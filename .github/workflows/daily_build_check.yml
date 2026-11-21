@@ -1,0 +1,29 @@
+name: Daily Trio build check
+# Drew's addition: on days Trio's own weekly Sunday run doesn't cover,
+# start "4. Build Trio" only when upstream nightscout/Trio dev has new commits.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 13 * * 1-6" # Mon-Sat 13:00 UTC (5 AM PT)
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build if upstream dev has new commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ahead=$(gh api "repos/${{ github.repository }}/compare/${{ github.repository_owner }}:dev...nightscout:dev" -q .ahead_by)
+          echo "Upstream dev commits not yet in this fork: $ahead"
+          if [ "$ahead" -gt 0 ]; then
+            gh workflow run build_trio.yml -R "${{ github.repository }}" --ref dev
+            echo "Started Build Trio."
+          else
+            echo "No upstream changes; skipping build."
+          fi

@@ -12,9 +12,26 @@ enum HealthIngestBackoff {
 struct HealthIngestQueuedRecord: Codable, Equatable {
     var record: HealthIngestRecord
     var bytes: Int
+    var hash: String
     var failures: Int
-    var rejects: Int
     var notBefore: Date
+}
+
+struct HealthIngestReceipt: Codable, Equatable {
+    enum State: String, Codable {
+        case accepted
+        case rejected
+    }
+
+    var key: String
+    var hash: String
+    var state: State
+    var at: Date
+}
+
+struct HealthIngestEnqueueResult: Equatable {
+    var queued: Int
+    var oversized: Int
 }
 
 struct HealthIngestPersistedStatus: Codable, Equatable {
@@ -52,12 +69,12 @@ final class HealthIngestDisk {
         save(items, name: "queue.json")
     }
 
-    func loadUploadedIDs() -> [String] {
-        load([String].self, name: "uploaded-ids.json") ?? []
+    func loadReceipts() -> [HealthIngestReceipt] {
+        load([HealthIngestReceipt].self, name: "receipts.json") ?? []
     }
 
-    func saveUploadedIDs(_ ids: [String]) {
-        save(ids, name: "uploaded-ids.json")
+    func saveReceipts(_ receipts: [HealthIngestReceipt]) {
+        save(receipts, name: "receipts.json")
     }
 
     func loadAnchors() -> [String: Data] {
@@ -82,15 +99,6 @@ final class HealthIngestDisk {
 
     func saveCursors(_ cursors: [String: Date]) {
         save(cursors, name: "cursors.json")
-    }
-
-    func loadDeviceID() -> String {
-        if let existing = load(String.self, name: "device-id.json"), !existing.isEmpty {
-            return existing
-        }
-        let created = UUID().uuidString
-        save(created, name: "device-id.json")
-        return created
     }
 
     func loadStatus() -> HealthIngestPersistedStatus {
@@ -121,43 +129,64 @@ final class HealthIngestDisk {
 actor HealthIngestQueue {
     private let disk: HealthIngestDisk
     private var items: [HealthIngestQueuedRecord]
-    private var pendingIDs: Set<String>
-    private var uploadedOrder: [String]
-    private var uploadedSet: Set<String>
-    private let uploadedCap = 30_000
-    private let rejectLimit = 5
+    private var receipts: [HealthIngestReceipt]
+    private let receiptCap = 30_000
+    private let snapshotInterval: TimeInterval = 24 * 3600
 
     init(disk: HealthIngestDisk) {
         self.disk = disk
         items = disk.loadQueue()
-        pendingIDs = Set(items.map(\.record.id))
-        uploadedOrder = disk.loadUploadedIDs()
-        uploadedSet = Set(uploadedOrder)
+        receipts = disk.loadReceipts()
     }
 
-    func enqueue(_ records: [HealthIngestRecord]) -> Int {
-        var added = 0
-        let now = Date()
+    /// Same `(type, id)` is reused. A changed payload replaces a pending row and is sent again
+    /// after a previous accept. An unchanged snapshot is sent again once a day.
+    func enqueue(_ records: [HealthIngestRecord], now: Date = Date()) -> HealthIngestEnqueueResult {
+        var queued = 0
+        var oversized = 0
+        var changed = false
         for record in records {
-            guard !pendingIDs.contains(record.id), !uploadedSet.contains(record.id) else { continue }
-            let bytes = (try? HealthIngestWire.encode(record).count) ?? 0
+            let payloadBytes = HealthIngestWire.payloadByteCount(record.payload)
+            if payloadBytes > HealthIngestWire.maxPayloadBytes {
+                oversized += 1
+                continue
+            }
+            let hash = HealthIngestWire.payloadHash(record.payload)
+            let key = Self.key(record)
+            if let index = items.firstIndex(where: { Self.key($0.record) == key }) {
+                guard items[index].hash != hash else { continue }
+                let bytes = (try? HealthIngestWire.encode(record).count) ?? payloadBytes
+                items[index].record = record
+                items[index].bytes = bytes
+                items[index].hash = hash
+                items[index].notBefore = now
+                queued += 1
+                changed = true
+                continue
+            }
+            if let receipt = receipts.last(where: { $0.key == key }), receipt.hash == hash {
+                let daily = Self.isSnapshot(record.type) && receipt.state == .accepted &&
+                    now.timeIntervalSince(receipt.at) >= snapshotInterval
+                guard daily else { continue }
+            }
+            let bytes = (try? HealthIngestWire.encode(record).count) ?? payloadBytes
             guard bytes > 0 else { continue }
             items.append(
                 HealthIngestQueuedRecord(
                     record: record,
                     bytes: bytes,
+                    hash: hash,
                     failures: 0,
-                    rejects: 0,
                     notBefore: now
                 )
             )
-            pendingIDs.insert(record.id)
-            added += 1
+            queued += 1
+            changed = true
         }
-        if added > 0 {
+        if changed {
             disk.saveQueue(items)
         }
-        return added
+        return HealthIngestEnqueueResult(queued: queued, oversized: oversized)
     }
 
     func nextBatch(limit: Int, maxBytes: Int) -> [HealthIngestRecord] {
@@ -184,87 +213,92 @@ actor HealthIngestQueue {
         return items.contains { $0.notBefore <= now }
     }
 
-    /// Duplicates are success. Rejected records stay for a few attempts, then leave the queue
-    /// so one bad record cannot block the rest. Transport failures keep every record.
+    /// Accepted and duplicate are done. A rejection is stored so the same payload is not retried,
+    /// then dropped. A timeout keeps the records and resends the same ids.
     func resolve(
-        batchIDs: [String],
+        batch: [HealthIngestRecord],
         acks: [HealthIngestAck],
-        transportFailed: Bool
+        transportFailed: Bool,
+        now: Date = Date()
     ) -> String? {
+        let keys = batch.map { Self.key($0) }
         if transportFailed {
-            let delay = HealthIngestBackoff.delay(afterFailures: bumpFailures(batchIDs))
-            postpone(batchIDs, until: Date().addingTimeInterval(delay))
+            let delay = HealthIngestBackoff.delay(afterFailures: bumpFailures(keys))
+            postpone(keys, until: now.addingTimeInterval(delay))
             disk.saveQueue(items)
             return nil
         }
 
-        var byID: [String: HealthIngestAck] = [:]
-        for ack in acks { byID[ack.id] = ack }
+        var byKey: [String: HealthIngestAck] = [:]
+        for ack in acks { byKey[Self.key(type: ack.type, id: ack.id)] = ack }
 
         var lastReject: String?
         var remove: Set<String> = []
-        var postponeIDs: [String] = []
-        for id in batchIDs {
-            guard let index = items.firstIndex(where: { $0.record.id == id }) else { continue }
-            guard let ack = byID[id] else {
-                postponeIDs.append(id)
+        var postponeKeys: [String] = []
+        for record in batch {
+            let key = Self.key(record)
+            guard let index = items.firstIndex(where: { Self.key($0.record) == key }) else { continue }
+            guard let ack = byKey[key] else {
+                postponeKeys.append(key)
                 continue
             }
             switch ack.status {
             case .accepted,
                  .duplicate:
-                remove.insert(id)
-                rememberUploaded(id)
+                remove.insert(key)
+                remember(key: key, hash: items[index].hash, state: .accepted, at: now)
             case .rejected:
-                items[index].rejects += 1
                 let reason = ack.reason ?? "rejected"
-                lastReject = reason
-                if items[index].rejects >= rejectLimit {
-                    remove.insert(id)
-                } else {
-                    let delay = HealthIngestBackoff.delay(afterFailures: items[index].rejects)
-                    items[index].notBefore = Date().addingTimeInterval(delay)
-                }
+                lastReject = "\(ack.type) \(ack.id): \(reason)"
+                remove.insert(key)
+                remember(key: key, hash: items[index].hash, state: .rejected, at: now)
             }
         }
-        if !postponeIDs.isEmpty {
-            let delay = HealthIngestBackoff.delay(afterFailures: 1)
-            postpone(postponeIDs, until: Date().addingTimeInterval(delay))
+        if !postponeKeys.isEmpty {
+            postpone(postponeKeys, until: now.addingTimeInterval(HealthIngestBackoff.delay(afterFailures: 1)))
         }
         if !remove.isEmpty {
-            items.removeAll { remove.contains($0.record.id) }
-            pendingIDs.subtract(remove)
+            items.removeAll { remove.contains(Self.key($0.record)) }
         }
         disk.saveQueue(items)
-        disk.saveUploadedIDs(uploadedOrder)
+        disk.saveReceipts(receipts)
         return lastReject
     }
 
-    private func bumpFailures(_ ids: [String]) -> Int {
+    private static func key(_ record: HealthIngestRecord) -> String {
+        key(type: record.type, id: record.id)
+    }
+
+    private static func key(type: String, id: String) -> String {
+        "\(type)\n\(id)"
+    }
+
+    private static func isSnapshot(_ type: String) -> Bool {
+        type == HealthIngestType.profileSnapshot || type == HealthIngestType.settingsSnapshot
+    }
+
+    private func bumpFailures(_ keys: [String]) -> Int {
+        let keySet = Set(keys)
         var maxFailures = 1
-        for index in items.indices where ids.contains(items[index].record.id) {
+        for index in items.indices where keySet.contains(Self.key(items[index].record)) {
             items[index].failures += 1
             maxFailures = max(maxFailures, items[index].failures)
         }
         return maxFailures
     }
 
-    private func postpone(_ ids: [String], until date: Date) {
-        let idSet = Set(ids)
-        for index in items.indices where idSet.contains(items[index].record.id) {
+    private func postpone(_ keys: [String], until date: Date) {
+        let keySet = Set(keys)
+        for index in items.indices where keySet.contains(Self.key(items[index].record)) {
             items[index].notBefore = date
         }
     }
 
-    private func rememberUploaded(_ id: String) {
-        guard uploadedSet.insert(id).inserted else { return }
-        uploadedOrder.append(id)
-        if uploadedOrder.count > uploadedCap {
-            let drop = uploadedOrder.count - uploadedCap
-            for removed in uploadedOrder.prefix(drop) {
-                uploadedSet.remove(removed)
-            }
-            uploadedOrder.removeFirst(drop)
+    private func remember(key: String, hash: String, state: HealthIngestReceipt.State, at: Date) {
+        receipts.removeAll { $0.key == key }
+        receipts.append(HealthIngestReceipt(key: key, hash: hash, state: state, at: at))
+        if receipts.count > receiptCap {
+            receipts.removeFirst(receipts.count - receiptCap)
         }
     }
 }

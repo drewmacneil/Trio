@@ -28,8 +28,11 @@ struct HealthIngestDiabetesAdapter {
         let units = settings.settings.units.rawValue
 
         if preferences.isOn(.glucose) {
+            let source = settings.settings.cgmPluginIdentifier.isEmpty
+                ? settings.settings.cgm.rawValue
+                : settings.settings.cgmPluginIdentifier
             await collect(into: &result, label: "glucose") {
-                try await glucoseRecords(since: since, units: units)
+                try await glucoseRecords(since: since, source: source)
             }
         }
         if preferences.isOn(.insulin) || preferences.isOn(.pumpEvents) {
@@ -52,7 +55,7 @@ struct HealthIngestDiabetesAdapter {
         }
         if preferences.isOn(.loopCycles) {
             await collect(into: &result, label: "loop cycles") {
-                try await loopRecords(since: since, units: units)
+                try await loopRecords(since: since)
             }
         }
         if preferences.isOn(.profilesAndSettings) {
@@ -79,14 +82,14 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func glucoseRecords(since: Date, units: String) async throws -> [HealthIngestRecord] {
+    private func glucoseRecords(since: Date, source: String) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = GlucoseStored.fetchRequest()
         request.predicate = NSPredicate(format: "date >= %@", since as NSDate)
         request.sortDescriptors = [NSSortDescriptor(key: "date", ascending: true)]
         request.fetchBatchSize = 256
         return try await context.perform {
-            try context.fetch(request).compactMap { Self.mapGlucose($0, units: units) }
+            try context.fetch(request).compactMap { Self.mapGlucose($0, source: $0.isManual ? "manual" : source) }
         }
     }
 
@@ -147,7 +150,7 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func loopRecords(since: Date, units: String) async throws -> [HealthIngestRecord] {
+    private func loopRecords(since: Date) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = OrefDetermination.fetchRequest()
         request.predicate = NSPredicate(format: "deliverAt >= %@ OR timestamp >= %@", since as NSDate, since as NSDate)
@@ -155,7 +158,7 @@ struct HealthIngestDiabetesAdapter {
         request.relationshipKeyPathsForPrefetching = ["forecasts", "forecasts.forecastValues"]
         request.fetchBatchSize = 32
         return try await context.perform {
-            try context.fetch(request).compactMap { Self.mapLoop($0, units: units) }
+            try context.fetch(request).compactMap(Self.mapLoop)
         }
     }
 
@@ -164,7 +167,7 @@ struct HealthIngestDiabetesAdapter {
         let payload = Self.profilePayload(stored, units: units)
         let record = HealthIngestRecord(
             type: HealthIngestType.profileSnapshot,
-            id: HealthIngestWire.contentID(for: payload),
+            id: HealthIngestWire.profileSnapshotID,
             start: Date(),
             end: nil,
             tz: HealthIngestTime.zoneIdentifier,
@@ -186,7 +189,7 @@ struct HealthIngestDiabetesAdapter {
         return [
             HealthIngestRecord(
                 type: HealthIngestType.settingsSnapshot,
-                id: HealthIngestWire.contentID(for: payload),
+                id: HealthIngestWire.settingsSnapshotID,
                 start: Date(),
                 end: nil,
                 tz: HealthIngestTime.zoneIdentifier,
@@ -238,25 +241,25 @@ struct HealthIngestDiabetesAdapter {
         return try context.fetch(request)
     }
 
-    static func mapGlucose(_ row: GlucoseStored, units: String) -> HealthIngestRecord? {
+    static func mapGlucose(_ row: GlucoseStored, source: String) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let mgdl = Int(row.glucose)
-        let sourceID = row.id?.uuidString ?? "glucose-\(Int(start.timeIntervalSince1970))-\(mgdl)"
-        var smoothed: HealthIngestJSON?
-        if let value = row.smoothedGlucose, value.doubleValue != 0 {
-            smoothed = .decimal(value)
-        }
         let payload = HealthIngestJSON.object([
             "mgdl": .number(Double(mgdl)),
             "low": .bool(HealthIngestGlucose.isLow(mgdl: mgdl)),
-            "lowFloorMgdl": .number(Double(HealthIngestGlucose.lowFloorMgdl)),
             "direction": row.direction.map { .string($0) },
-            "manual": .bool(row.isManual),
-            "smoothedMgdl": smoothed,
-            "settingsUnits": .string(units),
-            "sourceId": .string(sourceID)
+            "manual": row.isManual ? .bool(true) : nil,
+            "smoothedMgdl": row.smoothedGlucose.flatMap { value in
+                value.doubleValue == 0 ? nil : .decimal(value)
+            }
         ])
-        return record(type: HealthIngestType.glucose, id: sourceID, start: start, end: nil, payload: payload)
+        return record(
+            type: HealthIngestType.glucose,
+            id: HealthIngestIdentity.glucose(source: source, start: start),
+            start: start,
+            end: nil,
+            payload: payload
+        )
     }
 
     static func mapPump(
@@ -286,31 +289,17 @@ struct HealthIngestDiabetesAdapter {
 
     private static func mapBolus(_ event: PumpEventStored, sourceID: String, start: Date) -> HealthIngestRecord {
         let bolus = event.bolus
-        let canonical = [
-            "b1",
-            HealthIngestIdentity.canonical(bolus?.amount),
-            HealthIngestIdentity.canonical(bolus?.programmedAmount),
-            bolus?.isSMB == true ? "1" : "0",
-            bolus?.isExternal == true ? "1" : "0",
-            bolus?.isProgrammedByPumpUI == true ? "1" : "0",
-            event.isMutable ? "1" : "0"
-        ].joined(separator: "|")
+        let smb = bolus?.isSMB ?? false
         let payload = HealthIngestJSON.object([
             "units": .decimal(bolus?.amount),
             "programmedUnits": .decimal(bolus?.programmedAmount),
-            "smb": .bool(bolus?.isSMB ?? false),
-            "external": .bool(bolus?.isExternal ?? false),
-            "programmedByPumpUI": .bool(bolus?.isProgrammedByPumpUI ?? false),
-            "mutable": .bool(event.isMutable),
-            "insulinType": event.insulinType.map { .string($0) },
-            "actionDurationHours": .decimal(event.actionDuration),
-            "peakTimeMinutes": .decimal(event.peakTime),
-            "syncIdentifier": event.syncIdentifier.map { .string($0) },
-            "sourceId": .string(sourceID)
+            "external": (bolus?.isExternal == true) ? .bool(true) : nil,
+            "programmedByPumpUI": (bolus?.isProgrammedByPumpUI == true) ? .bool(true) : nil,
+            "insulinType": event.insulinType.map { .string($0) }
         ])
         return record(
-            type: HealthIngestType.bolus,
-            id: HealthIngestIdentity.revision(sourceID: sourceID, canonical: canonical),
+            type: smb ? HealthIngestType.smb : HealthIngestType.bolus,
+            id: sourceID,
             start: start,
             end: nil,
             payload: payload
@@ -321,31 +310,16 @@ struct HealthIngestDiabetesAdapter {
         let temp = event.tempBasal
         let scheduled = temp?.isScheduledBasal ?? false
         let end = scheduled ? nil : temp?.endDate
-        let canonical = [
-            "t1",
-            HealthIngestIdentity.canonical(temp?.rate),
-            String(temp?.duration ?? 0),
-            scheduled ? "1" : "0",
-            HealthIngestIdentity.canonical(temp?.deliveredUnits),
-            HealthIngestIdentity.canonical(end),
-            event.isMutable ? "1" : "0"
-        ].joined(separator: "|")
         let payload = HealthIngestJSON.object([
-            "rateUnitsPerHour": .decimal(temp?.rate),
+            "rate": .number(temp?.rate?.doubleValue ?? 0),
             "durationMinutes": .number(Double(temp?.duration ?? 0)),
-            "scheduledBasal": .bool(scheduled),
+            "scheduledBasal": scheduled ? .bool(true) : nil,
             "deliveredUnits": .decimal(temp?.deliveredUnits),
-            "tempType": temp?.tempType.map { .string($0) },
-            "mutable": .bool(event.isMutable),
-            "insulinType": event.insulinType.map { .string($0) },
-            "actionDurationHours": .decimal(event.actionDuration),
-            "peakTimeMinutes": .decimal(event.peakTime),
-            "syncIdentifier": event.syncIdentifier.map { .string($0) },
-            "sourceId": .string(sourceID)
+            "insulinType": event.insulinType.map { .string($0) }
         ])
         return record(
             type: HealthIngestType.tempBasal,
-            id: HealthIngestIdentity.revision(sourceID: sourceID, canonical: canonical),
+            id: sourceID,
             start: temp?.startDate ?? start,
             end: end == start ? nil : end,
             payload: payload
@@ -357,17 +331,16 @@ struct HealthIngestDiabetesAdapter {
         let sourceID = row.id?.uuidString ?? "carb-\(Int(start.timeIntervalSince1970))-\(row.carbs)"
         let payload = HealthIngestJSON.object([
             "grams": .number(row.carbs),
-            "fat": .number(row.fat),
-            "protein": .number(row.protein),
-            "note": row.note.map { .string($0) },
-            "isFPU": .bool(row.isFPU),
-            "fpuID": row.fpuID?.uuidString.map { .string($0) },
-            "sourceId": .string(sourceID)
+            "fatGrams": row.fat > 0 ? .number(row.fat) : nil,
+            "proteinGrams": row.protein > 0 ? .number(row.protein) : nil,
+            "note": row.note.flatMap { $0.isEmpty ? nil : .string($0) },
+            "isFPU": row.isFPU ? .bool(true) : nil,
+            "fpuID": row.fpuID?.uuidString.map { .string($0) }
         ])
         return record(type: HealthIngestType.carbs, id: sourceID, start: start, end: nil, payload: payload)
     }
 
-    private static func mapOverrideRun(_ run: OverrideRunStored, units: String) -> HealthIngestRecord? {
+    private static func mapOverrideRun(_ run: OverrideRunStored, units _: String) -> HealthIngestRecord? {
         guard let start = run.startDate ?? run.override?.date else { return nil }
         let parent = run.override
         let sourceID = parent?.id ?? run.id?.uuidString ?? "override-run-\(Int(start.timeIntervalSince1970))"
@@ -388,7 +361,7 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func mapOverride(_ row: OverrideStored, units: String) -> HealthIngestRecord? {
+    private static func mapOverride(_ row: OverrideStored, units _: String) -> HealthIngestRecord? {
         guard let start = row.date, let sourceID = row.id else { return nil }
         let end = ending(start: start, minutes: row.duration?.decimalValue, indefinite: row.indefinite)
         return overrideRecord(
@@ -419,50 +392,36 @@ struct HealthIngestDiabetesAdapter {
         enabled: Bool,
         target: NSDecimalNumber?,
         smbOff: Bool,
-        units: String,
+        units _: String,
         phase: String,
         advanced: OverrideStored?
     ) -> HealthIngestRecord {
-        let canonical = [
-            "o1",
-            phase,
-            HealthIngestIdentity.canonical(start),
-            HealthIngestIdentity.canonical(end),
-            percentage.map { String($0) } ?? "",
-            HealthIngestIdentity.canonical(target),
-            enabled ? "1" : "0",
-            indefinite ? "1" : "0"
-        ].joined(separator: "|")
         let payload = HealthIngestJSON.object([
             "name": name.map { .string($0) },
             "percentage": percentage.map { .number($0) },
             "durationMinutes": .decimal(duration),
-            "indefinite": .bool(indefinite),
+            "indefinite": indefinite ? .bool(true) : nil,
             "enabled": .bool(enabled),
             "target": .decimal(target),
-            "targetUnits": .string("mg/dL"),
-            "settingsUnits": .string(units),
-            "smbOff": .bool(smbOff),
-            "isf": .bool(advanced?.isf ?? false),
-            "cr": .bool(advanced?.cr ?? false),
-            "isfAndCr": .bool(advanced?.isfAndCr ?? false),
-            "advancedSettings": .bool(advanced?.advancedSettings ?? false),
+            "smbOff": smbOff ? .bool(true) : nil,
+            "isf": (advanced?.isf == true) ? .bool(true) : nil,
+            "cr": (advanced?.cr == true) ? .bool(true) : nil,
+            "isfAndCr": (advanced?.isfAndCr == true) ? .bool(true) : nil,
+            "advancedSettings": (advanced?.advancedSettings == true) ? .bool(true) : nil,
             "smbMinutes": .decimal(advanced?.smbMinutes),
             "uamMinutes": .decimal(advanced?.uamMinutes),
-            "smbScheduledOff": .bool(advanced?.smbIsScheduledOff ?? false),
-            "phase": .string(phase),
-            "sourceId": .string(sourceID)
+            "phase": .string(phase)
         ])
         return record(
             type: HealthIngestType.override,
-            id: HealthIngestIdentity.revision(sourceID: sourceID, canonical: canonical),
+            id: sourceID,
             start: start,
             end: end,
             payload: payload
         )
     }
 
-    private static func mapTempTargetRun(_ run: TempTargetRunStored, units: String) -> HealthIngestRecord? {
+    private static func mapTempTargetRun(_ run: TempTargetRunStored, units _: String) -> HealthIngestRecord? {
         guard let start = run.startDate ?? run.tempTarget?.date else { return nil }
         let parent = run.tempTarget
         let sourceID = parent?.id?.uuidString ?? run.id?.uuidString ?? "temp-target-run-\(Int(start.timeIntervalSince1970))"
@@ -480,7 +439,7 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func mapTempTarget(_ row: TempTargetStored, units: String) -> HealthIngestRecord? {
+    private static func mapTempTarget(_ row: TempTargetStored, units _: String) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let sourceID = row.id?.uuidString ?? "temp-target-\(Int(start.timeIntervalSince1970))"
         let end = ending(start: start, minutes: row.duration?.decimalValue, indefinite: false)
@@ -507,92 +466,74 @@ struct HealthIngestDiabetesAdapter {
         duration: NSDecimalNumber?,
         enabled: Bool,
         halfBasal: NSDecimalNumber?,
-        units: String,
+        units _: String,
         phase: String
     ) -> HealthIngestRecord {
-        let canonical = [
-            "tt1",
-            phase,
-            HealthIngestIdentity.canonical(start),
-            HealthIngestIdentity.canonical(end),
-            HealthIngestIdentity.canonical(target),
-            HealthIngestIdentity.canonical(duration),
-            enabled ? "1" : "0"
-        ].joined(separator: "|")
         let payload = HealthIngestJSON.object([
             "name": name.map { .string($0) },
             "target": .decimal(target),
-            "targetUnits": .string("mg/dL"),
-            "settingsUnits": .string(units),
             "durationMinutes": .decimal(duration),
             "enabled": .bool(enabled),
             "halfBasalTarget": .decimal(halfBasal),
-            "phase": .string(phase),
-            "sourceId": .string(sourceID)
+            "phase": .string(phase)
         ])
         return record(
             type: HealthIngestType.tempTarget,
-            id: HealthIngestIdentity.revision(sourceID: sourceID, canonical: canonical),
+            id: sourceID,
             start: start,
             end: end,
             payload: payload
         )
     }
 
-    private static func mapLoop(_ row: OrefDetermination, units: String) -> HealthIngestRecord? {
+    private static func mapLoop(_ row: OrefDetermination) -> HealthIngestRecord? {
         let start = row.deliverAt ?? row.timestamp
         guard let start else { return nil }
-        let sourceID = row.id?.uuidString ?? "loop-\(Int(start.timeIntervalSince1970))"
+        let curves = ["iob", "cob", "zt", "uam"]
         var predictions: [String: HealthIngestJSON] = [:]
-        for forecast in row.forecasts ?? [] {
-            guard let type = forecast.type else { continue }
-            let values = forecast.forecastValuesArray.map { HealthIngestJSON.number(Double($0.value)) }
-            predictions[type] = .array(values)
+        for name in curves {
+            let values = (row.forecasts ?? []).first { $0.type == name }?
+                .forecastValuesArray
+                .map { HealthIngestJSON.number(Double($0.value)) } ?? []
+            predictions[name] = .array(values)
         }
-        let canonical = [
-            "l1",
-            row.enacted ? "1" : "0",
-            HealthIngestIdentity.canonical(row.timestampEnacted),
-            HealthIngestIdentity.canonical(row.rate),
-            HealthIngestIdentity.canonical(row.duration),
-            HealthIngestIdentity.canonical(row.smbToDeliver)
-        ].joined(separator: "|")
+        let determination = HealthIngestJSON.object([
+            "bg": .decimal(row.glucose),
+            "eventualBG": .decimal(row.eventualBG),
+            "insulinReq": .decimal(row.insulinReq),
+            "carbsRequired": .number(Double(row.carbsRequired)),
+            "rate": .decimal(row.rate),
+            "durationMinutes": .decimal(row.duration),
+            "smb": .decimal(row.smbToDeliver),
+            "bolus": .decimal(row.bolus),
+            "temp": row.temp.map { .string($0) },
+            "currentTarget": .decimal(row.currentTarget),
+            "carbRatio": .decimal(row.carbRatio),
+            "reservoir": .decimal(row.reservoir),
+            "threshold": .decimal(row.threshold)
+        ])
+        let enacted: HealthIngestJSON = row.enacted
+            ? .object([
+                "at": row.timestampEnacted.map { .string(HealthIngestTime.string(from: $0)) },
+                "rate": .decimal(row.rate),
+                "durationMinutes": .decimal(row.duration),
+                "smb": .decimal(row.smbToDeliver),
+                "temp": row.temp.map { .string($0) }
+            ])
+            : .null
         let payload = HealthIngestJSON.object([
-            "reason": row.reason.map { .string($0) },
             "iob": .decimal(row.iob),
             "cob": .number(Double(row.cob)),
             "isf": .decimal(row.insulinSensitivity),
             "autosensRatio": .decimal(row.sensitivityRatio),
-            "carbRatio": .decimal(row.carbRatio),
-            "bg": .decimal(row.glucose),
-            "settingsUnits": .string(units),
-            "currentTarget": .decimal(row.currentTarget),
-            "eventualBG": .decimal(row.eventualBG),
-            "insulinReq": .decimal(row.insulinReq),
-            "carbsRequired": .number(Double(row.carbsRequired)),
-            "reservoir": .decimal(row.reservoir),
-            "threshold": .decimal(row.threshold),
-            "minDelta": .decimal(row.minDelta),
-            "expectedDelta": .decimal(row.expectedDelta),
-            "scheduledBasal": .decimal(row.scheduledBasal),
-            "suggestion": HealthIngestJSON.object([
-                "rate": .decimal(row.rate),
-                "durationMinutes": .decimal(row.duration),
-                "smb": .decimal(row.smbToDeliver),
-                "bolus": .decimal(row.bolus),
-                "tempBasal": .decimal(row.tempBasal),
-                "temp": row.temp.map { .string($0) }
-            ]),
-            "enacted": .bool(row.enacted),
-            "enactedAt": row.timestampEnacted.map { .string(HealthIngestTime.string(from: $0)) },
-            "received": .bool(row.received),
+            "determination": determination,
+            "reason": row.reason.map { .string($0) },
             "predictions": .object(predictions),
-            "deliverAt": .string(HealthIngestTime.string(from: start)),
-            "sourceId": .string(sourceID)
+            "enacted": enacted
         ])
         return record(
             type: HealthIngestType.loopCycle,
-            id: HealthIngestIdentity.revision(sourceID: sourceID, canonical: canonical),
+            id: HealthIngestIdentity.loop(start: start),
             start: start,
             end: row.timestampEnacted,
             payload: payload

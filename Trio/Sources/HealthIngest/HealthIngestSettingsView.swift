@@ -6,6 +6,7 @@ import Swinject
 struct HealthIngestSettingsView: View {
     @ObservedObject private var uploader: HealthIngestUploader
     @State private var baseURL: String
+    @State private var deviceID: String
     @State private var tokenDraft = ""
     @State private var testResult: String?
     @State private var testing = false
@@ -20,6 +21,7 @@ struct HealthIngestSettingsView: View {
         let uploader = resolver.resolve(HealthIngestUploader.self)!
         _uploader = ObservedObject(wrappedValue: uploader)
         _baseURL = State(initialValue: uploader.preferences.baseURL)
+        _deviceID = State(initialValue: uploader.preferences.deviceID)
     }
 
     var body: some View {
@@ -32,11 +34,15 @@ struct HealthIngestSettingsView: View {
             .listRowBackground(Color.chart)
 
             Section {
-                TextField("https://example.ts.net", text: $baseURL)
+                TextField("https://example.ts.net:8443", text: $baseURL)
                     .textInputAutocapitalization(.never)
                     .keyboardType(.URL)
                     .autocorrectionDisabled()
-                    .onSubmit { uploader.setBaseURL(baseURL) }
+                    .onSubmit { saveServer() }
+                TextField("trio-iphone", text: $deviceID)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .onSubmit { saveServer() }
                 SecureField(uploader.status.hasToken ? "Token saved in Keychain" : "Bearer token", text: $tokenDraft)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -51,7 +57,7 @@ struct HealthIngestSettingsView: View {
             } header: {
                 Text("Server")
             } footer: {
-                Text("Use the server origin, including https. The token is stored in the Keychain.")
+                Text("https origin. A port such as 8443 is allowed. Device id must match the token, or the server returns 403. The token is stored in the Keychain.")
             }
             .listRowBackground(Color.chart)
 
@@ -113,7 +119,7 @@ struct HealthIngestSettingsView: View {
     private var enabledBinding: Binding<Bool> {
         Binding(
             get: { uploader.preferences.enabled },
-            set: { uploader.setEnabled($0, baseURL: baseURL) }
+            set: { uploader.setEnabled($0, baseURL: baseURL, deviceID: deviceID) }
         )
     }
 
@@ -132,7 +138,12 @@ struct HealthIngestSettingsView: View {
         }
     }
 
+    private func saveServer() {
+        uploader.setServer(baseURL: baseURL, deviceID: deviceID)
+    }
+
     private func saveToken() {
+        saveServer()
         uploader.setToken(tokenDraft)
         tokenDraft = ""
     }
@@ -141,8 +152,9 @@ struct HealthIngestSettingsView: View {
         testing = true
         testResult = nil
         let url = baseURL
+        let device = deviceID
         Task {
-            let result = await uploader.testConnection(baseURL: url)
+            let result = await uploader.testConnection(baseURL: url, deviceID: device)
             testResult = result
             testing = false
         }

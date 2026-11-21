@@ -448,6 +448,7 @@ enum SettingItems {
             view: .healthIngest,
             searchContents: [
                 "Upload to private server",
+                "Device id",
                 "Test connection",
                 "Backfill"
             ],

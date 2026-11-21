@@ -1,6 +1,23 @@
 import Foundation
 import HealthKit
 
+enum HealthIngestSleep {
+    /// Server stages. Apple's finer values collapse onto this set.
+    static func stage(hkValue: Int) -> String {
+        switch HKCategoryValueSleepAnalysis(rawValue: hkValue) {
+        case .asleep,
+             .asleepUnspecified:
+            return "asleep"
+        case .asleepCore: return "core"
+        case .asleepDeep: return "deep"
+        case .asleepREM: return "rem"
+        case .awake: return "awake"
+        case .inBed: return "inBed"
+        default: return "asleep"
+        }
+    }
+}
+
 /// Incremental HealthKit reads. Anchors persist on disk. The first sync is one day; older samples
 /// come from an explicit backfill, paged so a long history does not run as one radio burst.
 final class HealthIngestHealthKitReader {
@@ -324,7 +341,8 @@ final class HealthIngestHealthKitReader {
             value = sample.quantity.doubleValue(for: .count())
         }
         let sourceID = sample.uuid.uuidString
-        let end = sample.endDate == sample.startDate ? nil : sample.endDate
+        let requiresEnd = recordType == HealthIngestType.activeEnergy || recordType == HealthIngestType.exerciseMinutes
+        let end: Date? = requiresEnd ? sample.endDate : (sample.endDate == sample.startDate ? nil : sample.endDate)
         let payload = HealthIngestJSON.object([
             key: .number(value),
             "sourceBundle": .string(sample.sourceRevision.source.bundleIdentifier),
@@ -343,7 +361,7 @@ final class HealthIngestHealthKitReader {
     private static func mapSleep(_ sample: HKCategorySample) -> HealthIngestRecord {
         let sourceID = sample.uuid.uuidString
         let payload = HealthIngestJSON.object([
-            "stage": .string(sleepStage(sample.value)),
+            "stage": .string(HealthIngestSleep.stage(hkValue: sample.value)),
             "hkValue": .number(Double(sample.value)),
             "sourceBundle": .string(sample.sourceRevision.source.bundleIdentifier),
             "sourceId": .string(sourceID)
@@ -356,19 +374,6 @@ final class HealthIngestHealthKitReader {
             tz: HealthIngestTime.zoneIdentifier,
             payload: payload
         )
-    }
-
-    private static func sleepStage(_ value: Int) -> String {
-        switch HKCategoryValueSleepAnalysis(rawValue: value) {
-        case .asleep: return "asleep"
-        case .asleepCore: return "asleepCore"
-        case .asleepDeep: return "asleepDeep"
-        case .asleepREM: return "asleepREM"
-        case .asleepUnspecified: return "asleepUnspecified"
-        case .awake: return "awake"
-        case .inBed: return "inBed"
-        default: return "unknown"
-        }
     }
 
     private static func activityName(_ type: HKWorkoutActivityType) -> String {

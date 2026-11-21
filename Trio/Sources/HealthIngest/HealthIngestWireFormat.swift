@@ -7,17 +7,20 @@ import zlib
 /// Adjust this file when the private ingest server changes the JSON. The rest of the uploader
 /// talks to these types and does not build request bodies itself.
 ///
-/// Assumed response body (any one of these):
-/// `{ "records": [ { "id", "status", "reason"? } ] }`,
-/// `{ "results": [ { "id", "status", "reason"? } ] }`,
-/// or a top-level array of those objects.
-/// `status` is `accepted`, `duplicate`, or `rejected`.
+/// HTTP 200 body: `{ "results": [ { "type", "id", "status", "reason"? } ] }`.
+/// `status` is `accepted`, `duplicate`, or `rejected`. The upsert key is `(type, id)`.
 enum HealthIngestWire {
     static let schemaVersion = 1
-    static let appName = "Trio"
+    static let appName = "trio"
+    static let defaultDeviceID = "trio-iphone"
     static let ingestPath = "/v1/ingest"
     static let statusPath = "/v1/status"
     static let gzipThreshold = 1024
+    static let maxBatchRecords = 500
+    static let maxBatchBytes = 4 * 1024 * 1024
+    static let maxPayloadBytes = 128 * 1024
+    static let profileSnapshotID = "profile"
+    static let settingsSnapshotID = "settings"
 
     static func authorizationValue(token: String) -> String {
         "Bearer \(token)"
@@ -50,11 +53,22 @@ enum HealthIngestWire {
     }
 
     static func parseAcks(_ data: Data) throws -> [HealthIngestAck] {
-        guard !data.isEmpty else { return [] }
+        guard !data.isEmpty else { throw HealthIngestWireError.unrecognizedResponse }
         let json = try JSONSerialization.jsonObject(with: data)
-        let rows = ackRows(in: json)
-        guard let rows else { throw HealthIngestWireError.unrecognizedResponse }
-        return rows.compactMap(HealthIngestAck.init(json:))
+        guard let object = json as? [String: Any], let rows = object["results"] as? [Any] else {
+            throw HealthIngestWireError.unrecognizedResponse
+        }
+        let acks = rows.compactMap(HealthIngestAck.init(json:))
+        guard acks.count == rows.count else { throw HealthIngestWireError.unrecognizedResponse }
+        return acks
+    }
+
+    static func payloadHash(_ payload: HealthIngestJSON) -> String {
+        contentID(for: payload)
+    }
+
+    static func payloadByteCount(_ payload: HealthIngestJSON) -> Int {
+        (try? encode(payload).count) ?? 0
     }
 
     static func makeEncoder() -> JSONEncoder {
@@ -94,14 +108,6 @@ enum HealthIngestWire {
         let data = (try? makeEncoder().encode(payload)) ?? Data()
         return HealthIngestIdentity.hex(SHA256.hash(data: data), bytes: 16)
     }
-
-    private static func ackRows(in json: Any) -> [Any]? {
-        if let rows = json as? [Any] { return rows }
-        guard let object = json as? [String: Any] else { return nil }
-        if let rows = object["records"] as? [Any] { return rows }
-        if let rows = object["results"] as? [Any] { return rows }
-        return nil
-    }
 }
 
 enum HealthIngestWireError: Error, Equatable {
@@ -118,6 +124,7 @@ enum HealthIngestType {
     static let tempTarget = "temp_target"
     static let profileSnapshot = "profile_snapshot"
     static let settingsSnapshot = "settings_snapshot"
+    static let smb = "smb"
     static let loopCycle = "loop_cycle"
     static let pumpEvent = "pump_event"
     static let workout = "workout"
@@ -143,6 +150,7 @@ enum HealthIngestType {
         restingHR,
         settingsSnapshot,
         sleepStage,
+        smb,
         tempBasal,
         tempTarget,
         workout
@@ -181,38 +189,17 @@ enum HealthIngestTime {
 }
 
 enum HealthIngestIdentity {
-    /// Stable id for a record that can be revised. The same source and canonical text always
-    /// produce the same id, so a resend is a duplicate. A changed payload is a new id because
-    /// the server treats a duplicate id as success and keeps the first body.
-    static func revision(sourceID: String, canonical: String) -> String {
-        let digest = SHA256.hash(data: Data(canonical.utf8))
-        return "\(sourceID)#\(hex(digest, bytes: 8))"
+    /// Upsert key is `(type, id)`. The same id is reused when the payload changes and on retry.
+    static func glucose(source: String, start: Date) -> String {
+        "cgm:\(source.replacingOccurrences(of: ":", with: "-")):\(HealthIngestTime.string(from: start))"
+    }
+
+    static func loop(start: Date) -> String {
+        "loop:\(HealthIngestTime.string(from: start))"
     }
 
     static func hex(_ digest: SHA256.Digest, bytes: Int) -> String {
         digest.prefix(bytes).map { String(format: "%02x", $0) }.joined()
-    }
-
-    static func canonical(_ value: Decimal) -> String {
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.numberStyle = .decimal
-        formatter.usesGroupingSeparator = false
-        formatter.minimumFractionDigits = 0
-        formatter.maximumFractionDigits = 8
-        formatter.decimalSeparator = "."
-        return formatter.string(from: NSDecimalNumber(decimal: value))
-            ?? NSDecimalNumber(decimal: value).stringValue
-    }
-
-    static func canonical(_ value: NSDecimalNumber?) -> String {
-        guard let value else { return "" }
-        return canonical(value.decimalValue)
-    }
-
-    static func canonical(_ date: Date?) -> String {
-        guard let date else { return "" }
-        return HealthIngestTime.string(from: date)
     }
 }
 
@@ -263,11 +250,13 @@ struct HealthIngestAck: Equatable {
         case rejected
     }
 
+    var type: String
     var id: String
     var status: Status
     var reason: String?
 
-    init(id: String, status: Status, reason: String? = nil) {
+    init(type: String, id: String, status: Status, reason: String? = nil) {
+        self.type = type
         self.id = id
         self.status = status
         self.reason = reason
@@ -275,13 +264,15 @@ struct HealthIngestAck: Equatable {
 
     init?(json: Any) {
         guard let row = json as? [String: Any],
+              let type = row["type"] as? String,
               let id = row["id"] as? String,
               let raw = (row["status"] as? String)?.lowercased(),
               let status = Status(rawValue: raw)
         else { return nil }
+        self.type = type
         self.id = id
         self.status = status
-        reason = (row["reason"] as? String) ?? (row["error"] as? String)
+        reason = row["reason"] as? String
     }
 }
 

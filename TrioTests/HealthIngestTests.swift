@@ -1,4 +1,5 @@
 import Foundation
+import HealthKit
 import Testing
 
 @testable import Trio
@@ -8,6 +9,8 @@ import Testing
         let preferences = HealthIngestPreferences.initial
         #expect(!preferences.enabled)
         #expect(preferences.baseURL.isEmpty)
+        #expect(preferences.deviceID == "trio-iphone")
+        #expect(preferences.normalizedDeviceID == "trio-iphone")
         #expect(preferences.isOn(.glucose))
         #expect(preferences.isOn(.heart))
     }
@@ -25,16 +28,29 @@ import Testing
         #expect(!HealthIngestGlucose.isLow(mgdl: 0))
     }
 
-    @Test func revisionIdIsStableUntilThePayloadChanges() {
-        let first = HealthIngestIdentity.revision(sourceID: "bolus-1", canonical: "b1|1.5|1.5|0")
-        let same = HealthIngestIdentity.revision(sourceID: "bolus-1", canonical: "b1|1.5|1.5|0")
-        let finalized = HealthIngestIdentity.revision(sourceID: "bolus-1", canonical: "b1|1.2|1.5|0")
-        #expect(first == same)
-        #expect(first != finalized)
-        #expect(first.hasPrefix("bolus-1#"))
+    @Test func stableIdsAreReusedAndDoNotCarryARevision() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let stamp = HealthIngestTime.string(from: start)
+        let glucose = HealthIngestIdentity.glucose(source: "dexcom", start: start)
+        #expect(glucose == "cgm:dexcom:\(stamp)")
+        #expect(HealthIngestIdentity.glucose(source: "dexcom", start: start) == glucose)
+        #expect(HealthIngestIdentity.loop(start: start) == "loop:\(stamp)")
+        #expect(!glucose.contains("#"))
+        #expect(stamp.hasSuffix("Z"))
+        #expect(HealthIngestTime.date(from: "2026-01-01T05:30:00+05:30") != nil)
+        #expect(HealthIngestTime.date(from: "2026-01-01T00:00:00Z") != nil)
     }
 
-    @Test func originRequiresHTTPSAndRejectsUserinfo() {
+    @Test func sleepStagesUseTheServerNames() {
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.awake.rawValue) == "awake")
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.asleepCore.rawValue) == "core")
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.asleepDeep.rawValue) == "deep")
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.asleepREM.rawValue) == "rem")
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.inBed.rawValue) == "inBed")
+        #expect(HealthIngestSleep.stage(hkValue: HKCategoryValueSleepAnalysis.asleepUnspecified.rawValue) == "asleep")
+    }
+
+    @Test func originRequiresHTTPSAndRejectsUserinfo() throws {
         let origin = HealthIngestOrigin.parse("https://example.ts.net/")
         #expect(origin?.scheme == "https")
         #expect(origin?.host == "example.ts.net")
@@ -43,6 +59,12 @@ import Testing
         #expect(HealthIngestOrigin.parse("https://user:unit-test-token@example.ts.net") == nil)
         #expect(HealthIngestOrigin.parse("") == nil)
         #expect(HealthIngestOrigin.parse("https://example.ts.net/ingest")?.path == "/ingest")
+        let withPort = HealthIngestOrigin.parse("https://example.ts.net:8443")
+        #expect(withPort?.port == 8443)
+        #expect(withPort?.host == "example.ts.net")
+        let status = HealthIngestWire.endpoint(try #require(withPort), path: HealthIngestWire.statusPath)
+        #expect(status?.port == 8443)
+        #expect(status?.path == "/v1/status")
     }
 
     @Test func backoffDoublesAndCapsAtFifteenMinutes() {
@@ -65,7 +87,10 @@ import Testing
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         #expect(json["schemaVersion"] as? Int == 1)
         let device = try #require(json["device"] as? [String: Any])
-        #expect(device["app"] as? String == "Trio")
+        #expect(device["app"] as? String == "trio")
+        #expect(HealthIngestWire.maxBatchRecords == 500)
+        #expect(HealthIngestWire.maxBatchBytes == 4 * 1024 * 1024)
+        #expect(HealthIngestWire.maxPayloadBytes == 128 * 1024)
         #expect(device["id"] as? String == "device-1")
         let records = try #require(json["records"] as? [[String: Any]])
         let start = try #require(records.first?["start"] as? String)
@@ -77,20 +102,20 @@ import Testing
         #expect(!text.contains("unit-test-token"))
     }
 
-    @Test func responseAcceptsRecordsResultsOrATopLevelArray() throws {
-        let records = Data(#"{"records":[{"id":"a","status":"duplicate"},{"id":"b","status":"rejected","error":"no"}]}"#.utf8)
-        let parsed = try HealthIngestWire.parseAcks(records)
+    @Test func responseIsResultsWithTypeAndId() throws {
+        let body = Data(
+            #"{"results":[{"type":"glucose","id":"a","status":"duplicate"},{"type":"bolus","id":"b","status":"rejected","reason":"no"}]}"#
+                .utf8
+        )
+        let parsed = try HealthIngestWire.parseAcks(body)
         #expect(parsed.map(\.status) == [.duplicate, .rejected])
+        #expect(parsed[0].type == "glucose")
         #expect(parsed[1].reason == "no")
-
-        let results = Data(#"{"results":[{"id":"a","status":"accepted"}]}"#.utf8)
-        #expect(try HealthIngestWire.parseAcks(results).first?.status == .accepted)
-
-        let array = Data(#"[{"id":"a","status":"Accepted"}]"#.utf8)
-        #expect(try HealthIngestWire.parseAcks(array).first?.status == .accepted)
-        #expect(try HealthIngestWire.parseAcks(Data()).isEmpty)
         #expect(throws: HealthIngestWireError.unrecognizedResponse) {
-            try HealthIngestWire.parseAcks(Data(#"{"ok":true}"#.utf8))
+            try HealthIngestWire.parseAcks(Data(#"{"records":[{"type":"glucose","id":"a","status":"accepted"}]}"#.utf8))
+        }
+        #expect(throws: HealthIngestWireError.unrecognizedResponse) {
+            try HealthIngestWire.parseAcks(Data())
         }
     }
 
@@ -107,49 +132,62 @@ import Testing
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
         let record = makeRecord(id: "glucose-1", type: HealthIngestType.glucose)
-        #expect(await queue.enqueue([record]) == 1)
-        #expect(await queue.enqueue([record]) == 0)
+        #expect(await queue.enqueue([record]).queued == 1)
+        #expect(await queue.enqueue([record]).queued == 0)
         #expect(await queue.depth() == 1)
 
         let reloaded = HealthIngestQueue(disk: disk)
         #expect(await reloaded.depth() == 1)
         let reason = await reloaded.resolve(
-            batchIDs: ["glucose-1"],
-            acks: [HealthIngestAck(id: "glucose-1", status: .duplicate)],
+            batch: [record],
+            acks: [HealthIngestAck(type: record.type, id: record.id, status: .duplicate)],
             transportFailed: false
         )
         #expect(reason == nil)
         #expect(await reloaded.depth() == 0)
         let afterAck = HealthIngestQueue(disk: disk)
-        #expect(await afterAck.enqueue([record]) == 0)
+        #expect(await afterAck.enqueue([record]).queued == 0)
+
+        var changed = record
+        changed.payload = .object(["mgdl": .number(121), "low": .bool(false)])
+        #expect(await afterAck.enqueue([changed]).queued == 1)
     }
 
-    @Test func transportFailureKeepsTheRecordAndRejectionEventuallyDropsIt() async throws {
+    @Test func timeoutKeepsTheSameIdAndRejectionDropsIt() async throws {
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
         let record = makeRecord(id: "bolus-1", type: HealthIngestType.bolus)
-        #expect(await queue.enqueue([record]) == 1)
-        _ = await queue.resolve(batchIDs: ["bolus-1"], acks: [], transportFailed: true)
+        #expect(await queue.enqueue([record]).queued == 1)
+        _ = await queue.resolve(batch: [record], acks: [], transportFailed: true)
         #expect(await queue.depth() == 1)
         #expect(await queue.hasReady() == false)
+        let still = await queue.nextBatch(limit: 10, maxBytes: 1_000_000)
+        #expect(still.isEmpty)
 
         let rejecting = HealthIngestQueue(disk: try makeDisk())
-        #expect(await rejecting.enqueue([record]) == 1)
-        for _ in 0 ..< 4 {
-            _ = await rejecting.resolve(
-                batchIDs: ["bolus-1"],
-                acks: [HealthIngestAck(id: "bolus-1", status: .rejected, reason: "schema")],
-                transportFailed: false
-            )
-            #expect(await rejecting.depth() == 1)
-        }
+        #expect(await rejecting.enqueue([record]).queued == 1)
         let dropped = await rejecting.resolve(
-            batchIDs: ["bolus-1"],
-            acks: [HealthIngestAck(id: "bolus-1", status: .rejected, reason: "schema")],
+            batch: [record],
+            acks: [HealthIngestAck(type: record.type, id: record.id, status: .rejected, reason: "schema")],
             transportFailed: false
         )
-        #expect(dropped == "schema")
+        #expect(dropped == "bolus bolus-1: schema")
         #expect(await rejecting.depth() == 0)
+        #expect(await rejecting.enqueue([record]).queued == 0)
+    }
+
+    @Test func unchangedSettingsSnapshotIsSentAgainAfterADay() async throws {
+        let queue = HealthIngestQueue(disk: try makeDisk())
+        let snapshot = makeRecord(id: HealthIngestWire.settingsSnapshotID, type: HealthIngestType.settingsSnapshot)
+        #expect(await queue.enqueue([snapshot]).queued == 1)
+        _ = await queue.resolve(
+            batch: [snapshot],
+            acks: [HealthIngestAck(type: snapshot.type, id: snapshot.id, status: .accepted)],
+            transportFailed: false
+        )
+        #expect(await queue.enqueue([snapshot]).queued == 0)
+        let tomorrow = Date().addingTimeInterval(25 * 3600)
+        #expect(await queue.enqueue([snapshot], now: tomorrow).queued == 1)
     }
 
     @Test func statusCheckSendsTheBearerTokenAndNotTheBody() async throws {
@@ -180,7 +218,7 @@ import Testing
         let body = try HealthIngestWire.encodeEnvelope(
             HealthIngestEnvelope(
                 schemaVersion: 1,
-                device: HealthIngestDevice(id: "device-1", app: "Trio", appVersion: "1.0 (1)"),
+                device: HealthIngestDevice(id: "trio-iphone", app: "trio", appVersion: "1.0 (1)"),
                 records: [record]
             )
         )

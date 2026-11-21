@@ -47,16 +47,18 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
     }
 
-    @MainActor func setEnabled(_ enabled: Bool, baseURL: String) {
+    @MainActor func setEnabled(_ enabled: Bool, baseURL: String, deviceID: String) {
         var prefs = currentPreferences()
         prefs.enabled = enabled
         prefs.baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        prefs.deviceID = deviceID
         commit(prefs)
     }
 
-    @MainActor func setBaseURL(_ baseURL: String) {
+    @MainActor func setServer(baseURL: String, deviceID: String) {
         var prefs = currentPreferences()
         prefs.baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        prefs.deviceID = deviceID
         commit(prefs)
     }
 
@@ -82,10 +84,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         status.hasToken = false
     }
 
-    @MainActor func testConnection(baseURL: String) async -> String {
+    @MainActor func testConnection(baseURL: String, deviceID: String) async -> String {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         var prefs = currentPreferences()
         prefs.baseURL = trimmed
+        prefs.deviceID = deviceID
         commit(prefs)
         guard let origin = HealthIngestOrigin.parse(trimmed) else {
             return "Enter an https URL, for example https://example.ts.net."
@@ -116,7 +119,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         publishSnapshot(depth: status.queueDepth)
     }
 
-    private func commit(_ prefs: HealthIngestPreferences) {
+    private func commit(_ incoming: HealthIngestPreferences) {
+        var prefs = incoming
+        prefs.deviceID = prefs.normalizedDeviceID
         stateLock.lock()
         storedPreferences = prefs
         stateLock.unlock()
@@ -256,8 +261,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
         let incremental = await health.incremental(preferences: prefs)
         let added = await queue.enqueue(diabetes.records + healthResult.records + incremental.records)
-        if added > 0 {
-            debug(.healthKit, "Health Ingest queued \(added) records")
+        if added.queued > 0 {
+            debug(.healthKit, "Health Ingest queued \(added.queued) records")
         }
         if let message = (diabetes.errors + healthResult.errors + incremental.errors).first {
             setLastError(message)
@@ -267,9 +272,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         var failed = false
         var batches = 0
         while batches < 4, !Task.isCancelled {
-            let batch = await queue.nextBatch(limit: 50, maxBytes: 256_000)
+            let batch = await queue.nextBatch(
+                limit: HealthIngestWire.maxBatchRecords,
+                maxBytes: HealthIngestWire.maxBatchBytes
+            )
             if batch.isEmpty { break }
-            let outcome = await send(batch, origin: origin, token: token, queue: queue, disk: disk)
+            let outcome = await send(batch, origin: origin, token: token, queue: queue, deviceID: prefs.normalizedDeviceID)
             batches += 1
             if outcome {
                 failed = true
@@ -282,6 +290,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
         if !failed {
             consecutiveFailures = 0
+        }
+        if added.oversized > 0 {
+            let message = "A record payload was over 128 KiB and was dropped."
+            setLastError(message)
+            warning(.healthKit, "Health Ingest \(message)")
         }
         stateLock.lock()
         backfillRunning = health.hasPendingBackfill(preferences: prefs)
@@ -297,12 +310,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         origin: URL,
         token: String,
         queue: HealthIngestQueue,
-        disk: HealthIngestDisk
+        deviceID: String
     ) async -> Bool {
         let envelope = HealthIngestEnvelope(
             schemaVersion: HealthIngestWire.schemaVersion,
             device: HealthIngestDevice(
-                id: disk.loadDeviceID(),
+                id: deviceID,
                 app: HealthIngestWire.appName,
                 appVersion: HealthIngestAppVersion.current()
             ),
@@ -317,7 +330,6 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         await background.begin()
         defer { Task { await background.end() } }
 
-        let ids = batch.map(\.id)
         do {
             let (code, data) = try await client.post(
                 origin: origin,
@@ -325,41 +337,41 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 body: compressed ?? raw,
                 gzip: compressed != nil
             )
-            if code == 401 || code == 403 {
-                setLastError("The server rejected the token (HTTP \(code)).")
-                _ = await queue.resolve(batchIDs: ids, acks: [], transportFailed: true)
+            if code == 403 {
+                setLastError("The server returned 403. The device id must match the token's device id.")
+                _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
-            guard (200 ... 299).contains(code) else {
+            if code == 401 {
+                setLastError("The server rejected the token (HTTP 401).")
+                _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
+                consecutiveFailures += 1
+                return true
+            }
+            guard code == 200 else {
                 setLastError("The server returned HTTP \(code).")
-                _ = await queue.resolve(batchIDs: ids, acks: [], transportFailed: true)
+                _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
-            let acks: [HealthIngestAck]
-            if data.isEmpty {
-                acks = ids.map { HealthIngestAck(id: $0, status: .accepted) }
-            } else {
-                acks = try HealthIngestWire.parseAcks(data)
-                if acks.isEmpty {
-                    throw HealthIngestWireError.unrecognizedResponse
-                }
-            }
-            if let reject = await queue.resolve(batchIDs: ids, acks: acks, transportFailed: false) {
-                setLastError("A record was rejected: \(String(reject.prefix(180)))")
+            let acks = try HealthIngestWire.parseAcks(data)
+            if let reject = await queue.resolve(batch: batch, acks: acks, transportFailed: false) {
+                let message = "A record was rejected: \(String(reject.prefix(180)))"
+                setLastError(message)
+                warning(.healthKit, "Health Ingest \(message)")
             } else {
                 setLastError(nil)
             }
             return false
         } catch let error as HealthIngestWireError where error == .unrecognizedResponse {
             setLastError("The server response was not a per-record result.")
-            _ = await queue.resolve(batchIDs: ids, acks: [], transportFailed: true)
+            _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
             consecutiveFailures += 1
             return true
         } catch {
             setLastError(Self.networkMessage(error))
-            _ = await queue.resolve(batchIDs: ids, acks: [], transportFailed: true)
+            _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
             consecutiveFailures += 1
             warning(.healthKit, "Health Ingest upload failed: \(Self.networkMessage(error))")
             return true

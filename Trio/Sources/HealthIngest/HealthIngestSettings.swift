@@ -19,7 +19,7 @@ enum HealthIngestCategory: String, CaseIterable, Identifiable, Codable {
     var title: String {
         switch self {
         case .glucose: return "Glucose"
-        case .insulin: return "Boluses and temp basals"
+        case .insulin: return "Boluses, SMBs, and temp basals"
         case .carbs: return "Carbs"
         case .adjustments: return "Overrides and temp targets"
         case .pumpEvents: return "Pump events"
@@ -57,7 +57,7 @@ enum HealthIngestCategory: String, CaseIterable, Identifiable, Codable {
         case .carbs: return [HealthIngestType.carbs]
         case .glucose: return [HealthIngestType.glucose]
         case .heart: return [HealthIngestType.heartRate, HealthIngestType.hrv, HealthIngestType.restingHR]
-        case .insulin: return [HealthIngestType.bolus, HealthIngestType.tempBasal]
+        case .insulin: return [HealthIngestType.bolus, HealthIngestType.smb, HealthIngestType.tempBasal]
         case .loopCycles: return [HealthIngestType.loopCycle]
         case .profilesAndSettings: return [HealthIngestType.profileSnapshot, HealthIngestType.settingsSnapshot]
         case .pumpEvents: return [HealthIngestType.pumpEvent]
@@ -70,10 +70,22 @@ enum HealthIngestCategory: String, CaseIterable, Identifiable, Codable {
 struct HealthIngestPreferences: Codable, Equatable {
     var enabled: Bool
     var baseURL: String
+    /// Must match the token's device id or the server returns 403.
+    var deviceID: String
     /// Missing keys stay on, so turning the service on uploads every category until one is switched off.
     var categories: [String: Bool]
 
-    static let initial = HealthIngestPreferences(enabled: false, baseURL: "", categories: [:])
+    static let initial = HealthIngestPreferences(
+        enabled: false,
+        baseURL: "",
+        deviceID: HealthIngestWire.defaultDeviceID,
+        categories: [:]
+    )
+
+    var normalizedDeviceID: String {
+        let trimmed = deviceID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? HealthIngestWire.defaultDeviceID : trimmed
+    }
 
     func isOn(_ category: HealthIngestCategory) -> Bool {
         categories[category.rawValue] ?? true
@@ -81,6 +93,39 @@ struct HealthIngestPreferences: Codable, Equatable {
 
     var requestsHealthData: Bool {
         HealthIngestCategory.allCases.contains { $0.readsHealthKit && isOn($0) }
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case baseURL
+        case deviceID
+        case categories
+    }
+
+    init(enabled: Bool, baseURL: String, deviceID: String, categories: [String: Bool]) {
+        self.enabled = enabled
+        self.baseURL = baseURL
+        self.deviceID = deviceID
+        self.categories = categories
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        baseURL = try container.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID) ?? HealthIngestWire.defaultDeviceID
+        categories = try container.decodeIfPresent([String: Bool].self, forKey: .categories) ?? [:]
+        if deviceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            deviceID = HealthIngestWire.defaultDeviceID
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(enabled, forKey: .enabled)
+        try container.encode(baseURL, forKey: .baseURL)
+        try container.encode(deviceID, forKey: .deviceID)
+        try container.encode(categories, forKey: .categories)
     }
 }
 

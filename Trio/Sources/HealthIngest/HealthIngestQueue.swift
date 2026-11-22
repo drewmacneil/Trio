@@ -47,6 +47,49 @@ struct HealthIngestEnqueueResult: Equatable {
     var oversized: Int
 }
 
+struct HealthIngestRejectLog: Codable, Equatable {
+    static let capacity = 200
+
+    /// Newest last.
+    var events: [HealthIngestRejectEvent] = []
+    /// Lifetime counts until Clear, keyed by `type` + newline + `reason`.
+    var counts: [String: Int] = [:]
+
+    static func key(type: String, reason: String) -> String { "\(type)\n\(reason)" }
+
+    mutating func append(type: String, reason: String, message: String, at: Date) {
+        events.append(HealthIngestRejectEvent(type: type, reason: reason, message: message, at: at))
+        if events.count > Self.capacity {
+            events.removeFirst(events.count - Self.capacity)
+        }
+        let key = Self.key(type: type, reason: reason)
+        counts[key, default: 0] += 1
+    }
+
+    func groups() -> [HealthIngestRejectGroup] {
+        var latest: [String: HealthIngestRejectEvent] = [:]
+        for event in events {
+            let key = Self.key(type: event.type, reason: event.reason)
+            if let existing = latest[key], existing.at > event.at { continue }
+            latest[key] = event
+        }
+        return latest.values.map { event in
+            let key = Self.key(type: event.type, reason: event.reason)
+            return HealthIngestRejectGroup(
+                type: event.type,
+                reason: event.reason,
+                message: event.message,
+                count: counts[key] ?? 1,
+                lastSeen: event.at
+            )
+        }
+        .sorted { lhs, rhs in
+            if lhs.type != rhs.type { return lhs.type < rhs.type }
+            return lhs.lastSeen > rhs.lastSeen
+        }
+    }
+}
+
 struct HealthIngestPersistedStatus: Codable, Equatable {
     var lastSuccess: Date?
     var lastError: String?
@@ -169,6 +212,14 @@ final class HealthIngestDisk {
 
     func saveRejectedCount(_ count: Int) {
         save(count, name: "rejected-count.json")
+    }
+
+    func loadRejectLog() -> HealthIngestRejectLog {
+        load(HealthIngestRejectLog.self, name: "reject-log.json") ?? HealthIngestRejectLog()
+    }
+
+    func saveRejectLog(_ log: HealthIngestRejectLog) {
+        save(log, name: "reject-log.json")
     }
 
     func loadTimeZone() -> String? {
@@ -403,6 +454,23 @@ actor HealthIngestQueue {
 
     func rejectedCount() -> Int { disk.loadRejectedCount() }
 
+    func recordRejection(type: String, reason: String, message: String, at: Date = Date()) {
+        var log = disk.loadRejectLog()
+        log.append(type: type, reason: reason, message: message, at: at)
+        disk.saveRejectLog(log)
+    }
+
+    func rejectionSummary() -> (latest: String?, groups: [HealthIngestRejectGroup]) {
+        let log = disk.loadRejectLog()
+        let latest = log.events.max(by: { $0.at < $1.at })?.reason
+        return (latest, log.groups())
+    }
+
+    func clearRejections() {
+        disk.saveRejectLog(HealthIngestRejectLog())
+        disk.saveRejectedCount(0)
+    }
+
     /// Forgets rejected receipts so a later backfill can enqueue the same ids again
     /// after a payload or server-contract fix.
     func forgetRejectedReceipts() {
@@ -504,8 +572,11 @@ actor HealthIngestQueue {
                 remember(key: key, hash: items[index].hash, state: .accepted, at: now)
             case .rejected:
                 let reason = ack.reason ?? "rejected"
-                lastReject = "\(ack.type) \(ack.id): \(reason)"
+                let message = ack.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let detail = (message?.isEmpty == false) ? message! : reason
+                lastReject = "\(ack.type) \(ack.id): \(detail)"
                 items[index].failures += 1
+                recordRejection(type: ack.type, reason: reason, message: detail, at: now)
                 if items[index].failures == 1 {
                     disk.saveRejectedCount(disk.loadRejectedCount() + 1)
                 }

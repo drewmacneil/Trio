@@ -118,6 +118,27 @@ enum HealthIngestLoopCapture {
         saveProfiles(records)
     }
 
+    /// Puts effective profiles still held beside recent loop notes back on the
+    /// pending list so a mapping bump can send them again. Notes stay in place.
+    static func requeueStoredProfiles() {
+        var records = pendingProfiles()
+        var known = Set(records.map(\.id))
+        for note in notes() {
+            guard let payload = note.effectivePayload, let id = note.effectiveProfileId, known.insert(id).inserted else { continue }
+            records.append(
+                HealthIngestRecord(
+                    type: HealthIngestType.effectiveProfile,
+                    id: id,
+                    start: note.start,
+                    end: nil,
+                    tz: note.timeZone,
+                    payload: payload
+                )
+            )
+        }
+        saveProfiles(records)
+    }
+
     static func drainProfiles() -> [HealthIngestRecord] {
         let records = pendingProfiles()
         saveProfiles([])

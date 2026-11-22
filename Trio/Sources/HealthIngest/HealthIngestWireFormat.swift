@@ -39,7 +39,9 @@ enum HealthIngestWire {
 
     /// Bump when on-device payloads change so rejected receipts and HealthKit
     /// backfill cursors can be cleared and the records sent again.
-    static let mappingVersion = 3
+    /// 4 resends Core Data loop cycles and effective profiles the server used to reject
+    /// (finite predicted glucose, and schedule starts in HH:MM or HH:MM:SS).
+    static let mappingVersion = 4
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed
@@ -155,6 +157,39 @@ enum HealthIngestType {
     static let healthKitTypes: Set<String> = [
         workout, heartRate, restingHR, hrv, sleepStage, activeEnergy, exerciseMinutes
     ]
+
+    /// Types a mapping bump should drop and send again. The server dedupes.
+    static let contractResendTypes: Set<String> = healthKitTypes.union([loopCycle, effectiveProfile])
+
+    static func displayName(_ type: String) -> String {
+        switch type {
+        case glucose: return "Glucose"
+        case bolus: return "Bolus"
+        case tempBasal: return "Temp basal"
+        case carbs: return "Carbs"
+        case override: return "Override"
+        case tempTarget: return "Temp target"
+        case profileSnapshot: return "Profile snapshot"
+        case settingsSnapshot: return "Settings snapshot"
+        case smb: return "SMB"
+        case loopCycle: return "Loop cycle"
+        case pumpEvent: return "Pump event"
+        case workout: return "Workout"
+        case heartRate: return "Heart rate"
+        case restingHR: return "Resting heart rate"
+        case hrv: return "HRV"
+        case sleepStage: return "Sleep"
+        case activeEnergy: return "Active energy"
+        case exerciseMinutes: return "Exercise minutes"
+        case deletion: return "Deletion"
+        case profileSwitch: return "Profile switch"
+        case effectiveProfile: return "Effective profile"
+        case loopStat: return "Loop stat"
+        case tzChange: return "Time zone change"
+        default:
+            return type.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
 
     static let all: Set<String> = [
         activeEnergy,
@@ -335,12 +370,15 @@ struct HealthIngestAck: Equatable {
     var id: String
     var status: Status
     var reason: String?
+    /// Longer explanation when the server sends one beside `reason`.
+    var message: String?
 
-    init(type: String, id: String, status: Status, reason: String? = nil) {
+    init(type: String, id: String, status: Status, reason: String? = nil, message: String? = nil) {
         self.type = type
         self.id = id
         self.status = status
         self.reason = reason
+        self.message = message
     }
 
     init?(json: Any) {
@@ -354,6 +392,7 @@ struct HealthIngestAck: Equatable {
         self.id = id
         self.status = status
         reason = row["reason"] as? String
+        message = row["message"] as? String
     }
 }
 

@@ -375,6 +375,12 @@ extension Notification.Name {
                         .environmentObject(Icons())
                         .onOpenURL(perform: handleURL)
                 }
+                #if DEBUG
+                if HealthIngestScreenshot.isActive {
+                    HealthIngestScreenshotHost()
+                        .environment(appState)
+                }
+                #endif
             }
             // Global upper bound on Dynamic Type: keep accessibility scaling but stop before the
             // extreme sizes that shatter dense layouts. Fragile screens cap tighter (see Home, Statistics).

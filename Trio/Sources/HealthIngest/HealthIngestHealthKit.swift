@@ -22,6 +22,22 @@ enum HealthIngestSleep {
 /// come from an explicit backfill, paged so a long history does not run as one radio burst.
 final class HealthIngestHealthKitReader {
     static let queryTimeout: TimeInterval = 30
+    /// Workouts are larger samples and were hitting the 30s limit.
+    static let workoutQueryTimeout: TimeInterval = 90
+
+    static func timeout(for recordType: String) -> TimeInterval {
+        recordType == HealthIngestType.workout ? workoutQueryTimeout : queryTimeout
+    }
+
+    /// The underlying error text, not a generic "could not backfill" line.
+    static func failureText(recordType: String, error: Error) -> String {
+        if error is HealthKitQueryTimeout {
+            return "\(recordType) timed out"
+        }
+        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty { return recordType }
+        return "\(recordType): \(detail)"
+    }
 
     private let store: HKHealthStore
     private let disk: HealthIngestDisk
@@ -137,17 +153,19 @@ final class HealthIngestHealthKitReader {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
         loadIfNeeded()
         var errors: [String] = []
+        var skipped: Set<String> = []
         var pages = 0
         while pages < maxPages, !Task.isCancelled {
             var progressed = false
             for kind in Self.readTypes() where preferences.isOn(kind.category) {
                 if pages >= maxPages || Task.isCancelled { break }
+                if skipped.contains(kind.recordType) { continue }
                 guard cursor(for: kind.recordType) != nil else { continue }
                 progressed = true
                 pages += 1
                 if let message = await backfillOnePage(kind: kind, limit: pageLimit, sink: sink) {
                     errors.append(message)
-                    return errors
+                    skipped.insert(kind.recordType)
                 }
             }
             if !progressed { break }
@@ -163,7 +181,13 @@ final class HealthIngestHealthKitReader {
                 ? HKQuery.predicateForSamples(withStart: Date().addingTimeInterval(-24 * 3600), end: nil, options: .strictStartDate)
                 : nil
             do {
-                let page = try await anchoredQuery(type: kind.sampleType, predicate: predicate, anchor: existing, limit: limit)
+                let page = try await anchoredQuery(
+                    type: kind.sampleType,
+                    predicate: predicate,
+                    anchor: existing,
+                    limit: limit,
+                    timeout: Self.timeout(for: kind.recordType)
+                )
                 let count = page.samples.count
                 let records = autoreleasepool { page.samples.compactMap { Self.map($0, kind: kind) } }
                 if !records.isEmpty { await sink(records) }
@@ -172,8 +196,9 @@ final class HealthIngestHealthKitReader {
                 pages += 1
                 if count < limit { break }
             } catch {
+                if error is CancellationError || Task.isCancelled { return [] }
                 warning(.healthKit, "Health Ingest \(kind.recordType) query failed", error: error)
-                return ["Could not read \(kind.recordType)"]
+                return [Self.failureText(recordType: kind.recordType, error: error)]
             }
         }
         return []
@@ -184,7 +209,12 @@ final class HealthIngestHealthKitReader {
         guard let cursor = cursor(for: kind.recordType) else { return nil }
         let predicate = HKQuery.predicateForSamples(withStart: cursor, end: nil, options: .strictStartDate)
         do {
-            let samples = try await sampleQuery(type: kind.sampleType, predicate: predicate, limit: limit)
+            let samples = try await sampleQuery(
+                type: kind.sampleType,
+                predicate: predicate,
+                limit: limit,
+                timeout: Self.timeout(for: kind.recordType)
+            )
             guard let last = samples.last else {
                 setCursor(nil, for: kind.recordType)
                 persist()
@@ -202,8 +232,9 @@ final class HealthIngestHealthKitReader {
             persist()
             return nil
         } catch {
+            if error is CancellationError || Task.isCancelled { return nil }
             warning(.healthKit, "Health Ingest \(kind.recordType) backfill failed", error: error)
-            return "Could not backfill \(kind.recordType)"
+            return Self.failureText(recordType: kind.recordType, error: error)
         }
     }
 
@@ -223,7 +254,8 @@ final class HealthIngestHealthKitReader {
         type: HKSampleType,
         predicate: NSPredicate?,
         anchor: HKQueryAnchor?,
-        limit: Int
+        limit: Int,
+        timeout: TimeInterval
     ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
         let gate = HealthKitQueryGate<(samples: [HKSample], anchor: HKQueryAnchor?)>(store: store)
         return try await withTaskCancellationHandler {
@@ -242,14 +274,19 @@ final class HealthIngestHealthKitReader {
                     }
                 }
                 gate.attach(query)
-                gate.startTimeout(seconds: Self.queryTimeout)
+                gate.startTimeout(seconds: timeout)
             }
         } onCancel: {
             gate.cancel()
         }
     }
 
-    private func sampleQuery(type: HKSampleType, predicate: NSPredicate, limit: Int) async throws -> [HKSample] {
+    private func sampleQuery(
+        type: HKSampleType,
+        predicate: NSPredicate,
+        limit: Int,
+        timeout: TimeInterval
+    ) async throws -> [HKSample] {
         let gate = HealthKitQueryGate<[HKSample]>(store: store)
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
@@ -268,11 +305,21 @@ final class HealthIngestHealthKitReader {
                     }
                 }
                 gate.attach(query)
-                gate.startTimeout(seconds: Self.queryTimeout)
+                gate.startTimeout(seconds: timeout)
             }
         } onCancel: {
             gate.cancel()
         }
+    }
+
+    func oldestPendingCursor(preferences: HealthIngestPreferences) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        let dates = Self.readTypes().compactMap { kind -> Date? in
+            guard preferences.isOn(kind.category) else { return nil }
+            return cursors[kind.recordType]
+        }
+        return dates.min()
     }
 
     private func loadIfNeeded() {

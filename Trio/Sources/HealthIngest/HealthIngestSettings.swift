@@ -139,6 +139,36 @@ struct HealthIngestPreferences: Codable, Equatable {
     }
 }
 
+struct HealthIngestRejectEvent: Codable, Equatable, Identifiable {
+    var type: String
+    var reason: String
+    var message: String
+    var at: Date
+
+    var id: String { "\(type)|\(reason)|\(at.timeIntervalSinceReferenceDate)" }
+}
+
+/// One reason inside a record type, for the rejection detail screen.
+struct HealthIngestRejectGroup: Equatable, Identifiable {
+    var type: String
+    var reason: String
+    var message: String
+    var count: Int
+    var lastSeen: Date
+
+    var id: String { "\(type)\n\(reason)" }
+}
+
+struct HealthIngestBackfillProgress: Equatable {
+    var days: Int
+    var day: Int
+    var rowsSent: Int
+    /// Shown under the state line while a backfill is running.
+    var phase: String
+    /// 0...1 across the selected day window.
+    var fraction: Double
+}
+
 struct HealthIngestStatus: Equatable {
     var lastSuccess: Date?
     var lastError: String?
@@ -146,6 +176,9 @@ struct HealthIngestStatus: Equatable {
     var rejectedCount: Int = 0
     var hasToken = false
     var backfillRunning = false
+    var latestRejectReason: String?
+    var rejectGroups: [HealthIngestRejectGroup] = []
+    var backfill: HealthIngestBackfillProgress?
 }
 
 /// Upload preferences live in UserDefaults. The bearer token lives only in the Keychain.

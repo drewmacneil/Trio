@@ -45,7 +45,7 @@ enum HealthIngestCanonicalJSON {
     static func clock(seconds: Int) -> String {
         let hour = seconds / 3600
         let minute = (seconds % 3600) / 60
-        return String(format: "%d:%02d", hour, abs(minute))
+        return String(format: "%02d:%02d", hour, abs(minute))
     }
 
     /// `HH:MM` from a stored clock string (`HH:MM` or `HH:MM:SS`) or from seconds.
@@ -54,7 +54,7 @@ enum HealthIngestCanonicalJSON {
         if parts.count >= 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
            (0 ... 59).contains(minute)
         {
-            return String(format: "%d:%02d", hour, minute)
+            return String(format: "%02d:%02d", hour, minute)
         }
         return clock(seconds: seconds)
     }
@@ -65,7 +65,7 @@ enum HealthIngestCanonicalJSON {
         guard number.isFinite else { return nil }
         let hour = Int(number)
         let minute = Int(((number - Double(hour)) * 60).rounded())
-        return String(format: "%d:%02d", hour, abs(minute))
+        return String(format: "%02d:%02d", hour, abs(minute))
     }
 
     static func mgdl(_ value: Double, units: String) -> Double {

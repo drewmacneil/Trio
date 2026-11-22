@@ -571,6 +571,46 @@ import Testing
         #expect(await queue.depth() == 0)
     }
 
+    @Test func scheduleClocksUseHourMinuteWithLeadingZeros() {
+        #expect(HealthIngestCanonicalJSON.clock(seconds: 0) == "00:00")
+        #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
+        #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
+        #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
+        #expect(HealthIngestWire.mappingVersion == 4)
+        #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.workout) == 90)
+        #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.heartRate) == 30)
+        let error = NSError(domain: "HealthIngest", code: 1, userInfo: [NSLocalizedDescriptionKey: "Protected health data is unavailable"])
+        #expect(HealthIngestHealthKitReader.failureText(recordType: "workout", error: error) == "workout: Protected health data is unavailable")
+    }
+
+    @Test func rejectLogKeepsTheLastTwoHundredAndClears() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        for index in 0 ..< 205 {
+            let record = makeRecord(id: "reject-\(index)", type: index.isMultiple(of: 2) ? HealthIngestType.loopCycle : HealthIngestType.profileSnapshot)
+            #expect(await queue.enqueue([record]).queued == 1)
+            let ack = HealthIngestAck(
+                type: record.type,
+                id: record.id,
+                status: .rejected,
+                reason: index.isMultiple(of: 2) ? "minPredBG out of range" : "schedule start",
+                message: "detail \(index)"
+            )
+            _ = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
+        }
+        let summary = await queue.rejectionSummary()
+        #expect(disk.loadRejectLog().events.count == 200)
+        #expect(summary.groups.count == 2)
+        let loop = try #require(summary.groups.first { $0.type == HealthIngestType.loopCycle })
+        #expect(loop.count == 103)
+        #expect(loop.message == "detail 204")
+        #expect(await queue.rejectedCount() == 205)
+        await queue.clearRejections()
+        #expect(await queue.rejectedCount() == 0)
+        #expect(disk.loadRejectLog().events.isEmpty)
+        #expect(await queue.rejectionSummary().groups.isEmpty)
+    }
+
     private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)

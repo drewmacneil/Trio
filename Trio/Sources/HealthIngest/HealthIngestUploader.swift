@@ -40,6 +40,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private var appActive = false
     private var diabetesResume: Date?
     private var lastDiabetesRead: Date?
+    private var backfillDayCount = 0
+    private var backfillWindowStart: Date?
+    private var backfillRowsSent = 0
     private var lifecycle = Set<AnyCancellable>()
 
     /// How much one pass may read, hold, and send. Backgrounded work is kept small because
@@ -137,15 +140,17 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         prefs.deviceID = deviceID
         commit(prefs)
         guard let origin = HealthIngestOrigin.parse(trimmed) else {
-            return "Enter an https URL, for example https://example.ts.net."
+            return "Enter an https URL."
         }
         guard let token = settingsStore.token() else {
             return "Save a token first. It stays in the Keychain."
         }
+        let started = Date()
         do {
             let code = try await client.status(origin: origin, token: token)
             if (200 ... 299).contains(code) {
-                return "Connected (HTTP \(code))."
+                let milliseconds = max(0, Int(Date().timeIntervalSince(started) * 1000))
+                return "Connected, server responded in \(milliseconds) ms"
             }
             return "The server returned HTTP \(code)."
         } catch {
@@ -160,9 +165,23 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.lock()
         backfillSince = min(backfillSince ?? since, since)
         backfillRunning = true
+        backfillDayCount = bounded
+        backfillWindowStart = since
+        backfillRowsSent = 0
         stateLock.unlock()
         poke()
         publishSnapshot(depth: status.queueDepth)
+    }
+
+    @MainActor func clearRejections() {
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            if let queue = try? self.prepare() {
+                await queue.clearRejections()
+                let depth = await queue.depth()
+                self.publishSnapshot(depth: depth)
+            }
+        }
     }
 
     /// Clears HealthKit backfill cursors and rejected receipts, drops queued
@@ -177,8 +196,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private func performResetBackfill(days: Int) async {
         guard let queue = try? prepare(), let health, let disk else { return }
         await queue.forgetRejectedReceipts()
-        await queue.dropTypes(HealthIngestType.healthKitTypes)
+        await queue.dropTypes(HealthIngestType.contractResendTypes)
         health.resetBackfillCursors()
+        HealthIngestLoopCapture.requeueStoredProfiles()
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
         let depth = await queue.depth()
         await MainActor.run { [weak self] in
@@ -192,9 +212,26 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         guard let queue = try? prepare(), let health, let disk else { return }
         guard disk.loadMappingVersion() < HealthIngestWire.mappingVersion else { return }
         await queue.forgetRejectedReceipts()
-        await queue.dropTypes(HealthIngestType.healthKitTypes)
+        await queue.dropTypes(HealthIngestType.contractResendTypes)
         health.resetBackfillCursors()
+        HealthIngestLoopCapture.requeueStoredProfiles()
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        rewindCoreDataRead(days: 90)
+        let depth = await queue.depth()
+        publishSnapshot(depth: depth)
+    }
+
+    /// Next diabetes read starts at the beginning of the window so stored loop cycles are sent again.
+    private func rewindCoreDataRead(days: Int) {
+        let bounded = min(max(days, 1), 90)
+        let since = Date().addingTimeInterval(-Double(bounded) * 24 * 3600)
+        stateLock.lock()
+        backfillSince = min(backfillSince ?? since, since)
+        backfillRunning = true
+        backfillDayCount = bounded
+        backfillWindowStart = since
+        backfillRowsSent = 0
+        stateLock.unlock()
     }
 
     private func commit(_ incoming: HealthIngestPreferences) {
@@ -418,6 +455,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         func enqueuePage(_ records: [HealthIngestRecord]) async {
             let added = await queue.enqueue(records)
             oversized += added.oversized
+            noteBackfillRows(added.queued)
             if added.queued > 0 {
                 debug(.healthKit, "Health Ingest queued \(added.queued) records")
             }
@@ -697,22 +735,65 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return lastError
     }
 
+    private func noteBackfillRows(_ count: Int) {
+        guard count > 0 else { return }
+        stateLock.lock()
+        if backfillRunning { backfillRowsSent += count }
+        stateLock.unlock()
+    }
+
+    private func backfillProgress(preferences: HealthIngestPreferences) -> HealthIngestBackfillProgress? {
+        stateLock.lock()
+        let running = backfillRunning
+        let days = backfillDayCount
+        let start = backfillWindowStart
+        let rows = backfillRowsSent
+        let resume = diabetesResume
+        stateLock.unlock()
+        guard running, days > 0, let start else { return nil }
+        let now = Date()
+        var frontier = resume ?? now
+        if let cursor = health?.oldestPendingCursor(preferences: preferences) {
+            frontier = min(frontier, cursor)
+        }
+        let elapsed = max(0, frontier.timeIntervalSince(start))
+        let total = Double(days) * 24 * 3600
+        let day = min(days, max(1, Int(elapsed / (24 * 3600)) + 1))
+        let fraction = total > 0 ? min(1, elapsed / total) : 0
+        return HealthIngestBackfillProgress(
+            days: days,
+            day: day,
+            rowsSent: rows,
+            phase: "Reading Health samples",
+            fraction: fraction
+        )
+    }
+
     private func publishSnapshot(depth: Int) {
+        let prefs = currentPreferences()
+        let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
+        let latest = log.events.max(by: { $0.at < $1.at })?.reason
+        let running = lockedBackfillRunning()
         let snapshot = HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
             queueDepth: depth,
             rejectedCount: disk?.loadRejectedCount() ?? 0,
             hasToken: settingsStore.hasToken(),
-            backfillRunning: {
-                stateLock.lock()
-                defer { stateLock.unlock() }
-                return backfillRunning
-            }()
+            backfillRunning: running,
+            latestRejectReason: latest,
+            rejectGroups: log.groups(),
+            backfill: running ? backfillProgress(preferences: prefs) : nil
         )
         Task { @MainActor [weak self] in
             self?.status = snapshot
         }
+    }
+
+    private func lockedBackfillRunning() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return backfillRunning
     }
 
     private func resolverDevices() -> (model: String?, rates: [Double]) {

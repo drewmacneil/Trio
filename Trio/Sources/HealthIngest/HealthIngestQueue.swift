@@ -109,6 +109,39 @@ final class HealthIngestDisk {
         save(status, name: "status.json")
     }
 
+    func loadFirstSeen() -> [String: Date] {
+        load([String: Date].self, name: "first-seen.json") ?? [:]
+    }
+
+    func saveFirstSeen(_ seen: [String: Date]) {
+        save(seen, name: "first-seen.json")
+    }
+
+    /// Ids the server has accepted, keyed by record type. Missing keys were not scanned.
+    func loadUploadedIDs() -> [String: [String]] {
+        load([String: [String]].self, name: "uploaded-ids.json") ?? [:]
+    }
+
+    func saveUploadedIDs(_ ids: [String: [String]]) {
+        save(ids, name: "uploaded-ids.json")
+    }
+
+    func loadRejectedCount() -> Int {
+        load(Int.self, name: "rejected-count.json") ?? 0
+    }
+
+    func saveRejectedCount(_ count: Int) {
+        save(count, name: "rejected-count.json")
+    }
+
+    func loadTimeZone() -> String? {
+        load(String.self, name: "timezone.json")
+    }
+
+    func saveTimeZone(_ identifier: String) {
+        save(identifier, name: "timezone.json")
+    }
+
     private func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
         lock.lock()
         defer { lock.unlock() }
@@ -130,6 +163,7 @@ actor HealthIngestQueue {
     private let disk: HealthIngestDisk
     private var items: [HealthIngestQueuedRecord]
     private var receipts: [HealthIngestReceipt]
+    private var firstSeen: [String: Date]
     private let receiptCap = 30_000
     private let snapshotInterval: TimeInterval = 24 * 3600
 
@@ -137,6 +171,7 @@ actor HealthIngestQueue {
         self.disk = disk
         items = disk.loadQueue()
         receipts = disk.loadReceipts()
+        firstSeen = disk.loadFirstSeen()
     }
 
     /// Same `(type, id)` is reused. A changed payload replaces a pending row and is sent again
@@ -145,7 +180,16 @@ actor HealthIngestQueue {
         var queued = 0
         var oversized = 0
         var changed = false
-        for record in records {
+        for incoming in records {
+            var record = incoming
+            if HealthIngestType.contentAddressed.contains(record.type) {
+                if let seen = firstSeen[record.id] {
+                    record.start = seen
+                } else {
+                    firstSeen[record.id] = record.start
+                    disk.saveFirstSeen(firstSeen)
+                }
+            }
             let payloadBytes = HealthIngestWire.payloadByteCount(record.payload)
             if payloadBytes > HealthIngestWire.maxPayloadBytes {
                 oversized += 1
@@ -208,13 +252,38 @@ actor HealthIngestQueue {
 
     func depth() -> Int { items.count }
 
+    func rejectedCount() -> Int { disk.loadRejectedCount() }
+
+    /// Remember ids the server accepted so a later disappearance can become a deletion.
+    func noteUploaded(_ records: [HealthIngestRecord]) {
+        let tracked: Set<String> = [
+            HealthIngestType.glucose,
+            HealthIngestType.carbs,
+            HealthIngestType.bolus,
+            HealthIngestType.smb,
+            HealthIngestType.tempBasal,
+            HealthIngestType.pumpEvent
+        ]
+        var stored = disk.loadUploadedIDs()
+        var changed = false
+        for record in records where tracked.contains(record.type) {
+            var ids = stored[record.type] ?? []
+            if !ids.contains(record.id) {
+                ids.append(record.id)
+                stored[record.type] = ids
+                changed = true
+            }
+        }
+        if changed { disk.saveUploadedIDs(stored) }
+    }
+
     func hasReady() -> Bool {
         let now = Date()
         return items.contains { $0.notBefore <= now }
     }
 
-    /// Accepted and duplicate are done. A rejection is stored so the same payload is not retried,
-    /// then dropped. A timeout keeps the records and resends the same ids.
+    /// Accepted and duplicate are done. A rejection stays on the queue and is sent again later.
+    /// A timeout keeps the records and resends the same ids.
     func resolve(
         batch: [HealthIngestRecord],
         acks: [HealthIngestAck],
@@ -234,6 +303,7 @@ actor HealthIngestQueue {
 
         var lastReject: String?
         var remove: Set<String> = []
+        var accepted: [HealthIngestRecord] = []
         var postponeKeys: [String] = []
         for record in batch {
             let key = Self.key(record)
@@ -246,12 +316,13 @@ actor HealthIngestQueue {
             case .accepted,
                  .duplicate:
                 remove.insert(key)
+                accepted.append(record)
                 remember(key: key, hash: items[index].hash, state: .accepted, at: now)
             case .rejected:
                 let reason = ack.reason ?? "rejected"
                 lastReject = "\(ack.type) \(ack.id): \(reason)"
-                remove.insert(key)
-                remember(key: key, hash: items[index].hash, state: .rejected, at: now)
+                postponeKeys.append(key)
+                disk.saveRejectedCount(disk.loadRejectedCount() + 1)
             }
         }
         if !postponeKeys.isEmpty {
@@ -259,6 +330,9 @@ actor HealthIngestQueue {
         }
         if !remove.isEmpty {
             items.removeAll { remove.contains(Self.key($0.record)) }
+        }
+        if !accepted.isEmpty {
+            noteUploaded(accepted)
         }
         disk.saveQueue(items)
         disk.saveReceipts(receipts)
@@ -274,7 +348,7 @@ actor HealthIngestQueue {
     }
 
     private static func isSnapshot(_ type: String) -> Bool {
-        type == HealthIngestType.profileSnapshot || type == HealthIngestType.settingsSnapshot
+        HealthIngestType.contentAddressed.contains(type)
     }
 
     private func bumpFailures(_ keys: [String]) -> Int {

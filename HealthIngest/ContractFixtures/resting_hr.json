@@ -1,0 +1,9 @@
+{
+  "type": "resting_hr",
+  "id": "rhr:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "bpm": 55
+  }
+}

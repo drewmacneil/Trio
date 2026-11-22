@@ -58,8 +58,18 @@ enum HealthIngestCategory: String, CaseIterable, Identifiable, Codable {
         case .glucose: return [HealthIngestType.glucose]
         case .heart: return [HealthIngestType.heartRate, HealthIngestType.hrv, HealthIngestType.restingHR]
         case .insulin: return [HealthIngestType.bolus, HealthIngestType.smb, HealthIngestType.tempBasal]
-        case .loopCycles: return [HealthIngestType.loopCycle]
-        case .profilesAndSettings: return [HealthIngestType.profileSnapshot, HealthIngestType.settingsSnapshot]
+        case .loopCycles: return [
+                HealthIngestType.loopCycle,
+                HealthIngestType.loopStat,
+                HealthIngestType.effectiveProfile,
+                HealthIngestType.tzChange
+            ]
+        case .profilesAndSettings: return [
+                HealthIngestType.profileSnapshot,
+                HealthIngestType.settingsSnapshot,
+                HealthIngestType.profileSwitch,
+                HealthIngestType.deletion
+            ]
         case .pumpEvents: return [HealthIngestType.pumpEvent]
         case .sleep: return [HealthIngestType.sleepStage]
         case .workouts: return [HealthIngestType.workout]
@@ -133,6 +143,7 @@ struct HealthIngestStatus: Equatable {
     var lastSuccess: Date?
     var lastError: String?
     var queueDepth: Int = 0
+    var rejectedCount: Int = 0
     var hasToken = false
     var backfillRunning = false
 }

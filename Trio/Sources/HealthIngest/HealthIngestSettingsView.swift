@@ -69,6 +69,7 @@ struct HealthIngestSettingsView: View {
                 }
                 statusRow("Last success", uploader.status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
                 statusRow("Queue", "\(uploader.status.queueDepth)")
+                statusRow("Rejected", "\(uploader.status.rejectedCount)")
                 if uploader.status.backfillRunning {
                     Text("Backfill is still reading Health samples.")
                         .font(.footnote)

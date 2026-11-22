@@ -327,18 +327,28 @@ final class OpenAPS {
             preferences.sigmoid = false
         }
 
-        // Determine basal
-        let orefDetermination = try determineBasal(
-            glucose: glucose,
-            currentTemp: currentTemp,
-            iob: iob,
+        // Determine basal. The capture records the inputs needed to replay this cycle.
+        let orefDetermination = try HealthIngestLoopCapture.recording(
             profile: profile,
             autosens: autosens,
             meal: meal,
-            microBolusAllowed: true,
-            preferences: preferences,
-            trioCustomOrefVariables: trioCustomOrefVariables
-        )
+            iob: iob,
+            variables: trioCustomOrefVariables,
+            at: clock,
+            enabled: !simulation
+        ) {
+            try determineBasal(
+                glucose: glucose,
+                currentTemp: currentTemp,
+                iob: iob,
+                profile: profile,
+                autosens: autosens,
+                meal: meal,
+                microBolusAllowed: true,
+                preferences: preferences,
+                trioCustomOrefVariables: trioCustomOrefVariables
+            )
+        }
 
         debug(
             .algorithm,

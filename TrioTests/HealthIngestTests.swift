@@ -153,7 +153,7 @@ import Testing
         #expect(await afterAck.enqueue([changed]).queued == 1)
     }
 
-    @Test func timeoutKeepsTheSameIdAndRejectionDropsIt() async throws {
+    @Test func timeoutKeepsTheSameIdAndRejectionIsRetried() async throws {
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
         let record = makeRecord(id: "bolus-1", type: HealthIngestType.bolus)
@@ -172,13 +172,29 @@ import Testing
             transportFailed: false
         )
         #expect(dropped == "bolus bolus-1: schema")
-        #expect(await rejecting.depth() == 0)
+        #expect(await rejecting.depth() == 1)
+        #expect(await rejecting.hasReady() == false)
+        #expect(await rejecting.rejectedCount() == 1)
         #expect(await rejecting.enqueue([record]).queued == 0)
+    }
+
+    @Test func contentHashMatchesTheWorkedExample() {
+        let payload = HealthIngestJSON.object(["b": .number(1), "a": .number(2)])
+        #expect(HealthIngestCanonicalJSON.string(payload) == "{\"a\":2,\"b\":1}")
+        #expect(
+            HealthIngestCanonicalJSON.contentID(prefix: "profile", payload: payload) ==
+                "profile:d3626ac30a87e6f7a6428233b3c68299"
+        )
+        let fraction = HealthIngestJSON.object([
+            "rate": .number(0.9),
+            "gramsPerUnit": .number(10)
+        ])
+        #expect(HealthIngestCanonicalJSON.string(fraction) == "{\"gramsPerUnit\":10,\"rate\":0.9}")
     }
 
     @Test func unchangedSettingsSnapshotIsSentAgainAfterADay() async throws {
         let queue = HealthIngestQueue(disk: try makeDisk())
-        let snapshot = makeRecord(id: HealthIngestWire.settingsSnapshotID, type: HealthIngestType.settingsSnapshot)
+        let snapshot = makeRecord(id: "settings", type: HealthIngestType.settingsSnapshot)
         #expect(await queue.enqueue([snapshot]).queued == 1)
         _ = await queue.resolve(
             batch: [snapshot],

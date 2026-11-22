@@ -1,0 +1,13 @@
+{
+  "type": "smb",
+  "id": "smb:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "units": 0.1,
+    "isMutable": true,
+    "peakTime": 55,
+    "actionDuration": 5,
+    "insulinType": "example-rapid"
+  }
+}

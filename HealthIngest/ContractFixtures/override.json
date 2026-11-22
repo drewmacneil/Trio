@@ -1,0 +1,17 @@
+{
+  "type": "override",
+  "id": "override:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "name": "example-override",
+    "multiplier": 0.8,
+    "targetMgdl": 140,
+    "durationMinutes": 90,
+    "indefinite": false,
+    "active": true,
+    "smbIsScheduledOff": true,
+    "smbScheduledStart": "22:00",
+    "smbScheduledEnd": "06:00"
+  }
+}

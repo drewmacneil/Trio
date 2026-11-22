@@ -19,8 +19,9 @@ enum HealthIngestWire {
     static let maxBatchRecords = 500
     static let maxBatchBytes = 4 * 1024 * 1024
     static let maxPayloadBytes = 128 * 1024
-    static let profileSnapshotID = "profile"
-    static let settingsSnapshotID = "settings"
+    static let profileIDPrefix = "profile"
+    static let settingsIDPrefix = "settings"
+    static let effectiveIDPrefix = "effective"
 
     static func authorizationValue(token: String) -> String {
         "Bearer \(token)"
@@ -134,18 +135,29 @@ enum HealthIngestType {
     static let sleepStage = "sleep_stage"
     static let activeEnergy = "active_energy"
     static let exerciseMinutes = "exercise_minutes"
+    static let deletion = "deletion"
+    static let profileSwitch = "profile_switch"
+    static let effectiveProfile = "effective_profile"
+    static let loopStat = "loop_stat"
+    static let tzChange = "tz_change"
+
+    static let contentAddressed: Set<String> = [profileSnapshot, settingsSnapshot, effectiveProfile]
 
     static let all: Set<String> = [
         activeEnergy,
         bolus,
         carbs,
+        deletion,
+        effectiveProfile,
         exerciseMinutes,
         glucose,
         heartRate,
         hrv,
         loopCycle,
+        loopStat,
         override,
         profileSnapshot,
+        profileSwitch,
         pumpEvent,
         restingHR,
         settingsSnapshot,
@@ -153,6 +165,7 @@ enum HealthIngestType {
         smb,
         tempBasal,
         tempTarget,
+        tzChange,
         workout
     ]
 }

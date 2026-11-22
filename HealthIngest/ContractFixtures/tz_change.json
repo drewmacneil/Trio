@@ -1,0 +1,11 @@
+{
+  "type": "tz_change",
+  "id": "tz:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "from": "America/Los_Angeles",
+    "to": "America/New_York",
+    "at": "2026-03-01T15:30:00Z"
+  }
+}

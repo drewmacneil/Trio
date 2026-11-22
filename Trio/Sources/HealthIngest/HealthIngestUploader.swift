@@ -28,6 +28,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private var disk: HealthIngestDisk?
     private var queue: HealthIngestQueue?
     private var health: HealthIngestHealthKitReader?
+    private let container: Resolver
     private let client = HealthIngestClient()
     private let wake = HealthIngestWake()
     private var loopTask: Task<Void, Never>?
@@ -36,6 +37,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private let adapter = HealthIngestDiabetesAdapter()
 
     init(resolver: Resolver) {
+        container = resolver
         injectServices(resolver)
         settingsStore = HealthIngestSettingsStore(keychain: keychain)
         let loaded = settingsStore.load()
@@ -246,12 +248,22 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         guard let origin = HealthIngestOrigin.parse(prefs.baseURL), let token = settingsStore.token() else { return }
 
         let since = takeSince()
+        let devices = resolverDevices()
         let diabetes = await adapter.records(
             since: since.date,
             preferences: prefs,
             settings: settingsManager,
-            profiles: profiles
+            profiles: profiles,
+            pumpModel: devices.model,
+            supportedBasalRates: devices.rates
         )
+        var extra: [HealthIngestRecord] = []
+        if prefs.isOn(.loopCycles) {
+            extra.append(contentsOf: timeZoneChange(disk: disk))
+            extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
+            extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
+        }
+        extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
         if since.backfill {
             health.beginBackfill(since: since.date, preferences: prefs)
         }
@@ -260,7 +272,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             healthResult = await health.backfill(preferences: prefs)
         }
         let incremental = await health.incremental(preferences: prefs)
-        let added = await queue.enqueue(diabetes.records + healthResult.records + incremental.records)
+        let added = await queue.enqueue(diabetes.records + healthResult.records + incremental.records + extra)
         if added.queued > 0 {
             debug(.healthKit, "Health Ingest queued \(added.queued) records")
         }
@@ -426,6 +438,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
             queueDepth: depth,
+            rejectedCount: disk?.loadRejectedCount() ?? 0,
             hasToken: settingsStore.hasToken(),
             backfillRunning: {
                 stateLock.lock()
@@ -436,6 +449,63 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         Task { @MainActor [weak self] in
             self?.status = snapshot
         }
+    }
+
+    private func resolverDevices() -> (model: String?, rates: [Double]) {
+        guard let devices = container.resolve(DeviceDataManager.self) else { return (nil, []) }
+        let model = devices.pumpName.value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (model.isEmpty ? nil : model, devices.pumpManager?.supportedBasalRates ?? [])
+    }
+
+    private func timeZoneChange(disk: HealthIngestDisk) -> [HealthIngestRecord] {
+        let current = TimeZone.current.identifier
+        let previous = disk.loadTimeZone()
+        disk.saveTimeZone(current)
+        guard let previous, previous != current else { return [] }
+        let now = Date()
+        return [
+            HealthIngestRecord(
+                type: HealthIngestType.tzChange,
+                id: "tz:\(HealthIngestTime.string(from: now))",
+                start: now,
+                end: nil,
+                tz: current,
+                payload: .object([
+                    "from": .string(previous),
+                    "to": .string(current),
+                    "at": .string(HealthIngestTime.string(from: now))
+                ])
+            )
+        ]
+    }
+
+    private func deletions(live: [String: Set<String>], disk: HealthIngestDisk) -> [HealthIngestRecord] {
+        var uploaded = disk.loadUploadedIDs()
+        var records: [HealthIngestRecord] = []
+        let now = Date()
+        for (type, current) in live {
+            let known = Set(uploaded[type] ?? [])
+            for id in known.subtracting(current).sorted() {
+                records.append(
+                    HealthIngestRecord(
+                        type: HealthIngestType.deletion,
+                        id: "deletion:\(type):\(id)",
+                        start: now,
+                        end: nil,
+                        tz: HealthIngestTime.zoneIdentifier,
+                        payload: .object([
+                            "targetType": .string(type),
+                            "targetId": .string(id),
+                            "detectedAt": .string(HealthIngestTime.string(from: now)),
+                            "reason": .string("removed")
+                        ])
+                    )
+                )
+            }
+            uploaded[type] = Array(known.intersection(current))
+        }
+        disk.saveUploadedIDs(uploaded)
+        return records
     }
 
     private func poke() {

@@ -1,0 +1,35 @@
+{
+  "type": "effective_profile",
+  "id": "effective:17cfbb129c6e54e7daaf46a533a6c2af",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "name": "weekday",
+    "diaHours": 6,
+    "basal": [
+      {
+        "start": "00:00",
+        "rate": 0.6
+      }
+    ],
+    "carbRatio": [
+      {
+        "start": "00:00",
+        "gramsPerUnit": 12
+      }
+    ],
+    "isf": [
+      {
+        "start": "00:00",
+        "mgdlPerUnit": 55
+      }
+    ],
+    "target": [
+      {
+        "start": "00:00",
+        "lowMgdl": 140,
+        "highMgdl": 150
+      }
+    ]
+  }
+}

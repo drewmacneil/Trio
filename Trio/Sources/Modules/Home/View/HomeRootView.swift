@@ -597,9 +597,23 @@ extension Home {
                 }
         }
 
+        #if DEBUG
+            private func openHealthIngestIfRequested() {
+                guard ProcessInfo.processInfo.arguments.contains("-HealthIngestEmbedded") else { return }
+                selectedTab = 3
+                var path = NavigationPath()
+                path.append(Screen.serviceSettings)
+                path.append(Screen.healthIngest)
+                settingsPath = path
+            }
+        #else
+            private func openHealthIngestIfRequested() {}
+        #endif
+
         var body: some View {
             ZStack(alignment: .center) {
                 tabBar()
+                    .onAppear(perform: openHealthIngestIfRequested)
 
                 if state.waitForSuggestion {
                     CustomProgressView(text: String(localized: "Updating IOB...", comment: "Progress text when updating IOB"))

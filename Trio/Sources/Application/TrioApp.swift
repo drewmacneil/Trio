@@ -311,7 +311,22 @@ extension Notification.Name {
     var body: some Scene {
         WindowGroup {
             ZStack {
-                if self.showLoadingView {
+                if healthIngestScreenshot {
+                    #if DEBUG
+                        if HealthIngestScreenshot.mode == "sibling" {
+                            NavigationStack {
+                                NightscoutConfig.RootView(resolver: resolver, displayClose: false)
+                            }
+                            .environment(appState)
+                            .preferredColorScheme(.light)
+                        } else {
+                            HealthIngestScreenshotHost()
+                                .environment(appState)
+                        }
+                    #else
+                        EmptyView()
+                    #endif
+                } else if self.showLoadingView {
                     Main.LoadingView(showError: $showLoadingError, retry: retryCoreDataInitialization)
                         .onAppear {
                             if self.initState.complete {
@@ -375,12 +390,6 @@ extension Notification.Name {
                         .environmentObject(Icons())
                         .onOpenURL(perform: handleURL)
                 }
-                #if DEBUG
-                if HealthIngestScreenshot.isActive {
-                    HealthIngestScreenshotHost()
-                        .environment(appState)
-                }
-                #endif
             }
             // Global upper bound on Dynamic Type: keep accessibility scaling but stop before the
             // extreme sizes that shatter dense layouts. Fragile screens cap tighter (see Home, Statistics).
@@ -440,6 +449,14 @@ extension Notification.Name {
 
         UITabBar.appearance().standardAppearance = appearance
         UITabBar.appearance().scrollEdgeAppearance = appearance
+    }
+
+    private var healthIngestScreenshot: Bool {
+        #if DEBUG
+            HealthIngestScreenshot.isActive
+        #else
+            false
+        #endif
     }
 
     private func colorScheme(for colorScheme: ColorSchemeOption) -> ColorScheme? {

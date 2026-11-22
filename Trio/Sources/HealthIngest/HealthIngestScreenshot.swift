@@ -15,6 +15,13 @@ enum HealthIngestScreenshot {
         return args[index + 1]
     }
 
+    /// `uptodate-status` scrolls the form to the status section. The fixture file is separate.
+    static var scrollAnchor: String? {
+        let parts = mode.split(separator: "-", maxSplits: 1)
+        guard parts.count == 2 else { return nil }
+        return String(parts[1])
+    }
+
     static var fixtureURL: URL? {
         let args = ProcessInfo.processInfo.arguments
         guard let index = args.firstIndex(of: "-HealthIngestScreenshot"), index + 2 < args.count else { return nil }
@@ -68,17 +75,13 @@ struct HealthIngestScreenshotHost: View {
                     startBackfill: {},
                     resetBackfill: {},
                     clearRejections: {},
-                    background: appState.trioBackgroundColor(for: .light)
+                    background: appState.trioBackgroundColor(for: .light),
+                    scrollAnchor: HealthIngestScreenshot.scrollAnchor
                 )
             }
         }
         .preferredColorScheme(.light)
-        .onAppear {
-            for scene in UIApplication.shared.connectedScenes {
-                guard let windowScene = scene as? UIWindowScene else { continue }
-                windowScene.windows.forEach { $0.overrideUserInterfaceStyle = .light }
-            }
-        }
+        .background(LightWindowStyle())
     }
 
     private static func loadFixture() -> HealthIngestScreenshotFixture {
@@ -120,6 +123,25 @@ struct HealthIngestScreenshotHost: View {
                 count: row.count,
                 lastSeen: Date(timeIntervalSince1970: row.lastSeen)
             )
+        }
+    }
+}
+
+/// Sets the window to light once it exists, so asset colors follow the light mocks.
+private struct LightWindowStyle: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.apply()
+    }
+
+    final class Controller: UIViewController {
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            apply()
+        }
+
+        func apply() {
+            view.window?.overrideUserInterfaceStyle = .light
         }
     }
 }

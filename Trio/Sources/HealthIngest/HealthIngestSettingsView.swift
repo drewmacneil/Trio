@@ -96,24 +96,37 @@ struct HealthIngestSettingsForm: View {
     var resetBackfill: () -> Void
     var clearRejections: () -> Void
     var background: LinearGradient
+    var scrollAnchor: String? = nil
 
     private let backfillChoices = [1, 3, 7, 14, 30, 90]
 
     var body: some View {
+        ScrollViewReader { proxy in
+            form
+                .onAppear {
+                    guard let scrollAnchor else { return }
+                    DispatchQueue.main.async {
+                        proxy.scrollTo(scrollAnchor, anchor: .top)
+                    }
+                }
+        }
+    }
+
+    private var form: some View {
         Form {
-            headerSection
-            serverSection
+            headerSection.id("header")
+            serverSection.id("server")
             if enabled {
-                statusSection
-                dataSection
-                backfillSection
-                troubleshootingSection
+                statusSection.id("status")
+                dataSection.id("data")
+                backfillSection.id("backfill")
+                troubleshootingSection.id("troubleshooting")
             }
         }
         .scrollContentBackground(.hidden)
         .background(background)
         .navigationTitle("Health Ingest")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarTitleDisplayMode(.automatic)
         .alert("Reset backfill?", isPresented: $confirmReset) {
             Button("Reset and resend", role: .destructive) { resetBackfill() }
             Button("Cancel", role: .cancel) {}
@@ -133,23 +146,17 @@ struct HealthIngestSettingsForm: View {
                             .fill(enabled ? Color.green : Color.secondary.opacity(0.45))
                             .frame(width: 10, height: 10)
                         Text("Private server upload")
-                            .font(.headline)
                     }
                     Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 }
                 Spacer(minLength: 8)
                 Toggle("Private server upload", isOn: enabledBinding)
                     .labelsHidden()
             }
         } footer: {
-            VStack(alignment: .leading, spacing: 8) {
-                if !enabled {
-                    Text("Turn on to start uploading. You can still set the server and test the connection.")
-                }
-                Text("Off by default. The address and token stay on this phone.")
-            }
+            Text(headerFooter)
         }
         .listRowBackground(Color.chart)
     }
@@ -170,11 +177,18 @@ struct HealthIngestSettingsForm: View {
                 .autocorrectionDisabled()
             Button("Save token", action: saveToken)
                 .disabled(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            Button(testing ? "Testing…" : "Test connection", action: testConnection)
-                .disabled(testing)
-            if let testResult {
-                connectionResult(testResult)
+            Button(action: testConnection) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(testing ? "Testing…" : "Test connection")
+                        .foregroundStyle(Color.accentColor)
+                    if let testResult {
+                        connectionResult(testResult)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .buttonStyle(.plain)
+            .disabled(testing)
             if hasToken {
                 Button("Remove token", role: .destructive, action: removeToken)
             }
@@ -195,19 +209,20 @@ struct HealthIngestSettingsForm: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text(progress.phase)
                     Text("Day \(progress.day) of \(progress.days)")
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                     ProgressView(value: progress.fraction)
                     Text("\(progress.rowsSent.formatted()) rows sent")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
                 }
             }
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
             VStack(alignment: .leading, spacing: 2) {
                 labeledRow("Queue", status.queueDepth.formatted())
                 Text("Rows waiting to upload.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
             }
             NavigationLink {
                 HealthIngestRejectedView(groups: status.rejectGroups, onClear: clearRejections)
@@ -221,8 +236,8 @@ struct HealthIngestSettingsForm: View {
                     }
                     if let reason = status.latestRejectReason, status.rejectedCount > 0 {
                         Text(reason)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .font(.footnote)
+                            .foregroundColor(.secondary)
                             .lineLimit(2)
                     }
                 }
@@ -295,6 +310,14 @@ struct HealthIngestSettingsForm: View {
         Binding(get: { enabled }, set: { setEnabled($0) })
     }
 
+    private var headerFooter: String {
+        let kept = "Off by default. The address and token stay on this phone."
+        guard enabled else {
+            return "Turn on to start uploading. You can still set the server and test the connection.\n\n\(kept)"
+        }
+        return kept
+    }
+
     private var subtitle: String {
         guard enabled else { return "Off, nothing leaves this phone" }
         if let host = HealthIngestOrigin.host(baseURL) {
@@ -309,7 +332,6 @@ struct HealthIngestSettingsForm: View {
                 .fill(stateColor)
                 .frame(width: 10, height: 10)
             Text(stateTitle)
-                .font(.headline)
             Spacer()
             if status.backfillRunning {
                 ProgressView()
@@ -317,8 +339,8 @@ struct HealthIngestSettingsForm: View {
         }
         if !status.backfillRunning, let error = status.lastError, !error.isEmpty, stateTitle == "Error" {
             Text(error)
-                .font(.subheadline)
-                .foregroundStyle(.red)
+                .font(.footnote)
+                .foregroundColor(.red)
         }
     }
 
@@ -350,8 +372,8 @@ struct HealthIngestSettingsForm: View {
             Image(systemName: ok ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
                 .foregroundStyle(ok ? Color.green : Color.red)
             Text(text)
-                .font(.subheadline)
-                .foregroundStyle(ok ? Color.primary : Color.red)
+                .font(.footnote)
+                .foregroundColor(ok ? .secondary : .red)
         }
     }
 }
@@ -379,19 +401,18 @@ struct HealthIngestRejectedView: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(alignment: .firstTextBaseline) {
                                     Text(row.reason)
-                                        .font(.headline)
                                     Spacer()
                                     Text(row.count.formatted())
-                                        .foregroundStyle(.secondary)
+                                        .foregroundColor(.secondary)
                                 }
                                 if row.message != row.reason {
                                     Text(row.message)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
+                                        .font(.footnote)
+                                        .foregroundColor(.secondary)
                                 }
                                 Text(Self.seen(row.lastSeen))
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
                             }
                         }
                     } header: {
@@ -401,20 +422,16 @@ struct HealthIngestRejectedView: View {
                 }
             }
             Section {
-                Text("The phone keeps the last 200 rejects. The server keeps the full history.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .listRowBackground(Color.clear)
-            }
-            Section {
                 Button("Clear", role: .destructive, action: onClear)
+            } footer: {
+                Text("The phone keeps the last 200 rejects. The server keeps the full history.")
             }
             .listRowBackground(Color.chart)
         }
         .scrollContentBackground(.hidden)
         .background(appState.trioBackgroundColor(for: colorScheme))
         .navigationTitle("Rejected")
-        .navigationBarTitleDisplayMode(.inline)
+        .navigationBarTitleDisplayMode(.automatic)
     }
 
     private var grouped: [(type: String, rows: [HealthIngestRejectGroup])] {

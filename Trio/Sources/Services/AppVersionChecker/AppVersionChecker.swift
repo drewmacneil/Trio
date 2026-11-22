@@ -478,8 +478,7 @@ import UIKit
     //
     // The alert is dispatched to the main thread to ensure UI updates occur correctly.
     //
-    // Presentation is skipped when the view controller is already showing something - for example
-    // the non-release build warning from DevelopmentBranchAlerter, which runs just before this.
+    // Presentation is skipped when the view controller is already showing something.
     // UIKit drops a second presentation silently, so the caller is told whether the alert actually
     // appeared and can leave its throttle untouched to retry on the next foreground.
     //

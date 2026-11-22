@@ -35,7 +35,6 @@ extension Notification.Name {
     let initState = InitState()
 
     @State private var appState = AppState()
-    @State private var developmentBranchAlerter = DevelopmentBranchAlerter.shared
     @State private var showLoadingView = true
     @State private var showLoadingError = false
     @State private var showOnboardingCompletedSplash = false
@@ -385,22 +384,13 @@ extension Notification.Name {
                 }
             }
             // The scene is already active by the time Core Data finishes loading, so the scene
-            // phase change below cannot carry the warning on a cold launch. Fire it here instead,
-            // as the loading screen gives way to the app itself.
+            // phase change below cannot request alarm authorization on a cold launch. Fire it
+            // here instead, as the loading screen gives way to the app itself.
             .onChange(of: showLoadingView) { _, isLoading in
                 if !isLoading {
-                    presentDevelopmentBranchWarningIfNeeded()
                     requestAlarmAuthorizationIfNeeded()
                 }
             }
-            // A first-time user is still in onboarding when the loading screen goes away, so the
-            // warning is held back there. Raise it as the completion splash gives way to the app.
-            .onChange(of: showOnboardingCompletedSplash) { _, isShowingSplash in
-                if !isShowingSplash {
-                    presentDevelopmentBranchWarningIfNeeded()
-                }
-            }
-            .developmentBranchWarning(developmentBranchAlerter)
         }
         .onChange(of: scenePhase) { _, newScenePhase in
             info(.lifecycle, "Scene phase changed to \(newScenePhase)")
@@ -417,25 +407,12 @@ extension Notification.Name {
                     rootVC.excludeKeyboardFromSafeAreaTree()
                     AppVersionChecker.shared.checkAndNotifyVersionStatus(in: rootVC)
                 }
-                presentDevelopmentBranchWarningIfNeeded()
                 requestAlarmAuthorizationIfNeeded()
                 if initState.complete {
                     performCleanupIfNecessary()
                 }
             }
         }
-    }
-
-    /// Warns the user if this build did not come from the released `main` branch.
-    ///
-    /// Held back until Core Data has loaded and onboarding is behind us, so the warning never lands
-    /// on the launch splash or interrupts first-time setup.
-    @MainActor private func presentDevelopmentBranchWarningIfNeeded() {
-        guard initState.complete, !onboardingManager.shouldShowOnboarding else {
-            return
-        }
-
-        developmentBranchAlerter.alertIfNeeded()
     }
 
     /// Onboarding asks for AlarmKit, but users who onboarded before it existed were never asked,

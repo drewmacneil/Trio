@@ -909,7 +909,6 @@
 		D6DEC113821A7F1056C4AA1E /* NightscoutConfigDataFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F2A13DF0EDEEEDC4106AA2A /* NightscoutConfigDataFlow.swift */; };
 		D7C5E1F4A7B91E2F3C5D6E70 /* TimeInterval+Convenience.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7C5E1F4A7B91E2F3C5D6E71 /* TimeInterval+Convenience.swift */; };
 		D9441F789E7043278FD01494 /* HomeStateModel+QuickPickTreatments.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0A1E8522E7684C6AA742F6E4 /* HomeStateModel+QuickPickTreatments.swift */; };
-		DB0BA0010000000000000003 /* DevelopmentBranchAlerter.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB0BA0010000000000000002 /* DevelopmentBranchAlerter.swift */; };
 		DB0BB002000000000000000C /* ReleaseNotes.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB0BB002000000000000000B /* ReleaseNotes.swift */; };
 		DB0BB002000000000000000E /* ReleaseNotesService.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB0BB002000000000000000D /* ReleaseNotesService.swift */; };
 		DB0BB0020000000000000010 /* ReleaseNotesSheetView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DB0BB002000000000000000F /* ReleaseNotesSheetView.swift */; };
@@ -2185,7 +2184,6 @@
 		D0BDC6993C1087310EDFC428 /* CarbRatioEditorRootView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CarbRatioEditorRootView.swift; sourceTree = "<group>"; };
 		D543DE17E0054AF0821411BB /* QuickPickTreatmentsConfigDataFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickPickTreatmentsConfigDataFlow.swift; sourceTree = "<group>"; };
 		D7C5E1F4A7B91E2F3C5D6E71 /* TimeInterval+Convenience.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "TimeInterval+Convenience.swift"; sourceTree = "<group>"; };
-		DB0BA0010000000000000002 /* DevelopmentBranchAlerter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DevelopmentBranchAlerter.swift; sourceTree = "<group>"; };
 		DB0BB002000000000000000B /* ReleaseNotes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleaseNotes.swift; sourceTree = "<group>"; };
 		DB0BB002000000000000000D /* ReleaseNotesService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleaseNotesService.swift; sourceTree = "<group>"; };
 		DB0BB002000000000000000F /* ReleaseNotesSheetView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReleaseNotesSheetView.swift; sourceTree = "<group>"; };
@@ -3018,7 +3016,6 @@
 				B015AFE22E500000000D7351 /* BolusSafety */,
 				3862CC2C2743F9DC00BF832C /* Calendar */,
 				E592A37E2CEEC046009A472C /* ContactImage */,
-				DB0BA0010000000000000001 /* DevelopmentBranchAlerter */,
 				DB0BB002000000000000000A /* ReleaseNotes */,
 				F90692A8274B7A980037068D /* HealthKit */,
 				3B506FD72E6352E9000740B9 /* IOB */,
@@ -4744,14 +4741,6 @@
 			path = ISFEditor;
 			sourceTree = "<group>";
 		};
-		DB0BA0010000000000000001 /* DevelopmentBranchAlerter */ = {
-			isa = PBXGroup;
-			children = (
-				DB0BA0010000000000000002 /* DevelopmentBranchAlerter.swift */,
-			);
-			path = DevelopmentBranchAlerter;
-			sourceTree = "<group>";
-		};
 		DB0BB002000000000000000A /* ReleaseNotes */ = {
 			isa = PBXGroup;
 			children = (
@@ -6148,7 +6137,6 @@
 				38FE826D25CC8461001FF17A /* NightscoutAPI.swift in Sources */,
 				388358C825EEF6D200E024B2 /* BasalProfileEntry.swift in Sources */,
 				DDA9AC092D672CF100E6F1A9 /* AppVersionChecker.swift in Sources */,
-				DB0BA0010000000000000003 /* DevelopmentBranchAlerter.swift in Sources */,
 				3811DE0B25C9D32F00A708ED /* BaseView.swift in Sources */,
 				3BAC929D2E56A85400B853DA /* TempBasalFunctions.swift in Sources */,
 				3811DE3225C9D49500A708ED /* HomeDataFlow.swift in Sources */,

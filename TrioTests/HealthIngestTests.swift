@@ -251,24 +251,17 @@ import Testing
     }
 
 
-    @Test func recordIdsAreSanitizedToTheServerAlphabet() {
-        #expect(HealthIngestRecordID.sanitize("pump-123-Site Change") == "pump-123-Site-Change")
-        #expect(HealthIngestRecordID.component("Workout (80%)") == "Workout-80")
-        #expect(HealthIngestRecordID.component("   ") == "unnamed")
-        let plus = HealthIngestRecordID.sanitize("+bad")
-        #expect(plus.first?.isLetter == true || plus.first?.isNumber == true)
-        #expect(!plus.contains("+"))
-    }
-
-    @Test func diaHoursAndMultiplierMatchTheServerRanges() {
-        #expect(HealthIngestPayload.diaHours(0) == nil)
-        #expect(HealthIngestPayload.diaHours(-1) == nil)
+    @Test func payloadHelpersKeepStoredValuesAndDropOnlyNonFiniteNumbers() {
+        #expect(HealthIngestPayload.diaHours(0) == .number(0))
+        #expect(HealthIngestPayload.diaHours(-1) == .number(-1))
         #expect(HealthIngestPayload.diaHours(6) == .number(6))
-        #expect(HealthIngestPayload.diaHours(30) == .number(24))
-        #expect(HealthIngestPayload.unitMultiplier(percentage: 0) == nil)
+        #expect(HealthIngestPayload.diaHours(30) == .number(30))
+        #expect(HealthIngestPayload.diaHours(.infinity) == nil)
+        #expect(HealthIngestPayload.unitMultiplier(percentage: 0) == .number(0))
         #expect(HealthIngestPayload.unitMultiplier(percentage: 80) == .number(0.8))
-        #expect(HealthIngestPayload.unitMultiplier(percentage: 2000) == nil)
+        #expect(HealthIngestPayload.unitMultiplier(percentage: 2000) == .number(20))
         #expect(HealthIngestPayload.unitMultiplier(percentage: nil) == nil)
+        #expect(HealthIngestPayload.unitMultiplier(percentage: .nan) == nil)
     }
 
     @Test func healthKitPayloadsUseContractFieldNames() throws {
@@ -282,9 +275,10 @@ import Testing
         #expect(!keys(energy).contains("kilocalories"))
         #expect(keys(exercise).contains("minutes"))
         #expect(keys(heart).contains("bpm"))
-        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 0) == nil)
-        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 501) == nil)
-        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 0) == nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 0) != nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 501) != nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 0) != nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: .nan) == nil)
 
         let workout = try #require(
             HealthIngestHealthMapping.workoutPayload(
@@ -341,7 +335,7 @@ import Testing
                 recordType: HealthIngestType.sleepStage,
                 start: start,
                 end: start.addingTimeInterval(-1)
-            ) == .drop
+            ) == .value(start.addingTimeInterval(-1))
         )
     }
 
@@ -457,13 +451,14 @@ import Testing
         #expect(id == HealthIngestCanonicalJSON.contentID(prefix: "settings", payload: payload))
     }
 
-    @Test func predictedBGOmitsNegativeAndOutOfRangeValues() {
-        #expect(HealthIngestPayload.predictedBG(-12) == nil)
+    @Test func predictedBGKeepsNegativesAndDropsOnlyNonFiniteValues() {
+        #expect(HealthIngestPayload.predictedBG(-12) == .number(-12))
         #expect(HealthIngestPayload.predictedBG(0) == .number(0))
         #expect(HealthIngestPayload.predictedBG(110) == .number(110))
-        #expect(HealthIngestPayload.predictedBG(2001) == nil)
+        #expect(HealthIngestPayload.predictedBG(2001) == .number(2001))
         #expect(HealthIngestPayload.predictedBG(Double.nan) == nil)
-        #expect(HealthIngestPayload.predictedBG(NSDecimalNumber(value: -3)) == nil)
+        #expect(HealthIngestPayload.predictedBG(Double.infinity) == nil)
+        #expect(HealthIngestPayload.predictedBG(NSDecimalNumber(value: -3)) == .number(-3))
         #expect(HealthIngestPayload.predictedBG(Optional<Decimal>.none) == nil)
     }
 

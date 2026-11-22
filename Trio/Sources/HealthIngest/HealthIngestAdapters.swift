@@ -275,8 +275,8 @@ struct HealthIngestDiabetesAdapter {
         let pump = settings.pumpSettings
         var pumpFields: [String: HealthIngestJSON?] = [
             "diaHours": HealthIngestPayload.diaHours(Self.double(pump.insulinActionCurve)),
-            "maxBolus": .number(max(Self.double(pump.maxBolus), 0)),
-            "maxBasal": .number(max(Self.double(pump.maxBasal), 0))
+            "maxBolus": HealthIngestPayload.finiteNumber(Self.double(pump.maxBolus)),
+            "maxBasal": HealthIngestPayload.finiteNumber(Self.double(pump.maxBasal))
         ]
         if let pumpModel, !pumpModel.isEmpty {
             pumpFields["pumpModel"] = .string(pumpModel)
@@ -301,16 +301,15 @@ struct HealthIngestDiabetesAdapter {
             request.predicate = NSPredicate(format: "date >= %@", since as NSDate)
             return try context.fetch(request).compactMap { row -> HealthIngestRecord? in
                 guard let date = row.date, let name = row.name, !name.isEmpty else { return nil }
-                let trigger = Self.switchTrigger(row.trigger)
+                let trigger = row.trigger?.trimmingCharacters(in: .whitespacesAndNewlines)
                 let payload = HealthIngestJSON.object([
                     "date": .string(HealthIngestTime.string(from: date)),
                     "name": .string(name),
-                    "trigger": .string(trigger)
+                    "trigger": (trigger?.isEmpty == false) ? .string(trigger!) : nil
                 ])
-                let safeName = HealthIngestRecordID.component(name)
                 return Self.record(
                     type: HealthIngestType.profileSwitch,
-                    id: "profile-switch:\(HealthIngestTime.string(from: date)):\(safeName)",
+                    id: "profile-switch:\(HealthIngestTime.string(from: date)):\(name)",
                     start: date,
                     end: nil,
                     payload: payload
@@ -386,7 +385,7 @@ struct HealthIngestDiabetesAdapter {
         }
         guard includeEvents else { return nil }
         let payload = HealthIngestJSON.object([
-            "event": .string(Self.pumpEventName(type)),
+            "event": .string(type),
             "note": event.note.flatMap { $0.isEmpty ? nil : .string($0) }
         ])
         return record(type: HealthIngestType.pumpEvent, id: sourceID, start: start, end: nil, payload: payload)
@@ -396,13 +395,13 @@ struct HealthIngestDiabetesAdapter {
         let bolus = event.bolus
         let smb = bolus?.isSMB ?? false
         let payload = HealthIngestJSON.object([
-            "units": .decimal(bolus?.amount) ?? .number(0),
+            "units": .decimal(bolus?.amount),
             "programmedUnits": .decimal(bolus?.programmedAmount),
             "external": (bolus?.isExternal == true) ? .bool(true) : nil,
             "programmedByPumpUI": (bolus?.isProgrammedByPumpUI == true) ? .bool(true) : nil,
             "isMutable": .bool(event.isMutable),
-            "peakTime": Self.positiveNumber(event.peakTime),
-            "actionDuration": Self.positiveNumber(event.actionDuration),
+            "peakTime": Self.finiteNumber(event.peakTime),
+            "actionDuration": Self.finiteNumber(event.actionDuration),
             "insulinType": event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
         ])
         return record(
@@ -419,8 +418,8 @@ struct HealthIngestDiabetesAdapter {
         let scheduled = temp?.isScheduledBasal ?? false
         let end = scheduled ? nil : temp?.endDate
         let payload = HealthIngestJSON.object([
-            "rate": .number(temp?.rate?.doubleValue ?? 0),
-            "durationMinutes": .number(Double(temp?.duration ?? 0)),
+            "rate": temp?.rate.flatMap { HealthIngestPayload.finiteNumber($0.doubleValue) },
+            "durationMinutes": temp?.duration.map { .number(Double($0)) },
             "automatic": scheduled ? nil : .bool(true),
             "deliveredUnits": .decimal(temp?.deliveredUnits),
             "insulinType": event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
@@ -429,7 +428,7 @@ struct HealthIngestDiabetesAdapter {
             type: HealthIngestType.tempBasal,
             id: sourceID,
             start: temp?.startDate ?? start,
-            end: end == start ? nil : end,
+            end: end,
             payload: payload
         )
     }
@@ -437,8 +436,8 @@ struct HealthIngestDiabetesAdapter {
     static func mapCarb(_ row: CarbEntryStored) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let sourceID = row.id?.uuidString ?? "carb-\(Int(start.timeIntervalSince1970))-\(row.carbs)"
-        let fat: HealthIngestJSON? = row.fat > 0 ? .number(row.fat) : nil
-        let protein: HealthIngestJSON? = row.protein > 0 ? .number(row.protein) : nil
+        let fat: HealthIngestJSON? = HealthIngestPayload.finiteNumber(row.fat)
+        let protein: HealthIngestJSON? = HealthIngestPayload.finiteNumber(row.protein)
         let note: HealthIngestJSON? = row.note.flatMap { note in note.isEmpty ? nil : .string(note) }
         let fpu: HealthIngestJSON? = row.isFPU ? .bool(true) : nil
         let fpuID: HealthIngestJSON? = row.fpuID.map { .string($0.uuidString) }
@@ -515,7 +514,7 @@ struct HealthIngestDiabetesAdapter {
             "name": (trimmedName?.isEmpty == false) ? .string(trimmedName!) : nil,
             "multiplier": HealthIngestPayload.unitMultiplier(percentage: percentage),
             "targetMgdl": target.map { .number(HealthIngestCanonicalJSON.mgdl($0.doubleValue, units: units)) },
-            "durationMinutes": Self.positiveNumber(duration),
+            "durationMinutes": Self.finiteNumber(duration),
             "indefinite": indefinite ? .bool(true) : .bool(false),
             "active": .bool(enabled),
             "smbIsOff": smbOff ? .bool(true) : nil,
@@ -589,7 +588,7 @@ struct HealthIngestDiabetesAdapter {
         let payload = HealthIngestJSON.object([
             "name": (trimmedName?.isEmpty == false) ? .string(trimmedName!) : nil,
             "targetMgdl": target.map { .number(HealthIngestCanonicalJSON.mgdl($0.doubleValue, units: units)) },
-            "durationMinutes": Self.positiveNumber(duration),
+            "durationMinutes": Self.finiteNumber(duration),
             "halfBasalTarget": halfBasal.map { .number(HealthIngestCanonicalJSON.mgdl($0.doubleValue, units: units)) },
             "phase": .string(phase),
             "enabled": .bool(enabled)
@@ -689,13 +688,13 @@ struct HealthIngestDiabetesAdapter {
             "carbRatio": .array(profile.carbRatio.map { entry in
                 .object([
                     "start": .string(HealthIngestCanonicalJSON.clock(seconds: entry.seconds)),
-                    "gramsPerUnit": .number(max(Self.double(entry.value), 0))
+                    "gramsPerUnit": .number(Self.double(entry.value))
                 ])
             }),
             "isf": .array(profile.sensitivity.map { entry in
                 .object([
                     "start": .string(HealthIngestCanonicalJSON.clock(seconds: entry.seconds)),
-                    "mgdlPerUnit": .number(max(Self.double(entry.value), 0))
+                    "mgdlPerUnit": .number(Self.double(entry.value))
                 ])
             }),
             "target": .array(profile.target.map { entry in
@@ -720,7 +719,7 @@ struct HealthIngestDiabetesAdapter {
         guard row.enacted else { return .null }
         let smb: HealthIngestJSON? = .decimal(row.smbToDeliver)
         let rate: HealthIngestJSON? = .decimal(row.rate)
-        let minutes: HealthIngestJSON? = Self.positiveNumber(row.duration)
+        let minutes: HealthIngestJSON? = Self.finiteNumber(row.duration)
         let bolus: HealthIngestJSON? = .decimal(row.bolus)
         return .object([
             "smbUnits": smb,
@@ -737,10 +736,10 @@ struct HealthIngestDiabetesAdapter {
         enacted: HealthIngestJSON,
         note: HealthIngestLoopCapture.Note?
     ) -> HealthIngestJSON {
-        let iob: HealthIngestJSON = .decimal(row.iob) ?? .number(0)
+        let iob: HealthIngestJSON? = .decimal(row.iob)
         let cob: HealthIngestJSON = .number(Double(row.cob))
         let isf: HealthIngestJSON = .decimal(row.insulinSensitivity) ?? .null
-        let ratio: HealthIngestJSON = .decimal(row.sensitivityRatio) ?? .number(1)
+        let ratio: HealthIngestJSON? = .decimal(row.sensitivityRatio)
         let reason: HealthIngestJSON = row.reason.map { .string($0) } ?? .null
         let zone = note?.timeZone ?? HealthIngestTime.zoneIdentifier
         return .object([
@@ -776,48 +775,8 @@ struct HealthIngestDiabetesAdapter {
         NSDecimalNumber(decimal: value).doubleValue
     }
 
-    private static func switchTrigger(_ raw: String?) -> String {
-        let folded = (raw ?? "manual").lowercased().map { character -> Character in
-            if character.isLetter || character.isNumber || character == "_" || character == "-" { return character }
-            return "_"
-        }
-        var text = String(folded).trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        while text.contains("__") { text = text.replacingOccurrences(of: "__", with: "_") }
-        guard let first = text.first, first.isLetter else { return "manual" }
-        return String(text.prefix(64))
-    }
-
-    private static func pumpEventName(_ raw: String) -> String {
-        switch raw {
-        case "SiteChange",
-             "Site Change": return "site_change"
-        case "PumpSuspend": return "suspend"
-        case "PumpResume": return "resume"
-        case "PumpAlarm": return "alarm"
-        case "PumpBattery",
-             "Pump Battery Change": return "battery_change"
-        case "Insulin Change": return "reservoir_change"
-        case "Rewind": return "rewind"
-        case "Prime": return "prime"
-        default:
-            break
-        }
-        let folded = raw.lowercased().map { character -> Character in
-            if character.isLetter || character.isNumber { return character }
-            return "_"
-        }
-        var text = String(folded)
-        while text.contains("__") {
-            text = text.replacingOccurrences(of: "__", with: "_")
-        }
-        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "_"))
-        guard let first = text.first, first.isLetter || first.isNumber, text.count <= 64 else { return "other" }
-        return text
-    }
-
-    private static func positiveNumber(_ value: NSDecimalNumber?) -> HealthIngestJSON? {
-        guard let value, value.doubleValue > 0 else { return nil }
-        return .number(value.doubleValue)
+    private static func finiteNumber(_ value: NSDecimalNumber?) -> HealthIngestJSON? {
+        HealthIngestJSON.decimal(value)
     }
 
     private static func smbWindow(_ row: OverrideStored?) -> (start: String, end: String)? {
@@ -837,7 +796,7 @@ struct HealthIngestDiabetesAdapter {
     ) -> HealthIngestRecord {
         HealthIngestRecord(
             type: type,
-            id: HealthIngestRecordID.sanitize(id),
+            id: id,
             start: start,
             end: end,
             tz: HealthIngestTime.zoneIdentifier,

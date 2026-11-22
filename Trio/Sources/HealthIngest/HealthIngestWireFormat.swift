@@ -39,7 +39,7 @@ enum HealthIngestWire {
 
     /// Bump when on-device payloads change so rejected receipts and HealthKit
     /// backfill cursors can be cleared and the records sent again.
-    static let mappingVersion = 2
+    static let mappingVersion = 3
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed
@@ -229,66 +229,25 @@ enum HealthIngestIdentity {
     }
 }
 
-/// Record ids must be 1–200 characters of letters, digits, and . _ : -
-enum HealthIngestRecordID {
-    static func sanitize(_ raw: String) -> String {
-        let folded = raw.map { character -> Character in
-            if character.isLetter || character.isNumber || character == "." || character == "_" || character == ":" || character == "-" {
-                return character
-            }
-            return "-"
-        }
-        var text = String(folded)
-        while text.contains("--") {
-            text = text.replacingOccurrences(of: "--", with: "-")
-        }
-        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "-._:"))
-        if text.isEmpty { return "id" }
-        if let first = text.first, !first.isLetter, !first.isNumber {
-            text = "id-" + text
-        }
-        return String(text.prefix(200))
-    }
-
-    /// Profile names and other id fragments. Spaces and punctuation become "-".
-    static func component(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        let folded = trimmed.map { character -> Character in
-            if character.isLetter || character.isNumber || character == "." || character == "_" || character == "-" {
-                return character
-            }
-            return "-"
-        }
-        var text = String(folded)
-        while text.contains("--") {
-            text = text.replacingOccurrences(of: "--", with: "-")
-        }
-        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
-        if text.isEmpty { return "unnamed" }
-        return String(text.prefix(80))
-    }
-}
-
 enum HealthIngestPayload {
-    /// Server contract: diaHours must be > 0 and <= 24. Omit rather than send 0.
-    static func diaHours(_ hours: Double) -> HealthIngestJSON? {
-        guard hours.isFinite, hours > 0 else { return nil }
-        return .number(min(hours, 24))
+    /// JSON cannot represent NaN or infinity. Every other stored value is sent as-is.
+    static func finiteNumber(_ value: Double) -> HealthIngestJSON? {
+        guard value.isFinite else { return nil }
+        return .number(value)
     }
 
-    /// Server contract: multiplier must be > 0 and <= 10 if sent. A 0% override omits the field.
+    static func diaHours(_ hours: Double) -> HealthIngestJSON? {
+        finiteNumber(hours)
+    }
+
+    /// Trio stores an override as a percent; the wire field is a multiplier.
     static func unitMultiplier(percentage: Double?) -> HealthIngestJSON? {
         guard let percentage, percentage.isFinite else { return nil }
-        let multiplier = percentage / 100
-        guard multiplier > 0, multiplier <= 10 else { return nil }
-        return .number(multiplier)
+        return .number(percentage / 100)
     }
 
-    /// Optional predicted-BG fields. Omit non-finite or, until the server allows
-    /// oref negatives, values below 0, so one field does not fail the whole cycle.
     static func predictedBG(_ value: Double) -> HealthIngestJSON? {
-        guard value.isFinite, value >= 0, value <= 2000 else { return nil }
-        return .number(value)
+        finiteNumber(value)
     }
 
     static func predictedBG(_ value: Decimal?) -> HealthIngestJSON? {
@@ -412,12 +371,12 @@ enum HealthIngestJSON: Codable, Equatable {
 
     static func decimal(_ value: Decimal?) -> HealthIngestJSON? {
         guard let value else { return nil }
-        return .number(NSDecimalNumber(decimal: value).doubleValue)
+        return HealthIngestPayload.finiteNumber(NSDecimalNumber(decimal: value).doubleValue)
     }
 
     static func decimal(_ value: NSDecimalNumber?) -> HealthIngestJSON? {
         guard let value else { return nil }
-        return .number(value.doubleValue)
+        return HealthIngestPayload.finiteNumber(value.doubleValue)
     }
 
     init(jsonObject: Any) {

@@ -43,17 +43,18 @@ enum HealthIngestCanonicalJSON {
     }
 
     static func clock(seconds: Int) -> String {
-        let bounded = min(max(seconds, 0), (23 * 60 + 59) * 60)
-        return String(format: "%02d:%02d", bounded / 3600, (bounded % 3600) / 60)
+        let hour = seconds / 3600
+        let minute = (seconds % 3600) / 60
+        return String(format: "%d:%02d", hour, abs(minute))
     }
 
     /// `HH:MM` from a stored clock string (`HH:MM` or `HH:MM:SS`) or from seconds.
     static func clock(start: String, seconds: Int) -> String {
         let parts = start.split(separator: ":")
         if parts.count >= 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
-           (0 ... 23).contains(hour), (0 ... 59).contains(minute)
+           (0 ... 59).contains(minute)
         {
-            return String(format: "%02d:%02d", hour, minute)
+            return String(format: "%d:%02d", hour, minute)
         }
         return clock(seconds: seconds)
     }
@@ -61,11 +62,10 @@ enum HealthIngestCanonicalJSON {
     /// Stored override SMB window values are hours (22 means 22:00).
     static func clock(hour value: Decimal) -> String? {
         let number = NSDecimalNumber(decimal: value).doubleValue
-        guard number.isFinite, number >= 0, number < 24 else { return nil }
+        guard number.isFinite else { return nil }
         let hour = Int(number)
         let minute = Int(((number - Double(hour)) * 60).rounded())
-        guard (0 ... 59).contains(minute) else { return nil }
-        return String(format: "%02d:%02d", hour, minute)
+        return String(format: "%d:%02d", hour, abs(minute))
     }
 
     static func mgdl(_ value: Double, units: String) -> Double {

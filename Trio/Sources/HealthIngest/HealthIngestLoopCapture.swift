@@ -251,7 +251,7 @@ enum HealthIngestLoopCapture {
         pending.append(
             Stat(
                 start: start,
-                end: end < start ? start : end,
+                end: end,
                 result: result,
                 error: error,
                 timeZone: TimeZone.current.identifier

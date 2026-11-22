@@ -380,7 +380,7 @@ final class HealthIngestHealthKitReader {
         ) else { return nil }
         return HealthIngestRecord(
             type: HealthIngestType.workout,
-            id: HealthIngestRecordID.sanitize(workout.uuid.uuidString),
+            id: workout.uuid.uuidString,
             start: workout.startDate,
             end: workout.endDate,
             tz: HealthIngestTime.zoneIdentifier,
@@ -413,7 +413,7 @@ final class HealthIngestHealthKitReader {
         ) else { return nil }
         return HealthIngestRecord(
             type: recordType,
-            id: HealthIngestRecordID.sanitize(sample.uuid.uuidString),
+            id: sample.uuid.uuidString,
             start: sample.startDate,
             end: end,
             tz: HealthIngestTime.zoneIdentifier,
@@ -430,7 +430,7 @@ final class HealthIngestHealthKitReader {
         ) else { return nil }
         return HealthIngestRecord(
             type: HealthIngestType.sleepStage,
-            id: HealthIngestRecordID.sanitize(sample.uuid.uuidString),
+            id: sample.uuid.uuidString,
             start: sample.startDate,
             end: end,
             tz: HealthIngestTime.zoneIdentifier,
@@ -459,14 +459,15 @@ final class HealthIngestHealthKitReader {
         default:
             // HKWorkoutActivityType.dance is raw value 14. It is deprecated, and older workouts still use it.
             if type.rawValue == 14 { return "dance" }
-            return "other"
+            return "hkWorkoutActivityType.\(type.rawValue)"
         }
     }
 }
 
 
 
-/// Builds HealthKit ingest payloads using the server contract field names and ranges.
+/// Builds HealthKit ingest payloads using the server contract field names.
+/// Values are sent as stored; only non-finite numbers are dropped, because JSON cannot represent them.
 enum HealthIngestHealthMapping {
     static let source = "healthkit"
 
@@ -478,27 +479,18 @@ enum HealthIngestHealthMapping {
     static func quantityPayload(recordType: String, value: Double) -> HealthIngestJSON? {
         guard value.isFinite else { return nil }
         let key: String
-        let valid: Bool
         switch recordType {
-        case HealthIngestType.heartRate:
+        case HealthIngestType.heartRate, HealthIngestType.restingHR:
             key = "bpm"
-            valid = value >= 1 && value <= 350
-        case HealthIngestType.restingHR:
-            key = "bpm"
-            valid = value >= 1 && value <= 250
         case HealthIngestType.hrv:
             key = "sdnnMs"
-            valid = value > 0 && value <= 500
         case HealthIngestType.activeEnergy:
             key = "kcal"
-            valid = value >= 0 && value <= 20_000
         case HealthIngestType.exerciseMinutes:
             key = "minutes"
-            valid = value >= 0 && value <= 1_440
         default:
             return nil
         }
-        guard valid else { return nil }
         return .object([
             key: .number(value),
             "source": .string(source)
@@ -513,18 +505,14 @@ enum HealthIngestHealthMapping {
         avgHeartRate: Double?
     ) -> HealthIngestJSON? {
         let name = activity.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name.count <= 128 else { return nil }
-        guard durationSeconds.isFinite, durationSeconds >= 0, durationSeconds <= 172_800 else { return nil }
-        let energy = ranged(energyKcal, min: 0, max: 20_000)
-        if let energyKcal, energy == nil { return nil }
-        let distance = ranged(distanceMeters, min: 0, max: 1_000_000)
-        if let distanceMeters, distance == nil { return nil }
+        guard !name.isEmpty else { return nil }
+        guard durationSeconds.isFinite else { return nil }
         return .object([
             "activity": .string(name),
             "durationSeconds": .number(durationSeconds),
-            "energyKcal": energy.map { .number($0) },
-            "distanceMeters": distance.map { .number($0) },
-            "avgHeartRate": ranged(avgHeartRate, min: 1, max: 350).map { .number($0) },
+            "energyKcal": energyKcal.flatMap(HealthIngestPayload.finiteNumber),
+            "distanceMeters": distanceMeters.flatMap(HealthIngestPayload.finiteNumber),
+            "avgHeartRate": avgHeartRate.flatMap(HealthIngestPayload.finiteNumber),
             "source": .string(source)
         ])
     }
@@ -536,21 +524,15 @@ enum HealthIngestHealthMapping {
         ])
     }
 
-    /// Interval types require `end`. A sample with end before start is dropped.
-    /// Instantaneous samples omit `end` when it equals `start`.
+    /// Send the sample's own start and end. Interval types still include `end`
+    /// when it equals or precedes `start`; the server should accept those timestamps.
     static func sampleEnd(recordType: String, start: Date, end: Date) -> SampleEnd {
-        if end < start { return .drop }
         let interval = recordType == HealthIngestType.activeEnergy
             || recordType == HealthIngestType.exerciseMinutes
             || recordType == HealthIngestType.sleepStage
             || recordType == HealthIngestType.workout
         if interval { return .value(end) }
         return .value(end == start ? nil : end)
-    }
-
-    private static func ranged(_ value: Double?, min: Double, max: Double) -> Double? {
-        guard let value, value.isFinite, value >= min, value <= max else { return nil }
-        return value
     }
 }
 

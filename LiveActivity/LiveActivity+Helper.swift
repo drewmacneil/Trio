@@ -157,14 +157,18 @@ func bgAndTrend(
     // and everything has to be squeezed together to some degree
     // only display the first arrow character and make it red in case there were more characters
     var directionText: String?
-    if let direction = context.state.direction {
+    // An empty direction string is theoretically Codable-legal and would trap
+    // on startIndex...startIndex in the compact/minimal island views only.
+    // Lock-screen Text(direction) would still render, matching a "lock works,
+    // island blank" crash of the widget extension.
+    if let direction = context.state.direction, let first = direction.first {
         if size == .compact || size == .minimal {
-            directionText = String(direction[direction.startIndex ... direction.startIndex])
+            directionText = String(first)
         } else {
             directionText = direction
         }
 
-        characters += directionText!.count
+        characters += directionText?.count ?? 0
     }
 
     let spacing: CGFloat

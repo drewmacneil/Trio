@@ -220,10 +220,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     }
 
     private func observeLifecycle() {
-        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+        // The app's NotificationCenter protocol hides Foundation.NotificationCenter.
+        Foundation.NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
             .sink { [weak self] _ in self?.setActive(false) }
             .store(in: &lifecycle)
-        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+        Foundation.NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
             .sink { [weak self] _ in
                 self?.setActive(true)
                 self?.poke()
@@ -352,11 +353,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         } else {
             ready = false
         }
-        stateLock.lock()
-        let active = appActive
-        let catchingUp = diabetesResume != nil
-        stateLock.unlock()
-        if pendingBackfill || ready || catchingUp { return active ? 5 : 30 }
+        let activity = lockedActivity()
+        if pendingBackfill || ready || activity.catchingUp { return activity.active ? 5 : 30 }
         return 90
     }
 
@@ -648,6 +646,13 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         diabetesResume = date
         stateLock.unlock()
         disk?.saveDiabetesResume(date)
+    }
+
+    /// NSLock is unavailable directly inside an async function.
+    private func lockedActivity() -> (active: Bool, catchingUp: Bool) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return (appActive, diabetesResume != nil)
     }
 
     private func lockedLastDiabetesRead() -> Date? {

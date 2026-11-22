@@ -417,12 +417,17 @@ struct HealthIngestDiabetesAdapter {
         let temp = event.tempBasal
         let scheduled = temp?.isScheduledBasal ?? false
         let end = scheduled ? nil : temp?.endDate
+        let rate: HealthIngestJSON? = temp?.rate.flatMap { HealthIngestPayload.finiteNumber($0.doubleValue) }
+        let durationMinutes: HealthIngestJSON? = temp.map { .number(Double($0.duration)) }
+        let automatic: HealthIngestJSON? = scheduled ? nil : .bool(true)
+        let deliveredUnits: HealthIngestJSON? = .decimal(temp?.deliveredUnits)
+        let insulinType: HealthIngestJSON? = event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
         let payload = HealthIngestJSON.object([
-            "rate": temp?.rate.flatMap { HealthIngestPayload.finiteNumber($0.doubleValue) },
-            "durationMinutes": temp?.duration.map { .number(Double($0)) },
-            "automatic": scheduled ? nil : .bool(true),
-            "deliveredUnits": .decimal(temp?.deliveredUnits),
-            "insulinType": event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
+            "rate": rate,
+            "durationMinutes": durationMinutes,
+            "automatic": automatic,
+            "deliveredUnits": deliveredUnits,
+            "insulinType": insulinType
         ])
         return record(
             type: HealthIngestType.tempBasal,

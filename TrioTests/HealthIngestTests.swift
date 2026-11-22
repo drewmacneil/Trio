@@ -354,14 +354,13 @@ import Testing
             let reason = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
             #expect(reason == "hrv hrv-1: payload.sdnnMs is required")
             #expect(await queue.depth() == 1)
-            #expect(await queue.rejectedCount() == 1)
+            #expect(await queue.rejectedCount() == attempt)
             #expect(await queue.hasReady() == false)
-            _ = attempt
         }
         let dropped = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
         #expect(dropped == "hrv hrv-1: payload.sdnnMs is required")
         #expect(await queue.depth() == 0)
-        #expect(await queue.rejectedCount() == 1)
+        #expect(await queue.rejectedCount() == 3)
         #expect(await queue.enqueue([record]).queued == 0)
     }
 
@@ -576,7 +575,12 @@ import Testing
         #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
         #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
         #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
-        #expect(HealthIngestWire.mappingVersion == 4)
+        #expect(HealthIngestWire.mappingVersion == 5)
+        #expect(HealthIngestAck.acceptedRowCount([
+            HealthIngestAck(type: "hrv", id: "1", status: .accepted),
+            HealthIngestAck(type: "hrv", id: "2", status: .duplicate),
+            HealthIngestAck(type: "hrv", id: "3", status: .rejected, reason: "payload.sdnnMs is required")
+        ]) == 1)
         #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.workout) == 90)
         #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.heartRate) == 30)
         let error = NSError(domain: "HealthIngest", code: 1, userInfo: [NSLocalizedDescriptionKey: "Protected health data is unavailable"])
@@ -605,10 +609,125 @@ import Testing
         #expect(loop.count == 103)
         #expect(loop.message == "detail 204")
         #expect(await queue.rejectedCount() == 205)
+        #expect(summary.groups.reduce(0) { $0 + $1.count } == 205)
         await queue.clearRejections()
         #expect(await queue.rejectedCount() == 0)
         #expect(disk.loadRejectLog().events.isEmpty)
+        #expect(disk.loadRejectLog().reasons.isEmpty)
         #expect(await queue.rejectionSummary().groups.isEmpty)
+    }
+
+    @Test func rejectReasonsRemainAfterTheSampleBufferRollsOff() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        for index in 0 ..< HealthIngestRejectLog.capacity {
+            let record = makeRecord(id: "kcal-\(index)", type: HealthIngestType.activeEnergy)
+            #expect(await queue.enqueue([record]).queued == 1)
+            _ = await queue.resolve(
+                batch: [record],
+                acks: [HealthIngestAck(
+                    type: record.type,
+                    id: record.id,
+                    status: .rejected,
+                    reason: "payload.kcal is required",
+                    message: "kcal missing"
+                )],
+                transportFailed: false
+            )
+        }
+        for index in 0 ..< HealthIngestRejectLog.capacity {
+            let record = makeRecord(id: "sdnn-\(index)", type: HealthIngestType.hrv)
+            #expect(await queue.enqueue([record]).queued == 1)
+            _ = await queue.resolve(
+                batch: [record],
+                acks: [HealthIngestAck(
+                    type: record.type,
+                    id: record.id,
+                    status: .rejected,
+                    reason: "payload.sdnnMs is required",
+                    message: "sdnn missing"
+                )],
+                transportFailed: false
+            )
+        }
+        let summary = await queue.rejectionSummary()
+        #expect(disk.loadRejectLog().events.count == HealthIngestRejectLog.capacity)
+        #expect(disk.loadRejectLog().events.allSatisfy { $0.type == HealthIngestType.hrv })
+        let kcal = try #require(summary.groups.first { $0.reason == "payload.kcal is required" })
+        #expect(kcal.count == HealthIngestRejectLog.capacity)
+        #expect(kcal.message == "kcal missing")
+        let rejected = await queue.rejectedCount()
+        #expect(summary.groups.reduce(0) { $0 + $1.count } == rejected)
+    }
+
+    @Test func launchReconcileDropsTheStaleCounterWithoutAMappingBump() async throws {
+        let disk = try makeDisk()
+        disk.saveRejectedCount(15_893)
+        let orphaned = #"{"events":[],"counts":{"hrv\npayload.sdnnMs is required":15893}}"#
+        try orphaned.write(to: disk.directory.appendingPathComponent("reject-log.json"), atomically: true, encoding: .utf8)
+        let queue = HealthIngestQueue(disk: disk)
+        #expect(await queue.rejectionSummary().groups.isEmpty)
+        #expect(await queue.rejectedCount() == 0)
+        await queue.reconcileRejectedCount()
+        #expect(disk.loadRejectedCount() == 0)
+        #expect(disk.loadRejectLog().reasons.isEmpty)
+        #expect(disk.loadRejectLog().didMigrateLegacyCounts == false)
+        let saved = try String(contentsOf: disk.directory.appendingPathComponent("reject-log.json"), encoding: .utf8)
+        #expect(!saved.contains("\"counts\""))
+
+        let visible = """
+        {"events":[{"type":"hrv","reason":"payload.sdnnMs is required","message":"sdnn missing","at":"2026-01-01T00:00:00Z"}],"counts":{"hrv\\npayload.sdnnMs is required":4}}
+        """
+        try visible.write(to: disk.directory.appendingPathComponent("reject-log.json"), atomically: true, encoding: .utf8)
+        disk.saveRejectedCount(15_893)
+        await queue.reconcileRejectedCount()
+        let summary = await queue.rejectionSummary()
+        let group = try #require(summary.groups.first)
+        #expect(group.count == 4)
+        #expect(group.reason == "payload.sdnnMs is required")
+        let rejected = await queue.rejectedCount()
+        #expect(summary.groups.reduce(0) { $0 + $1.count } == rejected)
+        #expect(rejected == 4)
+        #expect(disk.loadRejectedCount() == 4)
+    }
+
+    @Test func freshBackfillReadsAsDayOneUntilTheCursorMoves() {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let untouched = HealthIngestBackfillProgress.frontier(start: start, cursor: nil, resume: nil)
+        let fresh = HealthIngestBackfillProgress.measure(
+            start: start,
+            frontier: untouched,
+            days: 90,
+            rowsSent: 0,
+            phase: "Reading Health samples"
+        )
+        #expect(untouched == start)
+        #expect(fresh.day == 1)
+        #expect(fresh.days == 90)
+        #expect(fresh.rowsSent == 0)
+        #expect(fresh.fraction == 0)
+
+        let day23 = start.addingTimeInterval(22 * 24 * 3600)
+        let reading = HealthIngestBackfillProgress.measure(
+            start: start,
+            frontier: HealthIngestBackfillProgress.frontier(start: start, cursor: day23, resume: nil),
+            days: 90,
+            rowsSent: 1_240,
+            phase: "Reading Health samples"
+        )
+        #expect(reading.day == 23)
+        #expect(reading.rowsSent == 1_240)
+
+        let finishedAt = start.addingTimeInterval(90 * 24 * 3600)
+        let finished = HealthIngestBackfillProgress.measure(
+            start: start,
+            frontier: HealthIngestBackfillProgress.frontier(start: start, cursor: finishedAt, resume: nil),
+            days: 90,
+            rowsSent: 4_000,
+            phase: "Reading Health samples"
+        )
+        #expect(finished.day == 90)
+        #expect(finished.fraction == 1)
     }
 
     private func makeDisk() throws -> HealthIngestDisk {

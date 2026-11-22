@@ -167,6 +167,29 @@ struct HealthIngestBackfillProgress: Equatable {
     var phase: String
     /// 0...1 across the selected day window.
     var fraction: Double
+
+    /// Where this pass has read to. A missing cursor has not advanced, so the window
+    /// start is used. Using "now" made a fresh 90-day pass display as day 90 before any row was sent.
+    static func frontier(start: Date, cursor: Date?, resume: Date?) -> Date {
+        if let cursor, let resume {
+            return min(cursor, resume)
+        }
+        return cursor ?? resume ?? start
+    }
+
+    static func measure(start: Date, frontier: Date, days: Int, rowsSent: Int, phase: String) -> HealthIngestBackfillProgress {
+        let elapsed = max(0, frontier.timeIntervalSince(start))
+        let total = Double(max(days, 1)) * 24 * 3600
+        let day = min(max(days, 1), max(1, Int(elapsed / (24 * 3600)) + 1))
+        let fraction = min(1, elapsed / total)
+        return HealthIngestBackfillProgress(
+            days: days,
+            day: day,
+            rowsSent: rowsSent,
+            phase: phase,
+            fraction: fraction
+        )
+    }
 }
 
 struct HealthIngestStatus: Equatable {

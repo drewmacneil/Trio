@@ -421,7 +421,9 @@ extension Notification.Name {
                    let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController
                 {
                     rootVC.excludeKeyboardFromSafeAreaTree()
-                    AppVersionChecker.shared.checkAndNotifyVersionStatus(in: rootVC)
+                    if !Self.healthIngestCaptureLaunch {
+                        AppVersionChecker.shared.checkAndNotifyVersionStatus(in: rootVC)
+                    }
                 }
                 requestAlarmAuthorizationIfNeeded()
                 if initState.complete {
@@ -437,8 +439,19 @@ extension Notification.Name {
         guard initState.complete, !onboardingManager.shouldShowOnboarding else {
             return
         }
+        if Self.healthIngestCaptureLaunch { return }
 
         Task { await CriticalAlertAlarmScheduler.requestAuthorization() }
+    }
+
+    /// Debug launches that capture Health Ingest must not cover the screen with startup alerts.
+    private static var healthIngestCaptureLaunch: Bool {
+        #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            return args.contains("-HealthIngestScreenshot") || args.contains("-HealthIngestEmbedded")
+        #else
+            return false
+        #endif
     }
 
     func configureTabBarAppearance() {

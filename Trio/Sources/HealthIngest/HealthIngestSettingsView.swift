@@ -48,7 +48,10 @@ struct HealthIngestSettingsView: View {
             },
             testConnection: runTest,
             startBackfill: { uploader.backfill(days: backfillDays) },
-            resetBackfill: { uploader.resetBackfill(days: backfillDays) },
+            resetBackfill: {
+                let days = uploader.status.backfillRunning ? (uploader.status.backfill?.days ?? backfillDays) : backfillDays
+                uploader.resetBackfill(days: days)
+            },
             clearRejections: { uploader.clearRejections() },
             background: appState.trioBackgroundColor(for: colorScheme)
         )
@@ -132,7 +135,7 @@ struct HealthIngestSettingsForm: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Trio will resend up to \(backfillDays) days of Health data from scratch. The current backfill will stop. Nothing is deleted."
+                "Trio will resend up to \(windowDays) days of Health data from scratch. The current backfill will stop. Nothing is deleted."
             )
         }
     }
@@ -177,18 +180,18 @@ struct HealthIngestSettingsForm: View {
                 .autocorrectionDisabled()
             Button("Save token", action: saveToken)
                 .disabled(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            Button(action: testConnection) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(testing ? "Testing…" : "Test connection")
-                        .foregroundStyle(Color.accentColor)
-                    if let testResult {
-                        connectionResult(testResult)
-                    }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(testing ? "Testing…" : "Test connection")
+                    .foregroundStyle(Color.accentColor)
+                if let testResult {
+                    connectionResult(testResult)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .buttonStyle(.plain)
-            .disabled(testing)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                if !testing { testConnection() }
+            }
             if hasToken {
                 Button("Remove token", role: .destructive, action: removeToken)
             }
@@ -266,7 +269,7 @@ struct HealthIngestSettingsForm: View {
 
     private var backfillSection: some View {
         Section {
-            Picker("Days", selection: $backfillDays) {
+            Picker("Days", selection: daysSelection) {
                 ForEach(backfillChoices, id: \.self) { days in
                     Text("\(days)").tag(days)
                 }
@@ -304,6 +307,26 @@ struct HealthIngestSettingsForm: View {
             Text("Forgets upload progress and resends the selected window. Nothing is deleted; the server skips duplicates.")
         }
         .listRowBackground(Color.chart)
+    }
+
+    /// While a pass is running the locked picker shows that pass. It does not replace the
+    /// user's selection, which returns when the pass ends.
+    private var windowDays: Int {
+        if status.backfillRunning, let days = status.backfill?.days {
+            return days
+        }
+        return backfillDays
+    }
+
+    private var daysSelection: Binding<Int> {
+        Binding(
+            get: { windowDays },
+            set: { newValue in
+                if !status.backfillRunning {
+                    backfillDays = newValue
+                }
+            }
+        )
     }
 
     private var enabledBinding: Binding<Bool> {

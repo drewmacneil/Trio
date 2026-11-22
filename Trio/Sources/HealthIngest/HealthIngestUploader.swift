@@ -212,6 +212,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         guard let queue = try? prepare(), let health, let disk else { return }
         guard disk.loadMappingVersion() < HealthIngestWire.mappingVersion else { return }
         await queue.forgetRejectedReceipts()
+        await queue.clearRejections()
         await queue.dropTypes(HealthIngestType.contractResendTypes)
         health.resetBackfillCursors()
         HealthIngestLoopCapture.requeueStoredProfiles()
@@ -363,6 +364,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     }
 
     private func run() async {
+        if let queue {
+            await queue.reconcileRejectedCount()
+        }
         await applyMappingUpgradeIfNeeded()
         while !Task.isCancelled {
             let prefs = currentPreferences()
@@ -455,7 +459,6 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         func enqueuePage(_ records: [HealthIngestRecord]) async {
             let added = await queue.enqueue(records)
             oversized += added.oversized
-            noteBackfillRows(added.queued)
             if added.queued > 0 {
                 debug(.healthKit, "Health Ingest queued \(added.queued) records")
             }
@@ -625,6 +628,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 return true
             }
             let acks = try HealthIngestWire.parseAcks(data)
+            noteBackfillRows(HealthIngestAck.acceptedRowCount(acks))
             if let reject = await queue.resolve(batch: batch, acks: acks, transportFailed: false) {
                 let message = "A record was rejected: \(String(reject.prefix(180)))"
                 setLastError(message)
@@ -735,6 +739,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return lastError
     }
 
+    /// Server-accepted rows for the pass that is running now. Queued and duplicate rows are not included.
     private func noteBackfillRows(_ count: Int) {
         guard count > 0 else { return }
         stateLock.lock()
@@ -751,37 +756,29 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         let resume = diabetesResume
         stateLock.unlock()
         guard running, days > 0, let start else { return nil }
-        let now = Date()
-        var frontier = resume ?? now
-        if let cursor = health?.oldestPendingCursor(preferences: preferences) {
-            frontier = min(frontier, cursor)
-        }
-        let elapsed = max(0, frontier.timeIntervalSince(start))
-        let total = Double(days) * 24 * 3600
-        let day = min(days, max(1, Int(elapsed / (24 * 3600)) + 1))
-        let fraction = total > 0 ? min(1, elapsed / total) : 0
-        return HealthIngestBackfillProgress(
+        let cursor = health?.oldestPendingCursor(preferences: preferences)
+        let frontier = HealthIngestBackfillProgress.frontier(start: start, cursor: cursor, resume: resume)
+        return HealthIngestBackfillProgress.measure(
+            start: start,
+            frontier: frontier,
             days: days,
-            day: day,
             rowsSent: rows,
-            phase: "Reading Health samples",
-            fraction: fraction
+            phase: "Reading Health samples"
         )
     }
 
     private func publishSnapshot(depth: Int) {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
-        let latest = log.events.max(by: { $0.at < $1.at })?.reason
         let running = lockedBackfillRunning()
         let snapshot = HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
             queueDepth: depth,
-            rejectedCount: disk?.loadRejectedCount() ?? 0,
+            rejectedCount: log.total,
             hasToken: settingsStore.hasToken(),
             backfillRunning: running,
-            latestRejectReason: latest,
+            latestRejectReason: log.latestReason,
             rejectGroups: log.groups(),
             backfill: running ? backfillProgress(preferences: prefs) : nil
         )

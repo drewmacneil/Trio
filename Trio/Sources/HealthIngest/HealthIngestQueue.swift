@@ -47,45 +47,98 @@ struct HealthIngestEnqueueResult: Equatable {
     var oversized: Int
 }
 
+struct HealthIngestRejectReason: Codable, Equatable {
+    var type: String
+    var reason: String
+    var message: String
+    var count: Int
+    var lastSeen: Date
+}
+
 struct HealthIngestRejectLog: Codable, Equatable {
     static let capacity = 200
 
-    /// Newest last.
+    /// Newest last. Only the latest samples; reasons below survive after this rolls.
     var events: [HealthIngestRejectEvent] = []
-    /// Lifetime counts until Clear, keyed by `type` + newline + `reason`.
-    var counts: [String: Int] = [:]
+    /// One row per type and reason. Status and the detail screen both read this.
+    var reasons: [HealthIngestRejectReason] = []
+    /// True when this value was decoded from the old `counts` map and should be rewritten.
+    var didMigrateLegacyCounts = false
 
-    static func key(type: String, reason: String) -> String { "\(type)\n\(reason)" }
+    var total: Int { reasons.reduce(0) { $0 + $1.count } }
+
+    var latestReason: String? {
+        reasons.max(by: { $0.lastSeen < $1.lastSeen })?.reason
+    }
 
     mutating func append(type: String, reason: String, message: String, at: Date) {
         events.append(HealthIngestRejectEvent(type: type, reason: reason, message: message, at: at))
         if events.count > Self.capacity {
             events.removeFirst(events.count - Self.capacity)
         }
-        let key = Self.key(type: type, reason: reason)
-        counts[key, default: 0] += 1
+        if let index = reasons.firstIndex(where: { $0.type == type && $0.reason == reason }) {
+            reasons[index].count += 1
+            reasons[index].message = message
+            reasons[index].lastSeen = at
+        } else {
+            reasons.append(
+                HealthIngestRejectReason(type: type, reason: reason, message: message, count: 1, lastSeen: at)
+            )
+        }
     }
 
     func groups() -> [HealthIngestRejectGroup] {
-        var latest: [String: HealthIngestRejectEvent] = [:]
-        for event in events {
-            let key = Self.key(type: event.type, reason: event.reason)
-            if let existing = latest[key], existing.at > event.at { continue }
-            latest[key] = event
-        }
-        return latest.values.map { event in
-            let key = Self.key(type: event.type, reason: event.reason)
-            return HealthIngestRejectGroup(
-                type: event.type,
-                reason: event.reason,
-                message: event.message,
-                count: counts[key] ?? 1,
-                lastSeen: event.at
+        reasons.map {
+            HealthIngestRejectGroup(
+                type: $0.type,
+                reason: $0.reason,
+                message: $0.message,
+                count: $0.count,
+                lastSeen: $0.lastSeen
             )
         }
         .sorted { lhs, rhs in
             if lhs.type != rhs.type { return lhs.type < rhs.type }
             return lhs.lastSeen > rhs.lastSeen
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(events, forKey: .events)
+        try container.encode(reasons, forKey: .reasons)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case events
+        case reasons
+        case counts
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        events = try container.decodeIfPresent([HealthIngestRejectEvent].self, forKey: .events) ?? []
+        reasons = try container.decodeIfPresent([HealthIngestRejectReason].self, forKey: .reasons) ?? []
+        guard reasons.isEmpty, let counts = try container.decodeIfPresent([String: Int].self, forKey: .counts), !counts.isEmpty else { return }
+        didMigrateLegacyCounts = true
+        // A counts map with no samples never appeared in the detail list. Importing it
+        // would bring back a stale total such as 15,893. Leave the store empty.
+        guard !events.isEmpty else { return }
+        for (key, count) in counts {
+            let parts = key.split(separator: "\n", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let match = events.last { $0.type == parts[0] && $0.reason == parts[1] }
+            reasons.append(
+                HealthIngestRejectReason(
+                    type: parts[0],
+                    reason: parts[1],
+                    message: match?.message ?? parts[1],
+                    count: count,
+                    lastSeen: match?.at ?? .distantPast
+                )
+            )
         }
     }
 }
@@ -452,18 +505,34 @@ actor HealthIngestQueue {
     /// Rows held in memory. Never above `windowCap` after init or an enqueue.
     func windowCount() -> Int { items.count }
 
-    func rejectedCount() -> Int { disk.loadRejectedCount() }
+    /// Sum of the per-reason counts. Matches the detail screen, including reasons
+    /// whose samples have already rolled off the 200-event buffer.
+    func rejectedCount() -> Int { disk.loadRejectLog().total }
+
+    /// The per-reason store is the only source of truth. Phones that already shipped
+    /// can still have the old integer file (15,893) with an empty detail list. Rewrite
+    /// that file on launch so the stale number is gone without a mapping-version bump.
+    func reconcileRejectedCount() {
+        let log = disk.loadRejectLog()
+        if log.didMigrateLegacyCounts {
+            disk.saveRejectLog(log)
+        }
+        let total = log.total
+        if disk.loadRejectedCount() != total {
+            disk.saveRejectedCount(total)
+        }
+    }
 
     func recordRejection(type: String, reason: String, message: String, at: Date = Date()) {
         var log = disk.loadRejectLog()
         log.append(type: type, reason: reason, message: message, at: at)
         disk.saveRejectLog(log)
+        disk.saveRejectedCount(log.total)
     }
 
     func rejectionSummary() -> (latest: String?, groups: [HealthIngestRejectGroup]) {
         let log = disk.loadRejectLog()
-        let latest = log.events.max(by: { $0.at < $1.at })?.reason
-        return (latest, log.groups())
+        return (log.latestReason, log.groups())
     }
 
     func clearRejections() {
@@ -577,9 +646,6 @@ actor HealthIngestQueue {
                 lastReject = "\(ack.type) \(ack.id): \(detail)"
                 items[index].failures += 1
                 recordRejection(type: ack.type, reason: reason, message: detail, at: now)
-                if items[index].failures == 1 {
-                    disk.saveRejectedCount(disk.loadRejectedCount() + 1)
-                }
                 if items[index].failures >= 3 {
                     remove.insert(key)
                     remember(key: key, hash: items[index].hash, state: .rejected, at: now)

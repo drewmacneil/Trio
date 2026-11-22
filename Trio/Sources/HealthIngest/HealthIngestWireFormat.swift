@@ -41,7 +41,9 @@ enum HealthIngestWire {
     /// backfill cursors can be cleared and the records sent again.
     /// 4 resends Core Data loop cycles and effective profiles the server used to reject
     /// (finite predicted glucose, and schedule starts in HH:MM or HH:MM:SS).
-    static let mappingVersion = 4
+    /// 5 clears the reject counter and the reason log together. Version 4 left the
+    /// old counter in place after the new buffer was empty.
+    static let mappingVersion = 5
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed
@@ -379,6 +381,13 @@ struct HealthIngestAck: Equatable {
         self.status = status
         self.reason = reason
         self.message = message
+    }
+
+    /// Rows the server accepted in this response. Duplicates and rejects are not counted.
+    static func acceptedRowCount(_ acks: [HealthIngestAck]) -> Int {
+        acks.reduce(0) { count, ack in
+            count + (ack.status == .accepted ? 1 : 0)
+        }
     }
 
     init?(json: Any) {

@@ -42,7 +42,10 @@ import Testing
     }
 
     @Test("Basal rates are kept at three decimal places") func basalRatesRounded() throws {
-        let danaRates = (0 ... 300).map { Double($0) / 100 }.filter { $0 > 0 }.map { Decimal($0) }
+        // Split up so the type checker doesn't time out on slower machines.
+        let steps: [Double] = (0 ... 300).map { (step: Int) -> Double in Double(step) / 100 }
+        let positiveSteps: [Double] = steps.filter { (value: Double) -> Bool in value > 0 }
+        let danaRates: [Decimal] = positiveSteps.map { (value: Double) -> Decimal in Decimal(value) }
         let noisy = danaRates.filter { $0 != $0.rounded(scale: 3) }
         #expect(!noisy.isEmpty)
 

@@ -17,7 +17,7 @@ enum HealthIngestWire {
     static let statusPath = "/v1/status"
     static let gzipThreshold = 1024
     static let maxBatchRecords = 500
-    static let maxBatchBytes = 4 * 1024 * 1024
+    static let maxBatchBytes = 1024 * 1024
     static let maxPayloadBytes = 128 * 1024
     static let profileIDPrefix = "profile"
     static let settingsIDPrefix = "settings"

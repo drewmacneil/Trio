@@ -89,7 +89,7 @@ import Testing
         let device = try #require(json["device"] as? [String: Any])
         #expect(device["app"] as? String == "trio")
         #expect(HealthIngestWire.maxBatchRecords == 500)
-        #expect(HealthIngestWire.maxBatchBytes == 4 * 1024 * 1024)
+        #expect(HealthIngestWire.maxBatchBytes == 1024 * 1024)
         #expect(HealthIngestWire.maxPayloadBytes == 128 * 1024)
         #expect(device["id"] as? String == "device-1")
         let records = try #require(json["records"] as? [[String: Any]])
@@ -508,6 +508,73 @@ import Testing
         #expect(await queue.enqueue([first]).queued == 1)
     }
 
+
+    @Test func canonicalJSONMatchesJavaScriptStringEscaping() {
+        // JSON.stringify leaves "/" and non-ASCII raw and escapes only ", \\ and C0 controls.
+        // JSONSerialization wrote "\\/", which changed the id of any snapshot containing "mg/dL".
+        let payload = HealthIngestJSON.object([
+            "values": .object([
+                "preferences": .object([
+                    "units": .string("mg/dL"),
+                    "name": .string("a\"b\\c\n\u{01}é")
+                ]),
+                "n": .array([.number(1), .number(2.5)])
+            ])
+        ])
+        let expected = "{\"values\":{\"n\":[1,2.5],\"preferences\":{\"name\":\"a\\\"b\\\\c\\n\\u0001é\",\"units\":\"mg/dL\"}}}"
+        #expect(HealthIngestCanonicalJSON.string(payload) == expected)
+        #expect(HealthIngestCanonicalJSON.digest(payload) == "864be80a81810c42970c041c89eed7cf")
+        #expect(HealthIngestCanonicalJSON.digest(canonical: expected) == HealthIngestCanonicalJSON.digest(payload))
+    }
+
+    @Test func queueKeepsOnlyAWindowInMemoryAndSpillsTheRest() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let total = 2_600
+        var sent = 0
+        while sent < total {
+            let upper = min(sent + 500, total)
+            let records = (sent ..< upper).map { makeRecord(id: "hr-\($0)", type: HealthIngestType.heartRate) }
+            #expect(await queue.enqueue(records).queued == records.count)
+            #expect(await queue.windowCount() <= HealthIngestQueue.windowCap)
+            sent = upper
+        }
+        #expect(await queue.depth() == total)
+        #expect(await queue.windowCount() == HealthIngestQueue.windowCap)
+
+        // A relaunch sees the same rows without loading them all.
+        let reopened = HealthIngestQueue(disk: disk)
+        #expect(await reopened.depth() == total)
+        #expect(await reopened.windowCount() <= HealthIngestQueue.windowCap)
+
+        var delivered = Set<String>()
+        while true {
+            let batch = await reopened.nextBatch(limit: HealthIngestWire.maxBatchRecords, maxBytes: HealthIngestWire.maxBatchBytes)
+            if batch.isEmpty { break }
+            #expect(batch.count <= HealthIngestWire.maxBatchRecords)
+            #expect(await reopened.windowCount() <= HealthIngestQueue.windowCap)
+            let acks = batch.map { HealthIngestAck(type: $0.type, id: $0.id, status: .accepted, reason: nil) }
+            _ = await reopened.resolve(batch: batch, acks: acks, transportFailed: false)
+            for record in batch { delivered.insert(record.id) }
+        }
+        #expect(delivered.count == total)
+        #expect(await reopened.depth() == 0)
+    }
+
+    @Test func anOversizedLegacyQueueFileIsSplitIntoSegmentsOnOpen() async throws {
+        let disk = try makeDisk()
+        let legacy = (0 ..< 2_500).map { index -> HealthIngestQueuedRecord in
+            let record = makeRecord(id: "legacy-\(index)", type: HealthIngestType.hrv)
+            return HealthIngestQueuedRecord(record: record, bytes: 200, hash: "h\(index)", failures: 0, notBefore: Date(timeIntervalSince1970: 0))
+        }
+        disk.saveQueue(legacy)
+        let queue = HealthIngestQueue(disk: disk)
+        #expect(await queue.depth() == 2_500)
+        #expect(await queue.windowCount() <= HealthIngestQueue.windowCap)
+        #expect(disk.loadQueue().count <= HealthIngestQueue.windowCap)
+        await queue.dropTypes([HealthIngestType.hrv])
+        #expect(await queue.depth() == 0)
+    }
 
     private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory

@@ -103,85 +103,127 @@ final class HealthIngestHealthKitReader {
         return Self.readTypes().contains { preferences.isOn($0.category) && cursors[$0.recordType] != nil }
     }
 
-    func incremental(preferences: HealthIngestPreferences) async -> HealthIngestReadResult {
-        guard HKHealthStore.isHealthDataAvailable() else { return HealthIngestReadResult() }
+    /// Receives one page of mapped records. The reader never accumulates pages, so at most
+    /// one page of `HKSample`s and records is alive at a time.
+    typealias PageSink = ([HealthIngestRecord]) async -> Void
+
+    /// Anchored reads, `pageLimit` samples per query and at most `maxPagesPerKind` queries per
+    /// type per call. Remaining samples are picked up by the next call because the anchor only
+    /// advances past samples that were handed to `sink`. Returns user-visible errors.
+    func incremental(
+        preferences: HealthIngestPreferences,
+        pageLimit: Int,
+        maxPagesPerKind: Int,
+        sink: PageSink
+    ) async -> [String] {
+        guard HKHealthStore.isHealthDataAvailable() else { return [] }
         loadIfNeeded()
-        var result = HealthIngestReadResult()
+        var errors: [String] = []
         for kind in Self.readTypes() where preferences.isOn(kind.category) {
-            let page = await anchoredPage(kind: kind)
-            result.records.append(contentsOf: page.records)
-            result.errors.append(contentsOf: page.errors)
+            if Task.isCancelled { break }
+            errors.append(contentsOf: await anchoredPages(kind: kind, limit: pageLimit, maxPages: maxPagesPerKind, sink: sink))
         }
-        persist()
-        return result
+        return errors
     }
 
-    func backfill(preferences: HealthIngestPreferences) async -> HealthIngestReadResult {
-        guard HKHealthStore.isHealthDataAvailable() else { return HealthIngestReadResult() }
+    /// Backfill reads round-robin across types, one `pageLimit` page at a time, `maxPages` pages
+    /// in total per call. The cursor for a type only advances after its page went to `sink`.
+    func backfill(
+        preferences: HealthIngestPreferences,
+        pageLimit: Int,
+        maxPages: Int,
+        sink: PageSink
+    ) async -> [String] {
+        guard HKHealthStore.isHealthDataAvailable() else { return [] }
         loadIfNeeded()
-        var result = HealthIngestReadResult()
-        for kind in Self.readTypes() where preferences.isOn(kind.category) && cursors[kind.recordType] != nil {
-            let page = await backfillPage(kind: kind)
-            result.records.append(contentsOf: page.records)
-            result.errors.append(contentsOf: page.errors)
-        }
-        persist()
-        return result
-    }
-
-    private func anchoredPage(kind: SampleKind) async -> HealthIngestReadResult {
-        let existing = anchor(for: kind.recordType)
-        let predicate: NSPredicate? = existing == nil
-            ? HKQuery.predicateForSamples(withStart: Date().addingTimeInterval(-24 * 3600), end: nil, options: .strictStartDate)
-            : nil
-        do {
-            let page = try await anchoredQuery(type: kind.sampleType, predicate: predicate, anchor: existing)
-            setAnchor(page.anchor, for: kind.recordType)
-            return HealthIngestReadResult(records: page.samples.compactMap { Self.map($0, kind: kind) }, errors: [])
-        } catch {
-            warning(.healthKit, "Health Ingest \(kind.recordType) query failed", error: error)
-            return HealthIngestReadResult(records: [], errors: ["Could not read \(kind.recordType)"])
-        }
-    }
-
-    /// Reads up to 20 pages, then saves a cursor so the next wake continues. Completed cursors are cleared.
-    private func backfillPage(kind: SampleKind) async -> HealthIngestReadResult {
-        guard var cursor = cursors[kind.recordType] else { return HealthIngestReadResult() }
-        var records: [HealthIngestRecord] = []
+        var errors: [String] = []
         var pages = 0
-        while pages < 20 {
-            let predicate = HKQuery.predicateForSamples(withStart: cursor, end: nil, options: .strictStartDate)
-            do {
-                let samples = try await sampleQuery(type: kind.sampleType, predicate: predicate, limit: 400)
-                if samples.isEmpty {
-                    cursors[kind.recordType] = nil
-                    break
-                }
-                records.append(contentsOf: samples.compactMap { Self.map($0, kind: kind) })
-                guard let last = samples.last else { break }
-                if last.startDate > cursor {
-                    cursor = last.startDate
-                } else {
-                    cursor = last.startDate.addingTimeInterval(1)
-                }
-                cursors[kind.recordType] = cursor
+        while pages < maxPages, !Task.isCancelled {
+            var progressed = false
+            for kind in Self.readTypes() where preferences.isOn(kind.category) {
+                if pages >= maxPages || Task.isCancelled { break }
+                guard cursor(for: kind.recordType) != nil else { continue }
+                progressed = true
                 pages += 1
-                if samples.count < 400 {
-                    cursors[kind.recordType] = nil
-                    break
+                if let message = await backfillOnePage(kind: kind, limit: pageLimit, sink: sink) {
+                    errors.append(message)
+                    return errors
                 }
+            }
+            if !progressed { break }
+        }
+        return errors
+    }
+
+    private func anchoredPages(kind: SampleKind, limit: Int, maxPages: Int, sink: PageSink) async -> [String] {
+        var pages = 0
+        while pages < maxPages, !Task.isCancelled {
+            let existing = anchor(for: kind.recordType)
+            let predicate: NSPredicate? = existing == nil
+                ? HKQuery.predicateForSamples(withStart: Date().addingTimeInterval(-24 * 3600), end: nil, options: .strictStartDate)
+                : nil
+            do {
+                let page = try await anchoredQuery(type: kind.sampleType, predicate: predicate, anchor: existing, limit: limit)
+                let count = page.samples.count
+                let records = autoreleasepool { page.samples.compactMap { Self.map($0, kind: kind) } }
+                if !records.isEmpty { await sink(records) }
+                setAnchor(page.anchor, for: kind.recordType)
+                persist()
+                pages += 1
+                if count < limit { break }
             } catch {
-                warning(.healthKit, "Health Ingest \(kind.recordType) backfill failed", error: error)
-                return HealthIngestReadResult(records: records, errors: ["Could not backfill \(kind.recordType)"])
+                warning(.healthKit, "Health Ingest \(kind.recordType) query failed", error: error)
+                return ["Could not read \(kind.recordType)"]
             }
         }
-        return HealthIngestReadResult(records: records, errors: [])
+        return []
+    }
+
+    /// Returns an error message, or nil when the page was read (or the type had nothing left).
+    private func backfillOnePage(kind: SampleKind, limit: Int, sink: PageSink) async -> String? {
+        guard let cursor = cursor(for: kind.recordType) else { return nil }
+        let predicate = HKQuery.predicateForSamples(withStart: cursor, end: nil, options: .strictStartDate)
+        do {
+            let samples = try await sampleQuery(type: kind.sampleType, predicate: predicate, limit: limit)
+            guard let last = samples.last else {
+                setCursor(nil, for: kind.recordType)
+                persist()
+                return nil
+            }
+            let records = autoreleasepool { samples.compactMap { Self.map($0, kind: kind) } }
+            if !records.isEmpty { await sink(records) }
+            if samples.count < limit {
+                setCursor(nil, for: kind.recordType)
+            } else if last.startDate > cursor {
+                setCursor(last.startDate, for: kind.recordType)
+            } else {
+                setCursor(last.startDate.addingTimeInterval(1), for: kind.recordType)
+            }
+            persist()
+            return nil
+        } catch {
+            warning(.healthKit, "Health Ingest \(kind.recordType) backfill failed", error: error)
+            return "Could not backfill \(kind.recordType)"
+        }
+    }
+
+    private func cursor(for recordType: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cursors[recordType]
+    }
+
+    private func setCursor(_ date: Date?, for recordType: String) {
+        lock.lock()
+        cursors[recordType] = date
+        lock.unlock()
     }
 
     private func anchoredQuery(
         type: HKSampleType,
         predicate: NSPredicate?,
-        anchor: HKQueryAnchor?
+        anchor: HKQueryAnchor?,
+        limit: Int
     ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
         let gate = HealthKitQueryGate<(samples: [HKSample], anchor: HKQueryAnchor?)>(store: store)
         return try await withTaskCancellationHandler {
@@ -191,7 +233,7 @@ final class HealthIngestHealthKitReader {
                     type: type,
                     predicate: predicate,
                     anchor: anchor,
-                    limit: HKObjectQueryNoLimit
+                    limit: max(limit, 1)
                 ) { _, samples, _, newAnchor, error in
                     if let error {
                         gate.finish(.failure(error))

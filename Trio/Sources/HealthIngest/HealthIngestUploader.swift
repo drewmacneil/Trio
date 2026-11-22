@@ -35,6 +35,43 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private var contentCancellable: AnyCancellable?
     private var started = false
     private let adapter = HealthIngestDiabetesAdapter()
+    /// Guarded by `stateLock`. False until the app says otherwise, so a launch caused by
+    /// HealthKit background delivery starts with the small background budget.
+    private var appActive = false
+    private var diabetesResume: Date?
+    private var lastDiabetesRead: Date?
+    private var lifecycle = Set<AnyCancellable>()
+
+    /// How much one pass may read, hold, and send. Backgrounded work is kept small because
+    /// iOS gives a background process far less memory before it jetsams it.
+    private struct Budget {
+        var hkPageLimit: Int
+        var backfillPages: Int
+        var incrementalPages: Int
+        var flushBatches: Int
+        var backlogHighWater: Int
+        var diabetesChunk: TimeInterval
+        var minDiabetesInterval: TimeInterval
+
+        static let foreground = Budget(
+            hkPageLimit: 500,
+            backfillPages: 4,
+            incrementalPages: 2,
+            flushBatches: 8,
+            backlogHighWater: 6_000,
+            diabetesChunk: 2 * 24 * 3600,
+            minDiabetesInterval: 0
+        )
+        static let background = Budget(
+            hkPageLimit: 250,
+            backfillPages: 1,
+            incrementalPages: 1,
+            flushBatches: 2,
+            backlogHighWater: 1_500,
+            diabetesChunk: 24 * 3600,
+            minDiabetesInterval: 600
+        )
+    }
 
     init(resolver: Resolver) {
         container = resolver
@@ -44,6 +81,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         storedPreferences = loaded
         preferences = loaded
         status.hasToken = settingsStore.hasToken()
+        observeLifecycle()
         if loaded.enabled {
             // Never decode the on-disk queue or start HealthKit on the
             // main actor. loadServices() resolves this type on MainActor
@@ -181,6 +219,33 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return storedPreferences
     }
 
+    private func observeLifecycle() {
+        NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)
+            .sink { [weak self] _ in self?.setActive(false) }
+            .store(in: &lifecycle)
+        NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                self?.setActive(true)
+                self?.poke()
+            }
+            .store(in: &lifecycle)
+        Task { @MainActor [weak self] in
+            self?.setActive(UIApplication.shared.applicationState == .active)
+        }
+    }
+
+    private func setActive(_ active: Bool) {
+        stateLock.lock()
+        appActive = active
+        stateLock.unlock()
+    }
+
+    private func currentBudget() -> Budget {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return appActive ? .foreground : .background
+    }
+
     /// Starts the upload loop on a utility thread. Must not be called on the
     /// main actor: `prepare()` JSON-decodes the on-disk queue and receipts.
     private func scheduleStart() {
@@ -254,6 +319,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.lock()
         lastSuccess = persisted.lastSuccess
         lastError = persisted.lastError
+        diabetesResume = disk.loadDiabetesResume()
         stateLock.unlock()
         return queue
     }
@@ -286,7 +352,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         } else {
             ready = false
         }
-        if pendingBackfill || ready { return 5 }
+        stateLock.lock()
+        let active = appActive
+        let catchingUp = diabetesResume != nil
+        stateLock.unlock()
+        if pendingBackfill || ready || catchingUp { return active ? 5 : 30 }
         return 90
     }
 
@@ -338,76 +408,109 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             origin: origin,
             token: token,
             deviceID: prefs.normalizedDeviceID,
-            maxBatches: 8
+            maxBatches: currentBudget().flushBatches
         )
         sentAny = firstFlush.sentAny
         failed = firstFlush.failed
 
+        let budget = currentBudget()
         var oversized = 0
-        var healthResult = HealthIngestReadResult()
-        var incremental = HealthIngestReadResult()
-        var diabetes = HealthIngestReadResult()
+        var errors: [String] = []
+
+        func enqueuePage(_ records: [HealthIngestRecord]) async {
+            let added = await queue.enqueue(records)
+            oversized += added.oversized
+            if added.queued > 0 {
+                debug(.healthKit, "Health Ingest queued \(added.queued) records")
+            }
+        }
+
         if !failed, !Task.isCancelled {
-            let since = takeSince()
-            let devices = resolverDevices()
-            diabetes = await adapter.records(
-                since: since.date,
-                preferences: prefs,
-                settings: settingsManager,
-                profiles: profiles,
-                pumpModel: devices.model,
-                supportedBasalRates: devices.rates
-            )
-            var extra: [HealthIngestRecord] = []
-            if prefs.isOn(.loopCycles) {
-                extra.append(contentsOf: timeZoneChange(disk: disk))
-                extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
-                extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
-            }
-            extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
-            if since.backfill {
-                health.beginBackfill(since: since.date, preferences: prefs)
-            }
-            let addedFast = await queue.enqueue(diabetes.records + extra)
-            oversized += addedFast.oversized
-            if addedFast.queued > 0 {
-                debug(.healthKit, "Health Ingest queued \(addedFast.queued) records")
-            }
-            if !failed, !Task.isCancelled {
-                let flush = await flushReadyBatches(
-                    queue: queue,
-                    origin: origin,
-                    token: token,
-                    deviceID: prefs.normalizedDeviceID,
-                    maxBatches: 8
+            let backlog = await queue.depth()
+            let now = Date()
+            let catchingUp = lockedDiabetesResume() != nil
+            let throttled = budget.minDiabetesInterval > 0
+                && (lockedLastDiabetesRead().map { now.timeIntervalSince($0) < budget.minDiabetesInterval } ?? false)
+            let backedUp = catchingUp && backlog >= budget.backlogHighWater
+            if !throttled, !backedUp {
+                let since = takeSince()
+                // A long catch-up or backfill is read one window at a time, not as one fetch.
+                let until = windowEnd(from: since.date, chunk: budget.diabetesChunk)
+                let devices = resolverDevices()
+                let diabetes = await adapter.records(
+                    since: since.date,
+                    until: until,
+                    preferences: prefs,
+                    settings: settingsManager,
+                    profiles: profiles,
+                    pumpModel: devices.model,
+                    supportedBasalRates: devices.rates
                 )
-                sentAny = sentAny || flush.sentAny
-                failed = failed || flush.failed
-            }
-            if !Task.isCancelled, health.hasPendingBackfill(preferences: prefs) {
-                healthResult = await health.backfill(preferences: prefs)
+                errors.append(contentsOf: diabetes.errors)
+                var extra: [HealthIngestRecord] = []
+                if prefs.isOn(.loopCycles) {
+                    extra.append(contentsOf: timeZoneChange(disk: disk))
+                    extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
+                    extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
+                }
+                extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
+                if since.backfill {
+                    health.beginBackfill(since: since.date, preferences: prefs)
+                }
+                await enqueuePage(diabetes.records + extra)
+                setDiabetesResume(until)
+                setLastDiabetesRead(now)
             }
             if !Task.isCancelled {
-                incremental = await health.incremental(preferences: prefs)
-            }
-            let addedHK = await queue.enqueue(healthResult.records + incremental.records)
-            oversized += addedHK.oversized
-            if addedHK.queued > 0 {
-                debug(.healthKit, "Health Ingest queued \(addedHK.queued) Health records")
-            }
-            if !failed, !Task.isCancelled {
                 let flush = await flushReadyBatches(
                     queue: queue,
                     origin: origin,
                     token: token,
                     deviceID: prefs.normalizedDeviceID,
-                    maxBatches: 4
+                    maxBatches: budget.flushBatches
                 )
                 sentAny = sentAny || flush.sentAny
                 failed = failed || flush.failed
             }
         }
-        if let message = (diabetes.errors + healthResult.errors + incremental.errors).first {
+        if !failed, !Task.isCancelled {
+            // Health reads stream page by page into the queue. They pause while the queue is
+            // backed up, so a long backfill cannot outrun the uploads.
+            if await queue.depth() < budget.backlogHighWater {
+                if health.hasPendingBackfill(preferences: prefs) {
+                    errors.append(
+                        contentsOf: await health.backfill(
+                            preferences: prefs,
+                            pageLimit: budget.hkPageLimit,
+                            maxPages: budget.backfillPages,
+                            sink: enqueuePage
+                        )
+                    )
+                }
+                if !Task.isCancelled {
+                    errors.append(
+                        contentsOf: await health.incremental(
+                            preferences: prefs,
+                            pageLimit: budget.hkPageLimit,
+                            maxPagesPerKind: budget.incrementalPages,
+                            sink: enqueuePage
+                        )
+                    )
+                }
+            }
+            if !Task.isCancelled {
+                let flush = await flushReadyBatches(
+                    queue: queue,
+                    origin: origin,
+                    token: token,
+                    deviceID: prefs.normalizedDeviceID,
+                    maxBatches: max(budget.flushBatches / 2, 1)
+                )
+                sentAny = sentAny || flush.sentAny
+                failed = failed || flush.failed
+            }
+        }
+        if let message = errors.first {
             setLastError(message)
         }
         if sentAny {
@@ -444,11 +547,18 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             ),
             records: batch
         )
-        guard let raw = try? HealthIngestWire.encodeEnvelope(envelope) else {
+        // Serialization and gzip make many temporary strings and buffers. Drain them
+        // before the network wait so only the request body stays alive.
+        var encoded: Data?
+        var compressed: Data?
+        autoreleasepool {
+            encoded = try? HealthIngestWire.encodeEnvelope(envelope)
+            if let encoded { compressed = HealthIngestWire.gzipIfWorthwhile(encoded) }
+        }
+        guard let raw = encoded else {
             setLastError("Could not encode a batch.")
             return true
         }
-        let compressed = HealthIngestWire.gzipIfWorthwhile(raw)
         let background = HealthIngestBackgroundTask()
         await background.begin()
         defer { Task { await background.end() } }
@@ -506,7 +616,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         defer { stateLock.unlock() }
         if let requested = backfillSince {
             backfillSince = nil
+            diabetesResume = nil
             return (requested, true)
+        }
+        if let resume = diabetesResume {
+            diabetesResume = nil
+            return (resume, false)
         }
         // 36 hours covers a normal gap. If the last success is older, catch up from there.
         // Trio deletes most history after 90 days, so there is nothing useful past that.
@@ -514,6 +629,37 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         let catchUp = lastSuccess?.addingTimeInterval(-6 * 3600) ?? regular
         let oldest = Date().addingTimeInterval(-90 * 24 * 3600)
         return (max(oldest, min(regular, catchUp)), false)
+    }
+
+    /// End of the window to read now, or nil when the window reaches the present.
+    private func windowEnd(from start: Date, chunk: TimeInterval) -> Date? {
+        let end = start.addingTimeInterval(chunk)
+        return end < Date().addingTimeInterval(-60) ? end : nil
+    }
+
+    private func lockedDiabetesResume() -> Date? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return diabetesResume
+    }
+
+    private func setDiabetesResume(_ date: Date?) {
+        stateLock.lock()
+        diabetesResume = date
+        stateLock.unlock()
+        disk?.saveDiabetesResume(date)
+    }
+
+    private func lockedLastDiabetesRead() -> Date? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return lastDiabetesRead
+    }
+
+    private func setLastDiabetesRead(_ date: Date) {
+        stateLock.lock()
+        lastDiabetesRead = date
+        stateLock.unlock()
     }
 
     private func setLastError(_ message: String?) {

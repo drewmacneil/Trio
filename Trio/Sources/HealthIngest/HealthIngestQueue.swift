@@ -29,6 +29,19 @@ struct HealthIngestReceipt: Codable, Equatable {
     var at: Date
 }
 
+struct HealthIngestSpillSegment: Codable, Equatable {
+    var id: Int
+    var count: Int
+}
+
+struct HealthIngestSpillManifest: Codable, Equatable {
+    /// Oldest first.
+    var segments: [HealthIngestSpillSegment] = []
+    var nextID = 1
+
+    var count: Int { segments.reduce(0) { $0 + $1.count } }
+}
+
 struct HealthIngestEnqueueResult: Equatable {
     var queued: Int
     var oversized: Int
@@ -67,6 +80,30 @@ final class HealthIngestDisk {
 
     func saveQueue(_ items: [HealthIngestQueuedRecord]) {
         save(items, name: "queue.json")
+    }
+
+    /// Records beyond the in-memory window live in small segment files of at most
+    /// `HealthIngestQueue.segmentSize` rows each, so memory and every rewrite stay bounded.
+    func loadSpillManifest() -> HealthIngestSpillManifest {
+        load(HealthIngestSpillManifest.self, name: "queue-spill.json") ?? HealthIngestSpillManifest()
+    }
+
+    func saveSpillManifest(_ manifest: HealthIngestSpillManifest) {
+        save(manifest, name: "queue-spill.json")
+    }
+
+    func loadSpillSegment(_ id: Int) -> [HealthIngestQueuedRecord] {
+        load([HealthIngestQueuedRecord].self, name: "queue-spill-\(id).json") ?? []
+    }
+
+    func saveSpillSegment(_ id: Int, _ items: [HealthIngestQueuedRecord]) {
+        save(items, name: "queue-spill-\(id).json")
+    }
+
+    func deleteSpillSegment(_ id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("queue-spill-\(id).json"))
     }
 
     func loadReceipts() -> [HealthIngestReceipt] {
@@ -142,6 +179,15 @@ final class HealthIngestDisk {
         save(identifier, name: "timezone.json")
     }
 
+    /// Where a long catch-up read stopped, so a relaunch continues instead of skipping the gap.
+    func loadDiabetesResume() -> Date? {
+        load([String: Date].self, name: "diabetes-resume.json")?["resume"]
+    }
+
+    func saveDiabetesResume(_ date: Date?) {
+        save(date.map { ["resume": $0] } ?? [:], name: "diabetes-resume.json")
+    }
+
     func loadMappingVersion() -> Int {
         load(Int.self, name: "mapping-version.json") ?? 0
     }
@@ -168,9 +214,16 @@ final class HealthIngestDisk {
 }
 
 actor HealthIngestQueue {
+    /// Rows kept in memory and in `queue.json`. Anything beyond this goes to spill segments.
+    static let windowCap = 1_000
+    static let segmentSize = 500
+
     private let disk: HealthIngestDisk
     private var items: [HealthIngestQueuedRecord]
+    private var windowKeys: Set<String>
+    private var spill: HealthIngestSpillManifest
     private var receipts: [HealthIngestReceipt]
+    private var receiptByKey: [String: HealthIngestReceipt]
     private var firstSeen: [String: Date]
     /// Accepted receipts stay so deletions can be detected. Rejected receipts
     /// only need to prevent an immediate resend; a large rejected set made
@@ -181,17 +234,52 @@ actor HealthIngestQueue {
 
     init(disk: HealthIngestDisk) {
         self.disk = disk
-        items = disk.loadQueue()
-        receipts = disk.loadReceipts()
+        var window = disk.loadQueue()
+        var manifest = disk.loadSpillManifest()
+        // A queue file written before spill segments existed can hold tens of thousands
+        // of rows. Move the excess to segments once so memory is bounded from here on.
+        if window.count > Self.windowCap {
+            let excess = Array(window[Self.windowCap...])
+            window = Array(window[..<Self.windowCap])
+            var start = 0
+            while start < excess.count {
+                let end = min(start + Self.segmentSize, excess.count)
+                let chunk = Array(excess[start ..< end])
+                disk.saveSpillSegment(manifest.nextID, chunk)
+                manifest.segments.append(HealthIngestSpillSegment(id: manifest.nextID, count: chunk.count))
+                manifest.nextID += 1
+                start = end
+            }
+            disk.saveSpillManifest(manifest)
+            disk.saveQueue(window)
+        }
+        // Pull the oldest segments back in until the window is half full.
+        while window.count < Self.windowCap / 2, let first = manifest.segments.first {
+            window.append(contentsOf: disk.loadSpillSegment(first.id))
+            manifest.segments.removeFirst()
+            disk.saveQueue(window)
+            disk.saveSpillManifest(manifest)
+            disk.deleteSpillSegment(first.id)
+        }
+        items = window
+        windowKeys = Set(window.map { Self.key($0.record) })
+        spill = manifest
+        let stored = disk.loadReceipts()
+        receipts = stored
+        receiptByKey = Dictionary(stored.map { ($0.key, $0) }, uniquingKeysWith: { _, new in new })
         firstSeen = disk.loadFirstSeen()
     }
 
     /// Same `(type, id)` is reused. A changed payload replaces a pending row and is sent again
     /// after a previous accept. An unchanged snapshot is sent again once a day.
+    /// Callers pass at most a few hundred records at a time. Rows beyond the memory window are
+    /// written to spill segments, so a large backfill never grows the in-memory queue.
     func enqueue(_ records: [HealthIngestRecord], now: Date = Date()) -> HealthIngestEnqueueResult {
         var queued = 0
         var oversized = 0
         var changed = false
+        var overflow: [HealthIngestQueuedRecord] = []
+        var firstSeenChanged = false
         for incoming in records {
             var record = incoming
             if HealthIngestType.contentAddressed.contains(record.type) {
@@ -199,19 +287,21 @@ actor HealthIngestQueue {
                     record.start = seen
                 } else {
                     firstSeen[record.id] = record.start
-                    disk.saveFirstSeen(firstSeen)
+                    firstSeenChanged = true
                 }
             }
-            let payloadBytes = HealthIngestWire.payloadByteCount(record.payload)
+            // One canonical serialization feeds both the size check and the hash.
+            let canonical = HealthIngestCanonicalJSON.string(record.payload)
+            let payloadBytes = canonical.utf8.count
             if payloadBytes > HealthIngestWire.maxPayloadBytes {
                 oversized += 1
                 continue
             }
-            let hash = HealthIngestWire.payloadHash(record.payload)
+            let hash = HealthIngestCanonicalJSON.digest(canonical: canonical)
             let key = Self.key(record)
-            if let index = items.firstIndex(where: { Self.key($0.record) == key }) {
+            let bytes = Self.estimatedBytes(record, payloadBytes: payloadBytes)
+            if windowKeys.contains(key), let index = items.firstIndex(where: { Self.key($0.record) == key }) {
                 guard items[index].hash != hash else { continue }
-                let bytes = (try? HealthIngestWire.encode(record).count) ?? payloadBytes
                 items[index].record = record
                 items[index].bytes = bytes
                 items[index].hash = hash
@@ -220,29 +310,73 @@ actor HealthIngestQueue {
                 changed = true
                 continue
             }
-            if let receipt = receipts.last(where: { $0.key == key }), receipt.hash == hash {
+            if let receipt = receiptByKey[key], receipt.hash == hash {
                 let daily = Self.isSnapshot(record.type) && receipt.state == .accepted &&
                     now.timeIntervalSince(receipt.at) >= snapshotInterval
                 guard daily else { continue }
             }
-            let bytes = (try? HealthIngestWire.encode(record).count) ?? payloadBytes
             guard bytes > 0 else { continue }
-            items.append(
-                HealthIngestQueuedRecord(
-                    record: record,
-                    bytes: bytes,
-                    hash: hash,
-                    failures: 0,
-                    notBefore: now
-                )
+            let row = HealthIngestQueuedRecord(
+                record: record,
+                bytes: bytes,
+                hash: hash,
+                failures: 0,
+                notBefore: now
             )
+            if items.count < Self.windowCap {
+                items.append(row)
+                windowKeys.insert(key)
+                changed = true
+            } else {
+                // A repeat of a spilled row is harmless: the server upserts by (type, id).
+                overflow.append(row)
+            }
             queued += 1
-            changed = true
+        }
+        if firstSeenChanged {
+            disk.saveFirstSeen(firstSeen)
         }
         if changed {
             disk.saveQueue(items)
         }
+        if !overflow.isEmpty {
+            writeSpill(overflow)
+        }
         return HealthIngestEnqueueResult(queued: queued, oversized: oversized)
+    }
+
+    /// Serialized size is only used to cap a batch, so a cheap estimate is enough.
+    private static func estimatedBytes(_ record: HealthIngestRecord, payloadBytes: Int) -> Int {
+        payloadBytes + record.type.utf8.count + record.id.utf8.count + record.tz.utf8.count + 96
+    }
+
+    private func writeSpill(_ rows: [HealthIngestQueuedRecord]) {
+        var start = 0
+        while start < rows.count {
+            let end = min(start + Self.segmentSize, rows.count)
+            let chunk = Array(rows[start ..< end])
+            disk.saveSpillSegment(spill.nextID, chunk)
+            spill.segments.append(HealthIngestSpillSegment(id: spill.nextID, count: chunk.count))
+            spill.nextID += 1
+            start = end
+        }
+        disk.saveSpillManifest(spill)
+    }
+
+    /// Loads the oldest spill segments once the window has drained below half.
+    private func refillWindow() {
+        while items.count < Self.windowCap / 2, let first = spill.segments.first {
+            let rows = disk.loadSpillSegment(first.id)
+            for row in rows {
+                items.append(row)
+                windowKeys.insert(Self.key(row.record))
+            }
+            spill.segments.removeFirst()
+            // Window first, then the manifest, then the file: a crash leaves a duplicate, not a loss.
+            disk.saveQueue(items)
+            disk.saveSpillManifest(spill)
+            disk.deleteSpillSegment(first.id)
+        }
     }
 
     func nextBatch(limit: Int, maxBytes: Int) -> [HealthIngestRecord] {
@@ -262,7 +396,10 @@ actor HealthIngestQueue {
         return batch
     }
 
-    func depth() -> Int { items.count }
+    func depth() -> Int { items.count + spill.count }
+
+    /// Rows held in memory. Never above `windowCap` after init or an enqueue.
+    func windowCount() -> Int { items.count }
 
     func rejectedCount() -> Int { disk.loadRejectedCount() }
 
@@ -271,12 +408,30 @@ actor HealthIngestQueue {
     func forgetRejectedReceipts() {
         let remaining = receipts.filter { $0.state != .rejected }
         receipts = remaining
+        rebuildReceiptIndex()
         disk.saveReceipts(receipts)
     }
 
     func dropTypes(_ types: Set<String>) {
         items.removeAll { types.contains($0.record.type) }
+        windowKeys = Set(items.map { Self.key($0.record) })
         disk.saveQueue(items)
+        var kept: [HealthIngestSpillSegment] = []
+        for segment in spill.segments {
+            let rows = disk.loadSpillSegment(segment.id)
+            let remaining = rows.filter { !types.contains($0.record.type) }
+            if remaining.isEmpty {
+                disk.deleteSpillSegment(segment.id)
+            } else {
+                if remaining.count != rows.count {
+                    disk.saveSpillSegment(segment.id, remaining)
+                }
+                kept.append(HealthIngestSpillSegment(id: segment.id, count: remaining.count))
+            }
+        }
+        spill.segments = kept
+        disk.saveSpillManifest(spill)
+        refillWindow()
     }
 
     /// Remember ids the server accepted so a later disappearance can become a deletion.
@@ -289,13 +444,15 @@ actor HealthIngestQueue {
             HealthIngestType.tempBasal,
             HealthIngestType.pumpEvent
         ]
+        let relevant = records.filter { tracked.contains($0.type) }
+        guard !relevant.isEmpty else { return }
         var stored = disk.loadUploadedIDs()
+        var known: [String: Set<String>] = [:]
         var changed = false
-        for record in records where tracked.contains(record.type) {
-            var ids = stored[record.type] ?? []
-            if !ids.contains(record.id) {
-                ids.append(record.id)
-                stored[record.type] = ids
+        for record in relevant {
+            if known[record.type] == nil { known[record.type] = Set(stored[record.type] ?? []) }
+            if known[record.type]?.insert(record.id).inserted == true {
+                stored[record.type, default: []].append(record.id)
                 changed = true
             }
         }
@@ -333,7 +490,8 @@ actor HealthIngestQueue {
         var postponeKeys: [String] = []
         for record in batch {
             let key = Self.key(record)
-            guard let index = items.firstIndex(where: { Self.key($0.record) == key }) else { continue }
+            guard windowKeys.contains(key),
+                  let index = items.firstIndex(where: { Self.key($0.record) == key }) else { continue }
             guard let ack = byKey[key] else {
                 postponeKeys.append(key)
                 continue
@@ -364,12 +522,14 @@ actor HealthIngestQueue {
         }
         if !remove.isEmpty {
             items.removeAll { remove.contains(Self.key($0.record)) }
+            windowKeys.subtract(remove)
         }
         if !accepted.isEmpty {
             noteUploaded(accepted)
         }
         disk.saveQueue(items)
         disk.saveReceipts(receipts)
+        refillWindow()
         return lastReject
     }
 
@@ -403,9 +563,17 @@ actor HealthIngestQueue {
     }
 
     private func remember(key: String, hash: String, state: HealthIngestReceipt.State, at: Date) {
-        receipts.removeAll { $0.key == key }
-        receipts.append(HealthIngestReceipt(key: key, hash: hash, state: state, at: at))
+        if receiptByKey[key] != nil {
+            receipts.removeAll { $0.key == key }
+        }
+        let receipt = HealthIngestReceipt(key: key, hash: hash, state: state, at: at)
+        receipts.append(receipt)
+        receiptByKey[key] = receipt
         pruneReceipts()
+    }
+
+    private func rebuildReceiptIndex() {
+        receiptByKey = Dictionary(receipts.map { ($0.key, $0) }, uniquingKeysWith: { _, new in new })
     }
 
     private func pruneReceipts() {
@@ -425,6 +593,9 @@ actor HealthIngestQueue {
             if receipts.count > receiptCap {
                 receipts.removeFirst(receipts.count - receiptCap)
             }
+        }
+        if receiptByKey.count != receipts.count {
+            rebuildReceiptIndex()
         }
     }
 }

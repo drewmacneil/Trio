@@ -20,8 +20,11 @@ struct HealthIngestReadResult {
 
 /// Reads Trio storage into ingest records. Upstream storage changes should break here and nowhere else.
 struct HealthIngestDiabetesAdapter {
+    /// `until` bounds the large tables (glucose, pump history, carbs, loop cycles) to
+    /// `[since, until)` so a long catch-up is read in windows, not one 90-day fetch.
     func records(
         since: Date,
+        until: Date? = nil,
         preferences: HealthIngestPreferences,
         settings: SettingsManager,
         profiles: TherapyProfileStorage,
@@ -36,7 +39,7 @@ struct HealthIngestDiabetesAdapter {
                 ? settings.settings.cgm.rawValue
                 : settings.settings.cgmPluginIdentifier
             await collect(into: &result, label: "glucose") {
-                try await glucoseRecords(since: since, source: source)
+                try await glucoseRecords(since: since, until: until, source: source)
             }
             if let ids = try? await liveGlucoseIDs(source: source) {
                 result.liveIDs[HealthIngestType.glucose] = ids
@@ -44,7 +47,7 @@ struct HealthIngestDiabetesAdapter {
         }
         if preferences.isOn(.insulin) || preferences.isOn(.pumpEvents) {
             await collect(into: &result, label: "pump history") {
-                try await pumpRecords(since: since, preferences: preferences)
+                try await pumpRecords(since: since, until: until, preferences: preferences)
             }
             if let ids = try? await livePumpIDs(preferences: preferences) {
                 result.liveIDs.merge(ids) { _, new in new }
@@ -52,7 +55,7 @@ struct HealthIngestDiabetesAdapter {
         }
         if preferences.isOn(.carbs) {
             await collect(into: &result, label: "carbs") {
-                try await carbRecords(since: since)
+                try await carbRecords(since: since, until: until)
             }
             if let ids = try? await liveCarbIDs() {
                 result.liveIDs[HealthIngestType.carbs] = ids
@@ -68,7 +71,7 @@ struct HealthIngestDiabetesAdapter {
         }
         if preferences.isOn(.loopCycles) {
             await collect(into: &result, label: "loop cycles") {
-                try await loopRecords(since: since)
+                try await loopRecords(since: since, until: until)
             }
         }
         if preferences.isOn(.profilesAndSettings) {
@@ -103,10 +106,15 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func glucoseRecords(since: Date, source: String) async throws -> [HealthIngestRecord] {
+    private static func window(_ key: String, since: Date, until: Date?) -> NSPredicate {
+        guard let until else { return NSPredicate(format: "\(key) >= %@", since as NSDate) }
+        return NSPredicate(format: "\(key) >= %@ AND \(key) < %@", since as NSDate, until as NSDate)
+    }
+
+    private func glucoseRecords(since: Date, until: Date?, source: String) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = GlucoseStored.fetchRequest()
-        request.predicate = NSPredicate(format: "date >= %@", since as NSDate)
+        request.predicate = Self.window("date", since: since, until: until)
         request.sortDescriptors = [NSSortDescriptor(key: "date", ascending: true)]
         request.fetchBatchSize = 256
         return try await context.perform {
@@ -119,11 +127,18 @@ struct HealthIngestDiabetesAdapter {
         return try await context.perform {
             let deleted = try context.fetch(DeletedGlucoseStored.fetchRequest())
             let deletedDates = Set(deleted.map(\.date))
-            let rows = try context.fetch(GlucoseStored.fetchRequest())
+            // Only two columns, as dictionaries: this runs on every pass and must not
+            // realize a managed object per stored reading (~26k over 90 days).
+            let request = NSFetchRequest<NSDictionary>(entityName: "GlucoseStored")
+            request.resultType = .dictionaryResultType
+            request.propertiesToFetch = ["date", "isManual"]
+            request.fetchBatchSize = 512
+            let rows = try context.fetch(request)
             var ids = Set<String>()
             for row in rows {
-                guard let start = row.date, !deletedDates.contains(start) else { continue }
-                let rowSource = row.isManual ? "manual" : source
+                guard let start = row["date"] as? Date, !deletedDates.contains(start) else { continue }
+                let manual = (row["isManual"] as? Bool) ?? false
+                let rowSource = manual ? "manual" : source
                 ids.insert(HealthIngestIdentity.glucose(source: rowSource, start: start))
             }
             return ids
@@ -133,7 +148,9 @@ struct HealthIngestDiabetesAdapter {
     private func liveCarbIDs() async throws -> Set<String> {
         let context = CoreDataStack.shared.newTaskContext()
         return try await context.perform {
-            let rows = try context.fetch(CarbEntryStored.fetchRequest())
+            let request = CarbEntryStored.fetchRequest()
+            request.fetchBatchSize = 256
+            let rows = try context.fetch(request)
             return Set(rows.compactMap { Self.mapCarb($0)?.id })
         }
     }
@@ -143,7 +160,9 @@ struct HealthIngestDiabetesAdapter {
         let includeInsulin = preferences.isOn(.insulin)
         let includeEvents = preferences.isOn(.pumpEvents)
         return try await context.perform {
-            let rows = try context.fetch(PumpEventStored.fetchRequest())
+            let request = PumpEventStored.fetchRequest()
+            request.fetchBatchSize = 256
+            let rows = try context.fetch(request)
             var ids: [String: Set<String>] = [:]
             for row in rows {
                 guard let record = Self.mapPump(row, includeInsulin: includeInsulin, includeEvents: includeEvents) else { continue }
@@ -161,10 +180,14 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func pumpRecords(since: Date, preferences: HealthIngestPreferences) async throws -> [HealthIngestRecord] {
+    private func pumpRecords(
+        since: Date,
+        until: Date?,
+        preferences: HealthIngestPreferences
+    ) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = PumpEventStored.fetchRequest()
-        request.predicate = NSPredicate(format: "timestamp >= %@", since as NSDate)
+        request.predicate = Self.window("timestamp", since: since, until: until)
         request.sortDescriptors = [NSSortDescriptor(key: "timestamp", ascending: true)]
         request.relationshipKeyPathsForPrefetching = ["bolus", "tempBasal"]
         request.fetchBatchSize = 128
@@ -177,10 +200,10 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func carbRecords(since: Date) async throws -> [HealthIngestRecord] {
+    private func carbRecords(since: Date, until: Date?) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = CarbEntryStored.fetchRequest()
-        request.predicate = NSPredicate(format: "date >= %@", since as NSDate)
+        request.predicate = Self.window("date", since: since, until: until)
         request.sortDescriptors = [NSSortDescriptor(key: "date", ascending: true)]
         request.fetchBatchSize = 128
         return try await context.perform {
@@ -218,10 +241,17 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func loopRecords(since: Date) async throws -> [HealthIngestRecord] {
+    private func loopRecords(since: Date, until: Date?) async throws -> [HealthIngestRecord] {
         let context = CoreDataStack.shared.newTaskContext()
         let request = OrefDetermination.fetchRequest()
-        request.predicate = NSPredicate(format: "deliverAt >= %@ OR timestamp >= %@", since as NSDate, since as NSDate)
+        if let until {
+            request.predicate = NSPredicate(
+                format: "(deliverAt >= %@ OR timestamp >= %@) AND (deliverAt < %@ OR timestamp < %@)",
+                since as NSDate, since as NSDate, until as NSDate, until as NSDate
+            )
+        } else {
+            request.predicate = NSPredicate(format: "deliverAt >= %@ OR timestamp >= %@", since as NSDate, since as NSDate)
+        }
         request.sortDescriptors = [NSSortDescriptor(key: "deliverAt", ascending: true)]
         request.relationshipKeyPathsForPrefetching = ["forecasts", "forecasts.forecastValues"]
         request.fetchBatchSize = 32

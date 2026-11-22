@@ -27,7 +27,13 @@ enum HealthIngestCanonicalJSON {
     /// First 32 lowercase hex characters of SHA-256 over the canonical payload JSON.
     /// Matches the server's `contentHash` / `stableJson`.
     static func digest(_ payload: HealthIngestJSON) -> String {
-        let hashed = SHA256.hash(data: Data(string(payload).utf8))
+        digest(canonical: string(payload))
+    }
+
+    /// Same digest for a payload already serialized with `string(_:)`, so callers
+    /// that also need the byte count serialize once.
+    static func digest(canonical: String) -> String {
+        let hashed = SHA256.hash(data: Data(canonical.utf8))
         return HealthIngestIdentity.hex(hashed, bytes: 16)
     }
 
@@ -67,12 +73,34 @@ enum HealthIngestCanonicalJSON {
         return value
     }
 
+    /// `JSON.stringify` string escaping: `"` `\` and C0 controls only. `/`, DEL and
+    /// non-ASCII stay raw. `JSONSerialization` escapes `/` as `\/`, which made ids
+    /// of snapshots containing "mg/dL" or "mmol/L" differ from the server's hash.
+    /// Written without Foundation so a large batch does not churn the autorelease pool.
     private static func literal(_ text: String) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: [text]),
-              let encoded = String(data: data, encoding: .utf8),
-              encoded.count >= 2
-        else { return "\"\"" }
-        return String(encoded.dropFirst().dropLast())
+        var out = String()
+        out.reserveCapacity(text.utf8.count + 2)
+        out.unicodeScalars.append("\"")
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "\"": out += "\\\""
+            case "\\": out += "\\\\"
+            case "\u{08}": out += "\\b"
+            case "\u{0C}": out += "\\f"
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    let hex = String(scalar.value, radix: 16)
+                    out += "\\u" + String(repeating: "0", count: 4 - hex.count) + hex
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        out.unicodeScalars.append("\"")
+        return out
     }
 
     /// Shortest decimal that round-trips, matching `JSON.stringify` for ordinary values.

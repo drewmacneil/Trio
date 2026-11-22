@@ -296,9 +296,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             setLastError(message)
             warning(.healthKit, "Health Ingest \(message)")
         }
-        stateLock.lock()
-        backfillRunning = health.hasPendingBackfill(preferences: prefs)
-        stateLock.unlock()
+        storeBackfillRunning(health.hasPendingBackfill(preferences: prefs))
         let depth = await queue.depth()
         publishSnapshot(depth: depth)
         disk.saveStatus(HealthIngestPersistedStatus(lastSuccess: lockedSuccess(), lastError: lockedError()))
@@ -402,6 +400,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private func setLastSuccess(_ date: Date) {
         stateLock.lock()
         lastSuccess = date
+        stateLock.unlock()
+    }
+
+    private func storeBackfillRunning(_ running: Bool) {
+        stateLock.lock()
+        backfillRunning = running
         stateLock.unlock()
     }
 

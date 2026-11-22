@@ -377,18 +377,41 @@ enum HealthIngestGzip {
     }
 
     static func decompress(_ input: Data) -> Data? {
-        transform(input, initStream: { stream in
-            inflateInit2_(
-                stream,
-                MAX_WBITS + 16,
-                ZLIB_VERSION,
-                Int32(MemoryLayout<z_stream>.size)
-            )
-        }, process: { stream in
-            inflate(stream, Z_FINISH)
-        }, finish: { stream in
-            inflateEnd(stream)
-        }, bound: max(input.count * 4, 64))
+        guard !input.isEmpty else { return Data() }
+        var stream = z_stream()
+        guard inflateInit2_(
+            &stream,
+            MAX_WBITS + 16,
+            ZLIB_VERSION,
+            Int32(MemoryLayout<z_stream>.size)
+        ) == Z_OK else { return nil }
+        defer { _ = inflateEnd(&stream) }
+
+        let inputCount = input.count
+        let chunkSize = 16 * 1024
+        var output = Data()
+        let finished = input.withUnsafeBytes { raw -> Bool in
+            guard let source = raw.bindMemory(to: Bytef.self).baseAddress else { return false }
+            stream.next_in = UnsafeMutablePointer(mutating: source)
+            stream.avail_in = uInt(inputCount)
+            while true {
+                var chunk = Data(count: chunkSize)
+                let status: Int32 = chunk.withUnsafeMutableBytes { out in
+                    guard let destination = out.bindMemory(to: Bytef.self).baseAddress else { return Z_BUF_ERROR }
+                    stream.next_out = destination
+                    stream.avail_out = uInt(chunkSize)
+                    return inflate(&stream, Z_NO_FLUSH)
+                }
+                let produced = chunkSize - Int(stream.avail_out)
+                if produced > 0 {
+                    chunk.removeSubrange(produced ..< chunk.count)
+                    output.append(chunk)
+                }
+                if status == Z_STREAM_END { return true }
+                if status != Z_OK { return false }
+            }
+        }
+        return finished ? output : nil
     }
 
     private static func transform(
@@ -401,17 +424,19 @@ enum HealthIngestGzip {
         guard !input.isEmpty else { return Data() }
         var stream = z_stream()
         guard initStream(&stream) == Z_OK else { return nil }
-        defer { finish(&stream) }
+        defer { _ = finish(&stream) }
 
         var output = Data(count: max(bound, 64))
+        let inputCount = input.count
+        let outputCount = output.count
         let result: Int32 = input.withUnsafeBytes { raw in
             guard let source = raw.bindMemory(to: Bytef.self).baseAddress else { return Z_BUF_ERROR }
             return output.withUnsafeMutableBytes { out in
                 guard let destination = out.bindMemory(to: Bytef.self).baseAddress else { return Z_BUF_ERROR }
                 stream.next_in = UnsafeMutablePointer(mutating: source)
-                stream.avail_in = uInt(input.count)
+                stream.avail_in = uInt(inputCount)
                 stream.next_out = destination
-                stream.avail_out = uInt(output.count)
+                stream.avail_out = uInt(outputCount)
                 return process(&stream)
             }
         }

@@ -1,4 +1,4 @@
-import CoreData
+@preconcurrency import CoreData
 import Foundation
 
 /// Dexcom and Libre report a floor of 39 mg/dL. Trio clamps anything below that to 39 before it is stored,
@@ -329,18 +329,23 @@ struct HealthIngestDiabetesAdapter {
     static func mapCarb(_ row: CarbEntryStored) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let sourceID = row.id?.uuidString ?? "carb-\(Int(start.timeIntervalSince1970))-\(row.carbs)"
+        let fat: HealthIngestJSON? = row.fat > 0 ? .number(row.fat) : nil
+        let protein: HealthIngestJSON? = row.protein > 0 ? .number(row.protein) : nil
+        let note: HealthIngestJSON? = row.note.flatMap { note in note.isEmpty ? nil : .string(note) }
+        let fpu: HealthIngestJSON? = row.isFPU ? .bool(true) : nil
+        let fpuID: HealthIngestJSON? = row.fpuID.map { .string($0.uuidString) }
         let payload = HealthIngestJSON.object([
             "grams": .number(row.carbs),
-            "fatGrams": row.fat > 0 ? .number(row.fat) : nil,
-            "proteinGrams": row.protein > 0 ? .number(row.protein) : nil,
-            "note": row.note.flatMap { $0.isEmpty ? nil : .string($0) },
-            "isFPU": row.isFPU ? .bool(true) : nil,
-            "fpuID": row.fpuID?.uuidString.map { .string($0) }
+            "fatGrams": fat,
+            "proteinGrams": protein,
+            "note": note,
+            "isFPU": fpu,
+            "fpuID": fpuID
         ])
         return record(type: HealthIngestType.carbs, id: sourceID, start: start, end: nil, payload: payload)
     }
 
-    private static func mapOverrideRun(_ run: OverrideRunStored, units _: String) -> HealthIngestRecord? {
+    private static func mapOverrideRun(_ run: OverrideRunStored, units: String) -> HealthIngestRecord? {
         guard let start = run.startDate ?? run.override?.date else { return nil }
         let parent = run.override
         let sourceID = parent?.id ?? run.id?.uuidString ?? "override-run-\(Int(start.timeIntervalSince1970))"
@@ -361,7 +366,7 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func mapOverride(_ row: OverrideStored, units _: String) -> HealthIngestRecord? {
+    private static func mapOverride(_ row: OverrideStored, units: String) -> HealthIngestRecord? {
         guard let start = row.date, let sourceID = row.id else { return nil }
         let end = ending(start: start, minutes: row.duration?.decimalValue, indefinite: row.indefinite)
         return overrideRecord(
@@ -421,7 +426,7 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func mapTempTargetRun(_ run: TempTargetRunStored, units _: String) -> HealthIngestRecord? {
+    private static func mapTempTargetRun(_ run: TempTargetRunStored, units: String) -> HealthIngestRecord? {
         guard let start = run.startDate ?? run.tempTarget?.date else { return nil }
         let parent = run.tempTarget
         let sourceID = parent?.id?.uuidString ?? run.id?.uuidString ?? "temp-target-run-\(Int(start.timeIntervalSince1970))"
@@ -439,7 +444,7 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func mapTempTarget(_ row: TempTargetStored, units _: String) -> HealthIngestRecord? {
+    private static func mapTempTarget(_ row: TempTargetStored, units: String) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let sourceID = row.id?.uuidString ?? "temp-target-\(Int(start.timeIntervalSince1970))"
         let end = ending(start: start, minutes: row.duration?.decimalValue, indefinite: false)

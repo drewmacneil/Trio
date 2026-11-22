@@ -377,24 +377,27 @@ final class HealthIngestHealthKitReader {
     }
 
     private static func activityName(_ type: HKWorkoutActivityType) -> String {
-        let names: [HKWorkoutActivityType: String] = [
-            .cycling: "cycling",
-            .dance: "dance",
-            .elliptical: "elliptical",
-            .functionalStrengthTraining: "functionalStrengthTraining",
-            .hiking: "hiking",
-            .highIntensityIntervalTraining: "highIntensityIntervalTraining",
-            .mixedCardio: "mixedCardio",
-            .other: "other",
-            .pilates: "pilates",
-            .rowing: "rowing",
-            .running: "running",
-            .stairClimbing: "stairClimbing",
-            .swimming: "swimming",
-            .traditionalStrengthTraining: "traditionalStrengthTraining",
-            .walking: "walking",
-            .yoga: "yoga"
-        ]
-        return names[type] ?? "other"
+        switch type {
+        case .cycling: return "cycling"
+        case .socialDance,
+             .cardioDance: return "dance"
+        case .elliptical: return "elliptical"
+        case .functionalStrengthTraining: return "functionalStrengthTraining"
+        case .hiking: return "hiking"
+        case .highIntensityIntervalTraining: return "highIntensityIntervalTraining"
+        case .mixedCardio: return "mixedCardio"
+        case .pilates: return "pilates"
+        case .rowing: return "rowing"
+        case .running: return "running"
+        case .stairClimbing: return "stairClimbing"
+        case .swimming: return "swimming"
+        case .traditionalStrengthTraining: return "traditionalStrengthTraining"
+        case .walking: return "walking"
+        case .yoga: return "yoga"
+        default:
+            // HKWorkoutActivityType.dance is raw value 14. It is deprecated, and older workouts still use it.
+            if type.rawValue == 14 { return "dance" }
+            return "other"
+        }
     }
 }

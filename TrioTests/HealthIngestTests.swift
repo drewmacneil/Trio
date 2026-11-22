@@ -123,7 +123,7 @@ import Testing
         let input = Data(repeating: 0x61, count: 2048)
         let compressed = try #require(HealthIngestGzip.compress(input))
         #expect(compressed.starts(with: Data([0x1F, 0x8B])))
-        #expect(try HealthIngestGzip.decompress(compressed) == input)
+        #expect(HealthIngestGzip.decompress(compressed) == input)
         #expect(HealthIngestWire.gzipIfWorthwhile(input) != nil)
         #expect(HealthIngestWire.gzipIfWorthwhile(Data("short".utf8)) == nil)
     }

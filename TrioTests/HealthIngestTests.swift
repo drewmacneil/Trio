@@ -250,7 +250,128 @@ import Testing
         #expect(!text.contains("unit-test-token"))
     }
 
-    private func makeDisk() throws -> HealthIngestDisk {
+
+    @Test func recordIdsAreSanitizedToTheServerAlphabet() {
+        #expect(HealthIngestRecordID.sanitize("pump-123-Site Change") == "pump-123-Site-Change")
+        #expect(HealthIngestRecordID.component("Workout (80%)") == "Workout-80")
+        #expect(HealthIngestRecordID.component("   ") == "unnamed")
+        let plus = HealthIngestRecordID.sanitize("+bad")
+        #expect(plus.first?.isLetter == true || plus.first?.isNumber == true)
+        #expect(!plus.contains("+"))
+    }
+
+    @Test func diaHoursAndMultiplierMatchTheServerRanges() {
+        #expect(HealthIngestPayload.diaHours(0) == nil)
+        #expect(HealthIngestPayload.diaHours(-1) == nil)
+        #expect(HealthIngestPayload.diaHours(6) == .number(6))
+        #expect(HealthIngestPayload.diaHours(30) == .number(24))
+        #expect(HealthIngestPayload.unitMultiplier(percentage: 0) == nil)
+        #expect(HealthIngestPayload.unitMultiplier(percentage: 80) == .number(0.8))
+        #expect(HealthIngestPayload.unitMultiplier(percentage: 2000) == nil)
+        #expect(HealthIngestPayload.unitMultiplier(percentage: nil) == nil)
+    }
+
+    @Test func healthKitPayloadsUseContractFieldNames() throws {
+        let hrv = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 45))
+        let energy = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.activeEnergy, value: 1.5))
+        let exercise = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.exerciseMinutes, value: 1))
+        let heart = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 72))
+        #expect(keys(hrv).contains("sdnnMs"))
+        #expect(!keys(hrv).contains("sdnnMilliseconds"))
+        #expect(keys(energy).contains("kcal"))
+        #expect(!keys(energy).contains("kilocalories"))
+        #expect(keys(exercise).contains("minutes"))
+        #expect(keys(heart).contains("bpm"))
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 0) == nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 501) == nil)
+        #expect(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 0) == nil)
+
+        let workout = try #require(
+            HealthIngestHealthMapping.workoutPayload(
+                activity: "running",
+                durationSeconds: 1800,
+                energyKcal: 120,
+                distanceMeters: 4000,
+                avgHeartRate: 140
+            )
+        )
+        #expect(keys(workout).contains("activity"))
+        #expect(keys(workout).contains("energyKcal"))
+        #expect(keys(workout).contains("avgHeartRate"))
+        #expect(!keys(workout).contains("activityType"))
+        #expect(!keys(workout).contains("energyKilocalories"))
+        #expect(!keys(workout).contains("averageHeartRateBpm"))
+        #expect(
+            HealthIngestHealthMapping.workoutPayload(
+                activity: "",
+                durationSeconds: 60,
+                energyKcal: nil,
+                distanceMeters: nil,
+                avgHeartRate: nil
+            ) == nil
+        )
+
+        let sleep = HealthIngestHealthMapping.sleepPayload(
+            hkValue: HKCategoryValueSleepAnalysis.asleepCore.rawValue
+        )
+        #expect(keys(sleep).contains("stage"))
+        if case .object(let fields) = sleep, case .string(let stage) = fields["stage"] {
+            #expect(stage == "core")
+        } else {
+            Issue.record("sleep payload should include stage")
+        }
+
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        #expect(
+            HealthIngestHealthMapping.sampleEnd(
+                recordType: HealthIngestType.activeEnergy,
+                start: start,
+                end: start
+            ) == .value(start)
+        )
+        #expect(
+            HealthIngestHealthMapping.sampleEnd(
+                recordType: HealthIngestType.heartRate,
+                start: start,
+                end: start
+            ) == .value(nil)
+        )
+        #expect(
+            HealthIngestHealthMapping.sampleEnd(
+                recordType: HealthIngestType.sleepStage,
+                start: start,
+                end: start.addingTimeInterval(-1)
+            ) == .drop
+        )
+    }
+
+    @Test func rejectedRecordsAreDroppedAfterThreeAttempts() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let record = makeRecord(id: "hrv-1", type: HealthIngestType.hrv)
+        #expect(await queue.enqueue([record]).queued == 1)
+        let ack = HealthIngestAck(
+            type: record.type,
+            id: record.id,
+            status: .rejected,
+            reason: "payload.sdnnMs is required"
+        )
+        for attempt in 1 ... 2 {
+            let reason = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
+            #expect(reason == "hrv hrv-1: payload.sdnnMs is required")
+            #expect(await queue.depth() == 1)
+            #expect(await queue.rejectedCount() == 1)
+            #expect(await queue.hasReady() == false)
+            _ = attempt
+        }
+        let dropped = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
+        #expect(dropped == "hrv hrv-1: payload.sdnnMs is required")
+        #expect(await queue.depth() == 0)
+        #expect(await queue.rejectedCount() == 1)
+        #expect(await queue.enqueue([record]).queued == 0)
+    }
+
+        private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)
         return try HealthIngestDisk(directory: directory)
@@ -269,6 +390,13 @@ import Testing
                 "sourceId": .string(id)
             ])
         )
+    }
+
+    private func keys(_ value: HealthIngestJSON) -> Set<String> {
+        if case .object(let fields) = value {
+            return Set(fields.keys)
+        }
+        return []
     }
 }
 

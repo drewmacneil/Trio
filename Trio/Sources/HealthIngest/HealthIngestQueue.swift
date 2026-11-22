@@ -282,8 +282,9 @@ actor HealthIngestQueue {
         return items.contains { $0.notBefore <= now }
     }
 
-    /// Accepted and duplicate are done. A rejection stays on the queue and is sent again later.
-    /// A timeout keeps the records and resends the same ids.
+    /// Accepted and duplicate are done. A rejection is retried a few times, then dropped
+    /// so a bad record cannot be resent forever. A timeout keeps the records and resends
+    /// the same ids.
     func resolve(
         batch: [HealthIngestRecord],
         acks: [HealthIngestAck],
@@ -321,8 +322,16 @@ actor HealthIngestQueue {
             case .rejected:
                 let reason = ack.reason ?? "rejected"
                 lastReject = "\(ack.type) \(ack.id): \(reason)"
-                postponeKeys.append(key)
-                disk.saveRejectedCount(disk.loadRejectedCount() + 1)
+                items[index].failures += 1
+                if items[index].failures == 1 {
+                    disk.saveRejectedCount(disk.loadRejectedCount() + 1)
+                }
+                if items[index].failures >= 3 {
+                    remove.insert(key)
+                    remember(key: key, hash: items[index].hash, state: .rejected, at: now)
+                } else {
+                    postponeKeys.append(key)
+                }
             }
         }
         if !postponeKeys.isEmpty {

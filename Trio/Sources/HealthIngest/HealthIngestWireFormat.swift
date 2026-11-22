@@ -216,6 +216,62 @@ enum HealthIngestIdentity {
     }
 }
 
+/// Record ids must be 1–200 characters of letters, digits, and . _ : -
+enum HealthIngestRecordID {
+    static func sanitize(_ raw: String) -> String {
+        let folded = raw.map { character -> Character in
+            if character.isLetter || character.isNumber || character == "." || character == "_" || character == ":" || character == "-" {
+                return character
+            }
+            return "-"
+        }
+        var text = String(folded)
+        while text.contains("--") {
+            text = text.replacingOccurrences(of: "--", with: "-")
+        }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "-._:"))
+        if text.isEmpty { return "id" }
+        if let first = text.first, !first.isLetter, !first.isNumber {
+            text = "id-" + text
+        }
+        return String(text.prefix(200))
+    }
+
+    /// Profile names and other id fragments. Spaces and punctuation become "-".
+    static func component(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folded = trimmed.map { character -> Character in
+            if character.isLetter || character.isNumber || character == "." || character == "_" || character == "-" {
+                return character
+            }
+            return "-"
+        }
+        var text = String(folded)
+        while text.contains("--") {
+            text = text.replacingOccurrences(of: "--", with: "-")
+        }
+        text = text.trimmingCharacters(in: CharacterSet(charactersIn: "-._"))
+        if text.isEmpty { return "unnamed" }
+        return String(text.prefix(80))
+    }
+}
+
+enum HealthIngestPayload {
+    /// Server contract: diaHours must be > 0 and <= 24. Omit rather than send 0.
+    static func diaHours(_ hours: Double) -> HealthIngestJSON? {
+        guard hours.isFinite, hours > 0 else { return nil }
+        return .number(min(hours, 24))
+    }
+
+    /// Server contract: multiplier must be > 0 and <= 10 if sent. A 0% override omits the field.
+    static func unitMultiplier(percentage: Double?) -> HealthIngestJSON? {
+        guard let percentage, percentage.isFinite else { return nil }
+        let multiplier = percentage / 100
+        guard multiplier > 0, multiplier <= 10 else { return nil }
+        return .number(multiplier)
+    }
+}
+
 struct HealthIngestDevice: Codable, Equatable {
     var id: String
     var app: String

@@ -244,7 +244,7 @@ struct HealthIngestDiabetesAdapter {
     ) async throws -> [HealthIngestRecord] {
         let pump = settings.pumpSettings
         var pumpFields: [String: HealthIngestJSON?] = [
-            "diaHours": .number(max(Self.double(pump.insulinActionCurve), 0)),
+            "diaHours": HealthIngestPayload.diaHours(Self.double(pump.insulinActionCurve)),
             "maxBolus": .number(max(Self.double(pump.maxBolus), 0)),
             "maxBasal": .number(max(Self.double(pump.maxBasal), 0))
         ]
@@ -277,7 +277,7 @@ struct HealthIngestDiabetesAdapter {
                     "name": .string(name),
                     "trigger": .string(trigger)
                 ])
-                let safeName = name.replacingOccurrences(of: " ", with: "-")
+                let safeName = HealthIngestRecordID.component(name)
                 return Self.record(
                     type: HealthIngestType.profileSwitch,
                     id: "profile-switch:\(HealthIngestTime.string(from: date)):\(safeName)",
@@ -483,7 +483,7 @@ struct HealthIngestDiabetesAdapter {
         let schedule = Self.smbWindow(advanced)
         let payload = HealthIngestJSON.object([
             "name": (trimmedName?.isEmpty == false) ? .string(trimmedName!) : nil,
-            "multiplier": percentage.map { .number($0 / 100) },
+            "multiplier": HealthIngestPayload.unitMultiplier(percentage: percentage),
             "targetMgdl": target.map { .number(HealthIngestCanonicalJSON.mgdl($0.doubleValue, units: units)) },
             "durationMinutes": Self.positiveNumber(duration),
             "indefinite": indefinite ? .bool(true) : .bool(false),
@@ -807,7 +807,7 @@ struct HealthIngestDiabetesAdapter {
     ) -> HealthIngestRecord {
         HealthIngestRecord(
             type: type,
-            id: id,
+            id: HealthIngestRecordID.sanitize(id),
             start: start,
             end: end,
             tz: HealthIngestTime.zoneIdentifier,

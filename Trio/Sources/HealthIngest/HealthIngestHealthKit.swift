@@ -21,6 +21,8 @@ enum HealthIngestSleep {
 /// Incremental HealthKit reads. Anchors persist on disk. The first sync is one day; older samples
 /// come from an explicit backfill, paged so a long history does not run as one radio burst.
 final class HealthIngestHealthKitReader {
+    static let queryTimeout: TimeInterval = 30
+
     private let store: HKHealthStore
     private let disk: HealthIngestDisk
     private let lock = NSLock()
@@ -173,34 +175,53 @@ final class HealthIngestHealthKitReader {
         predicate: NSPredicate?,
         anchor: HKQueryAnchor?
     ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
-        try await withCheckedThrowingContinuation { continuation in
-            let query = HKAnchoredObjectQuery(
-                type: type,
-                predicate: predicate,
-                anchor: anchor,
-                limit: HKObjectQueryNoLimit
-            ) { _, samples, _, newAnchor, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: (samples ?? [], newAnchor))
+        let gate = HealthKitQueryGate<(samples: [HKSample], anchor: HKQueryAnchor?)>(store: store)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.setContinuation(continuation)
+                let query = HKAnchoredObjectQuery(
+                    type: type,
+                    predicate: predicate,
+                    anchor: anchor,
+                    limit: HKObjectQueryNoLimit
+                ) { _, samples, _, newAnchor, error in
+                    if let error {
+                        gate.finish(.failure(error))
+                    } else {
+                        gate.finish(.success((samples ?? [], newAnchor)))
+                    }
                 }
+                gate.attach(query)
+                gate.startTimeout(seconds: Self.queryTimeout)
             }
-            store.execute(query)
+        } onCancel: {
+            gate.cancel()
         }
     }
 
     private func sampleQuery(type: HKSampleType, predicate: NSPredicate, limit: Int) async throws -> [HKSample] {
-        try await withCheckedThrowingContinuation { continuation in
-            let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-            let query = HKSampleQuery(sampleType: type, predicate: predicate, limit: limit, sortDescriptors: [sort]) { _, samples, error in
-                if let error {
-                    continuation.resume(throwing: error)
-                } else {
-                    continuation.resume(returning: samples ?? [])
+        let gate = HealthKitQueryGate<[HKSample]>(store: store)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.setContinuation(continuation)
+                let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+                let query = HKSampleQuery(
+                    sampleType: type,
+                    predicate: predicate,
+                    limit: limit,
+                    sortDescriptors: [sort]
+                ) { _, samples, error in
+                    if let error {
+                        gate.finish(.failure(error))
+                    } else {
+                        gate.finish(.success(samples ?? []))
+                    }
                 }
+                gate.attach(query)
+                gate.startTimeout(seconds: Self.queryTimeout)
             }
-            store.execute(query)
+        } onCancel: {
+            gate.cancel()
         }
     }
 
@@ -285,8 +306,8 @@ final class HealthIngestHealthKitReader {
         return nil
     }
 
-    private static func mapWorkout(_ workout: HKWorkout) -> HealthIngestRecord {
-        let sourceID = workout.uuid.uuidString
+    private static func mapWorkout(_ workout: HKWorkout) -> HealthIngestRecord? {
+        guard workout.endDate >= workout.startDate else { return nil }
         var energy: Double?
         if let type = HKQuantityType.quantityType(forIdentifier: .activeEnergyBurned),
            let sum = workout.statistics(for: type)?.sumQuantity()
@@ -299,19 +320,17 @@ final class HealthIngestHealthKitReader {
         {
             heartRate = average.doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
         }
-        let payload = HealthIngestJSON.object([
-            "activityType": .string(activityName(workout.workoutActivityType)),
-            "activityTypeRaw": .number(Double(workout.workoutActivityType.rawValue)),
-            "energyKilocalories": energy.map { .number($0) },
-            "distanceMeters": workout.totalDistance.map { .number($0.doubleValue(for: .meter())) },
-            "averageHeartRateBpm": heartRate.map { .number($0) },
-            "durationSeconds": .number(workout.duration),
-            "sourceBundle": .string(workout.sourceRevision.source.bundleIdentifier),
-            "sourceId": .string(sourceID)
-        ])
+        let distance = workout.totalDistance.map { $0.doubleValue(for: .meter()) }
+        guard let payload = HealthIngestHealthMapping.workoutPayload(
+            activity: activityName(workout.workoutActivityType),
+            durationSeconds: workout.duration,
+            energyKcal: energy,
+            distanceMeters: distance,
+            avgHeartRate: heartRate
+        ) else { return nil }
         return HealthIngestRecord(
             type: HealthIngestType.workout,
-            id: sourceID,
+            id: HealthIngestRecordID.sanitize(workout.uuid.uuidString),
             start: workout.startDate,
             end: workout.endDate,
             tz: HealthIngestTime.zoneIdentifier,
@@ -319,38 +338,32 @@ final class HealthIngestHealthKitReader {
         )
     }
 
-    private static func mapQuantity(_ sample: HKQuantitySample, recordType: String) -> HealthIngestRecord {
+    private static func mapQuantity(_ sample: HKQuantitySample, recordType: String) -> HealthIngestRecord? {
         let value: Double
-        let key: String
         switch recordType {
         case HealthIngestType.heartRate,
              HealthIngestType.restingHR:
-            key = "bpm"
             value = sample.quantity.doubleValue(for: HKUnit.count().unitDivided(by: .minute()))
         case HealthIngestType.hrv:
-            key = "sdnnMilliseconds"
             value = sample.quantity.doubleValue(for: HKUnit.secondUnit(with: .milli))
         case HealthIngestType.activeEnergy:
-            key = "kilocalories"
             value = sample.quantity.doubleValue(for: .kilocalorie())
         case HealthIngestType.exerciseMinutes:
-            key = "minutes"
             value = sample.quantity.doubleValue(for: .minute())
         default:
-            key = "value"
-            value = sample.quantity.doubleValue(for: .count())
+            return nil
         }
-        let sourceID = sample.uuid.uuidString
-        let requiresEnd = recordType == HealthIngestType.activeEnergy || recordType == HealthIngestType.exerciseMinutes
-        let end: Date? = requiresEnd ? sample.endDate : (sample.endDate == sample.startDate ? nil : sample.endDate)
-        let payload = HealthIngestJSON.object([
-            key: .number(value),
-            "sourceBundle": .string(sample.sourceRevision.source.bundleIdentifier),
-            "sourceId": .string(sourceID)
-        ])
+        guard let payload = HealthIngestHealthMapping.quantityPayload(recordType: recordType, value: value) else {
+            return nil
+        }
+        guard case .value(let end) = HealthIngestHealthMapping.sampleEnd(
+            recordType: recordType,
+            start: sample.startDate,
+            end: sample.endDate
+        ) else { return nil }
         return HealthIngestRecord(
             type: recordType,
-            id: sourceID,
+            id: HealthIngestRecordID.sanitize(sample.uuid.uuidString),
             start: sample.startDate,
             end: end,
             tz: HealthIngestTime.zoneIdentifier,
@@ -358,19 +371,18 @@ final class HealthIngestHealthKitReader {
         )
     }
 
-    private static func mapSleep(_ sample: HKCategorySample) -> HealthIngestRecord {
-        let sourceID = sample.uuid.uuidString
-        let payload = HealthIngestJSON.object([
-            "stage": .string(HealthIngestSleep.stage(hkValue: sample.value)),
-            "hkValue": .number(Double(sample.value)),
-            "sourceBundle": .string(sample.sourceRevision.source.bundleIdentifier),
-            "sourceId": .string(sourceID)
-        ])
+    private static func mapSleep(_ sample: HKCategorySample) -> HealthIngestRecord? {
+        guard let payload = HealthIngestHealthMapping.sleepPayload(hkValue: sample.value) else { return nil }
+        guard case .value(let end) = HealthIngestHealthMapping.sampleEnd(
+            recordType: HealthIngestType.sleepStage,
+            start: sample.startDate,
+            end: sample.endDate
+        ) else { return nil }
         return HealthIngestRecord(
             type: HealthIngestType.sleepStage,
-            id: sourceID,
+            id: HealthIngestRecordID.sanitize(sample.uuid.uuidString),
             start: sample.startDate,
-            end: sample.endDate,
+            end: end,
             tz: HealthIngestTime.zoneIdentifier,
             payload: payload
         )
@@ -398,6 +410,186 @@ final class HealthIngestHealthKitReader {
             // HKWorkoutActivityType.dance is raw value 14. It is deprecated, and older workouts still use it.
             if type.rawValue == 14 { return "dance" }
             return "other"
+        }
+    }
+}
+
+
+
+/// Builds HealthKit ingest payloads using the server contract field names and ranges.
+enum HealthIngestHealthMapping {
+    static let source = "healthkit"
+
+    enum SampleEnd: Equatable {
+        case drop
+        case value(Date?)
+    }
+
+    static func quantityPayload(recordType: String, value: Double) -> HealthIngestJSON? {
+        guard value.isFinite else { return nil }
+        let key: String
+        let valid: Bool
+        switch recordType {
+        case HealthIngestType.heartRate:
+            key = "bpm"
+            valid = value >= 1 && value <= 350
+        case HealthIngestType.restingHR:
+            key = "bpm"
+            valid = value >= 1 && value <= 250
+        case HealthIngestType.hrv:
+            key = "sdnnMs"
+            valid = value > 0 && value <= 500
+        case HealthIngestType.activeEnergy:
+            key = "kcal"
+            valid = value >= 0 && value <= 20_000
+        case HealthIngestType.exerciseMinutes:
+            key = "minutes"
+            valid = value >= 0 && value <= 1_440
+        default:
+            return nil
+        }
+        guard valid else { return nil }
+        return .object([
+            key: .number(value),
+            "source": .string(source)
+        ])
+    }
+
+    static func workoutPayload(
+        activity: String,
+        durationSeconds: TimeInterval,
+        energyKcal: Double?,
+        distanceMeters: Double?,
+        avgHeartRate: Double?
+    ) -> HealthIngestJSON? {
+        let name = activity.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name.count <= 128 else { return nil }
+        guard durationSeconds.isFinite, durationSeconds >= 0, durationSeconds <= 172_800 else { return nil }
+        let energy = ranged(energyKcal, min: 0, max: 20_000)
+        if let energyKcal, energy == nil { return nil }
+        let distance = ranged(distanceMeters, min: 0, max: 1_000_000)
+        if let distanceMeters, distance == nil { return nil }
+        return .object([
+            "activity": .string(name),
+            "durationSeconds": .number(durationSeconds),
+            "energyKcal": energy.map { .number($0) },
+            "distanceMeters": distance.map { .number($0) },
+            "avgHeartRate": ranged(avgHeartRate, min: 1, max: 350).map { .number($0) },
+            "source": .string(source)
+        ])
+    }
+
+    static func sleepPayload(hkValue: Int) -> HealthIngestJSON {
+        .object([
+            "stage": .string(HealthIngestSleep.stage(hkValue: hkValue)),
+            "source": .string(source)
+        ])
+    }
+
+    /// Interval types require `end`. A sample with end before start is dropped.
+    /// Instantaneous samples omit `end` when it equals `start`.
+    static func sampleEnd(recordType: String, start: Date, end: Date) -> SampleEnd {
+        if end < start { return .drop }
+        let interval = recordType == HealthIngestType.activeEnergy
+            || recordType == HealthIngestType.exerciseMinutes
+            || recordType == HealthIngestType.sleepStage
+            || recordType == HealthIngestType.workout
+        if interval { return .value(end) }
+        return .value(end == start ? nil : end)
+    }
+
+    private static func ranged(_ value: Double?, min: Double, max: Double) -> Double? {
+        guard let value, value.isFinite, value >= min, value <= max else { return nil }
+        return value
+    }
+}
+
+/// Times out and cancels a HealthKit query without resuming its continuation twice.
+/// A TaskGroup around the query would still wait for the query task on exit, so
+/// the timeout lives here and `store.stop` plus a one-shot resume unblock the caller.
+private struct HealthKitQueryTimeout: Error {}
+
+private final class HealthKitQueryGate<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private let store: HKHealthStore
+    private var continuation: CheckedContinuation<Value, Error>?
+    private var query: HKQuery?
+    private var timeoutTask: Task<Void, Never>?
+    private var finished = false
+
+    init(store: HKHealthStore) {
+        self.store = store
+    }
+
+    func setContinuation(_ continuation: CheckedContinuation<Value, Error>) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func attach(_ query: HKQuery) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            store.stop(query)
+            return
+        }
+        self.query = query
+        lock.unlock()
+        store.execute(query)
+    }
+
+    func startTimeout(seconds: TimeInterval) {
+        let task = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            } catch {
+                return
+            }
+            self?.finish(.failure(HealthKitQueryTimeout()))
+        }
+        lock.lock()
+        if finished {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        timeoutTask = task
+        lock.unlock()
+    }
+
+    func cancel() {
+        finish(.failure(CancellationError()))
+    }
+
+    func finish(_ result: Result<Value, Error>) {
+        lock.lock()
+        if finished {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let query = self.query
+        self.query = nil
+        let timeoutTask = self.timeoutTask
+        self.timeoutTask = nil
+        lock.unlock()
+        timeoutTask?.cancel()
+        if let query {
+            store.stop(query)
+        }
+        switch result {
+        case .success(let value):
+            continuation?.resume(returning: value)
+        case .failure(let error):
+            continuation?.resume(throwing: error)
         }
     }
 }

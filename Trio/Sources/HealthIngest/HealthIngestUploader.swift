@@ -64,6 +64,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         commit(prefs)
     }
 
+    /// Turning a category off stops new collection for that category. Records of
+    /// that type already on the on-device queue are left there until they are
+    /// accepted, dropped after repeated rejects, or the queue file is cleared.
     @MainActor func setCategory(_ category: HealthIngestCategory, enabled: Bool) {
         var prefs = currentPreferences()
         prefs.categories[category.rawValue] = enabled
@@ -145,6 +148,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
 
     private func start() {
         if started {
+            ensureLoopRunning()
             refreshObservers()
             return
         }
@@ -242,54 +246,29 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return 90
     }
 
-    private func collectAndSend() async {
-        guard let queue = try? prepare(), let disk, let health else { return }
-        let prefs = currentPreferences()
-        guard let origin = HealthIngestOrigin.parse(prefs.baseURL), let token = settingsStore.token() else { return }
+    private struct FlushOutcome {
+        var sentAny: Bool
+        var failed: Bool
+    }
 
-        let since = takeSince()
-        let devices = resolverDevices()
-        let diabetes = await adapter.records(
-            since: since.date,
-            preferences: prefs,
-            settings: settingsManager,
-            profiles: profiles,
-            pumpModel: devices.model,
-            supportedBasalRates: devices.rates
-        )
-        var extra: [HealthIngestRecord] = []
-        if prefs.isOn(.loopCycles) {
-            extra.append(contentsOf: timeZoneChange(disk: disk))
-            extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
-            extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
-        }
-        extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
-        if since.backfill {
-            health.beginBackfill(since: since.date, preferences: prefs)
-        }
-        var healthResult = HealthIngestReadResult()
-        if health.hasPendingBackfill(preferences: prefs) {
-            healthResult = await health.backfill(preferences: prefs)
-        }
-        let incremental = await health.incremental(preferences: prefs)
-        let added = await queue.enqueue(diabetes.records + healthResult.records + incremental.records + extra)
-        if added.queued > 0 {
-            debug(.healthKit, "Health Ingest queued \(added.queued) records")
-        }
-        if let message = (diabetes.errors + healthResult.errors + incremental.errors).first {
-            setLastError(message)
-        }
-
+    /// Sends already-ready queue items. Must not await HealthKit or a Core Data reread.
+    private func flushReadyBatches(
+        queue: HealthIngestQueue,
+        origin: URL,
+        token: String,
+        deviceID: String,
+        maxBatches: Int
+    ) async -> FlushOutcome {
         var sentAny = false
         var failed = false
         var batches = 0
-        while batches < 4, !Task.isCancelled {
+        while batches < maxBatches, !Task.isCancelled {
             let batch = await queue.nextBatch(
                 limit: HealthIngestWire.maxBatchRecords,
                 maxBytes: HealthIngestWire.maxBatchBytes
             )
             if batch.isEmpty { break }
-            let outcome = await send(batch, origin: origin, token: token, queue: queue, deviceID: prefs.normalizedDeviceID)
+            let outcome = await send(batch, origin: origin, token: token, queue: queue, deviceID: deviceID)
             batches += 1
             if outcome {
                 failed = true
@@ -297,13 +276,103 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             }
             sentAny = true
         }
+        return FlushOutcome(sentAny: sentAny, failed: failed)
+    }
+
+    private func collectAndSend() async {
+        guard let queue = try? prepare(), let disk, let health else { return }
+        let prefs = currentPreferences()
+        guard let origin = HealthIngestOrigin.parse(prefs.baseURL), let token = settingsStore.token() else { return }
+
+        // Drain the existing queue first. A hung HealthKit incremental or backfill
+        // used to run before any send, so lastSuccess and queue depth could freeze
+        // after the first 4-batch flush.
+        var sentAny = false
+        var failed = false
+        let firstFlush = await flushReadyBatches(
+            queue: queue,
+            origin: origin,
+            token: token,
+            deviceID: prefs.normalizedDeviceID,
+            maxBatches: 8
+        )
+        sentAny = firstFlush.sentAny
+        failed = firstFlush.failed
+
+        var oversized = 0
+        var healthResult = HealthIngestReadResult()
+        var incremental = HealthIngestReadResult()
+        var diabetes = HealthIngestReadResult()
+        if !failed, !Task.isCancelled {
+            let since = takeSince()
+            let devices = resolverDevices()
+            diabetes = await adapter.records(
+                since: since.date,
+                preferences: prefs,
+                settings: settingsManager,
+                profiles: profiles,
+                pumpModel: devices.model,
+                supportedBasalRates: devices.rates
+            )
+            var extra: [HealthIngestRecord] = []
+            if prefs.isOn(.loopCycles) {
+                extra.append(contentsOf: timeZoneChange(disk: disk))
+                extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
+                extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
+            }
+            extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
+            if since.backfill {
+                health.beginBackfill(since: since.date, preferences: prefs)
+            }
+            let addedFast = await queue.enqueue(diabetes.records + extra)
+            oversized += addedFast.oversized
+            if addedFast.queued > 0 {
+                debug(.healthKit, "Health Ingest queued \(addedFast.queued) records")
+            }
+            if !failed, !Task.isCancelled {
+                let flush = await flushReadyBatches(
+                    queue: queue,
+                    origin: origin,
+                    token: token,
+                    deviceID: prefs.normalizedDeviceID,
+                    maxBatches: 8
+                )
+                sentAny = sentAny || flush.sentAny
+                failed = failed || flush.failed
+            }
+            if !Task.isCancelled, health.hasPendingBackfill(preferences: prefs) {
+                healthResult = await health.backfill(preferences: prefs)
+            }
+            if !Task.isCancelled {
+                incremental = await health.incremental(preferences: prefs)
+            }
+            let addedHK = await queue.enqueue(healthResult.records + incremental.records)
+            oversized += addedHK.oversized
+            if addedHK.queued > 0 {
+                debug(.healthKit, "Health Ingest queued \(addedHK.queued) Health records")
+            }
+            if !failed, !Task.isCancelled {
+                let flush = await flushReadyBatches(
+                    queue: queue,
+                    origin: origin,
+                    token: token,
+                    deviceID: prefs.normalizedDeviceID,
+                    maxBatches: 4
+                )
+                sentAny = sentAny || flush.sentAny
+                failed = failed || flush.failed
+            }
+        }
+        if let message = (diabetes.errors + healthResult.errors + incremental.errors).first {
+            setLastError(message)
+        }
         if sentAny {
             setLastSuccess(Date())
         }
         if !failed {
             consecutiveFailures = 0
         }
-        if added.oversized > 0 {
+        if oversized > 0 {
             let message = "A record payload was over 128 KiB and was dropped."
             setLastError(message)
             warning(.healthKit, "Health Ingest \(message)")
@@ -508,7 +577,18 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return records
     }
 
+    /// Restarts the upload loop if it exited while the service was still enabled.
+    private func ensureLoopRunning() {
+        if let loopTask, !loopTask.isCancelled { return }
+        loopTask = Task.detached(priority: .utility) { [weak self] in
+            await self?.run()
+        }
+    }
+
     private func poke() {
+        if started {
+            ensureLoopRunning()
+        }
         Task { await wake.signal() }
     }
 

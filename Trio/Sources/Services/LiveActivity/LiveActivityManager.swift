@@ -69,6 +69,14 @@ final class LiveActivityData: ObservableObject {
     /// The current active live activity.
     private var currentActivity: ActiveActivity?
 
+    /// Coalesce local Activity.update calls so glucose/IOB/determination bursts
+    /// do not trip liveactivitiesd's XPC input budget ("Client %{public}s has
+    /// exceeded request budget; timeout until %{public}s").
+    private var lastActivityUpdateAt: Date?
+    private var pendingCoalescedState: LiveActivityAttributes.ContentState?
+    private var coalesceTask: Task<Void, Never>?
+    private let minimumUpdateInterval: TimeInterval = 15
+
     private var data = LiveActivityData()
 
     /// A dispatch queue for handling Core Data change notifications.
@@ -263,84 +271,71 @@ final class LiveActivityData: ObservableObject {
             if currentActivity.needsRecreation(), UIApplication.shared.applicationState == .active {
                 debug(.liveActivity, "Recreating Live Activity \(currentActivity.activity.id)")
                 await endActivity()
-                // After endActivity(), currentActivity is guaranteed to be nil
-                // No recursive task, but explicitly restart
+                // Give liveactivitiesd / chronod / SystemAperture time to drop
+                // the previous jindo element before requesting a new one.
+                // The shortcut restart path already waits; hourly recreation did not.
+                debug(.liveActivity, "Waiting for iOS to clean up the ended Live Activity")
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
                 debug(.liveActivity, "Pushing update after recreation")
                 await pushUpdate(state)
             } else {
+                if let last = lastActivityUpdateAt,
+                   Date.now.timeIntervalSince(last) < minimumUpdateInterval
+                {
+                    let wait = minimumUpdateInterval - Date.now.timeIntervalSince(last)
+                    pendingCoalescedState = state
+                    if coalesceTask == nil {
+                        coalesceTask = Task { @MainActor [weak self] in
+                            let nanos = UInt64(max(wait, 0) * 1_000_000_000)
+                            try? await Task.sleep(nanoseconds: nanos)
+                            guard let self else { return }
+                            self.coalesceTask = nil
+                            if let pending = self.pendingCoalescedState {
+                                self.pendingCoalescedState = nil
+                                await self.pushUpdate(pending)
+                            }
+                        }
+                    }
+                    debug(.liveActivity, "Coalesced Live Activity update; next push in \(Int(max(wait, 0)))s")
+                    return
+                }
+
+                // staleDate must be in the future. state.date is the last loop
+                // cycle, which can already be several minutes old and would
+                // immediately mark the activity stale.
                 let content = ActivityContent(
                     state: state,
-                    staleDate: min(state.date ?? Date.now, Date.now).addingTimeInterval(360)
+                    staleDate: Date.now.addingTimeInterval(8 * 60),
+                    relevanceScore: 100
                 )
                 // Before the update, check if currentActivity is still valid
                 if let stillCurrent = self.currentActivity, stillCurrent.activity.id == currentActivity.activity.id {
                     debug(.liveActivity, "Updating Live Activity \(stillCurrent.activity.id)")
                     await stillCurrent.activity.update(content)
+                    lastActivityUpdateAt = Date.now
                 } else {
                     debug(.liveActivity, "Update skipped, activity changed during push")
                 }
             }
         } else {
-            // ... Activity is newly created ...
+            // Start with the real content in a single request. A dummy
+            // placeholder request followed by an immediate update races two
+            // jindo snapshots and spends two XPC budget slots.
             do {
-                let expired = ActivityContent(
-                    state: LiveActivityAttributes
-                        .ContentState(
-                            unit: settings.units.rawValue,
-                            bg: "--",
-                            glucose: nil,
-                            direction: nil,
-                            change: "--",
-                            date: Date.now,
-                            highGlucose: settings.high,
-                            lowGlucose: settings.low,
-                            target: data.determination?.target ?? 100 as Decimal,
-                            glucoseColorScheme: settings.glucoseColorScheme.rawValue,
-                            useDetailedViewIOS: false,
-                            useDetailedViewWatchOS: false,
-                            simpleViewStyle: LiveActivityAttributes.SimpleViewStyle(settings: settings),
-                            detailedViewState: LiveActivityAttributes.ContentAdditionalState(
-                                chart: [],
-                                rotationDegrees: 0,
-                                cob: 0,
-                                iob: 0,
-                                tdd: 0,
-                                isOverrideActive: false,
-                                overrideName: "",
-                                overrideDate: Date.now,
-                                overrideDuration: 0,
-                                overrideTarget: 0,
-                                isTempTargetActive: false,
-                                tempTargetName: "",
-                                tempTargetDate: Date.now,
-                                tempTargetDuration: 0,
-                                tempTargetTarget: 0,
-                                widgetItems: [],
-                                minForecast: [],
-                                maxForecast: [],
-                                forecastLines: [],
-                                forecastDisplayType: ForecastDisplayType.cone.rawValue
-                            ),
-                            isInitialState: true
-                        ),
-                    staleDate: Date.now.addingTimeInterval(60)
+                let content = ActivityContent(
+                    state: state,
+                    staleDate: Date.now.addingTimeInterval(8 * 60),
+                    relevanceScore: 100
                 )
 
                 let activity = try Activity.request(
                     attributes: LiveActivityAttributes(startDate: Date.now),
-                    content: expired,
+                    content: content,
                     pushType: nil
                 )
                 currentActivity = ActiveActivity(activity: activity)
+                lastActivityUpdateAt = Date.now
                 info(.liveActivity, "Started Live Activity \(activity.id)")
-
-                // Update the newly created activity with actual data
-                let updateContent = ActivityContent(
-                    state: state,
-                    staleDate: Date.now.addingTimeInterval(5 * 60)
-                )
-                await activity.update(updateContent)
-                debug(.liveActivity, "Set initial content for Live Activity \(activity.id)")
             } catch {
                 warning(.liveActivity, "Starting Live Activity failed, will retry on next update", error: error)
                 // Reset currentActivity on error to allow retry on next update
@@ -351,6 +346,10 @@ final class LiveActivityData: ObservableObject {
 
     /// Ends the current live activity and ensures that all unknown activities are terminated.
     private func endActivity() async {
+        coalesceTask?.cancel()
+        coalesceTask = nil
+        pendingCoalescedState = nil
+        lastActivityUpdateAt = nil
         debug(.liveActivity, "Ending all Live Activities")
 
         if let currentActivity {

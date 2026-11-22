@@ -95,6 +95,8 @@
 	<string>$(COPYRIGHT_NOTICE)</string>
 	<key>NSSupportsLiveActivities</key>
 	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
+	<true/>
 	<key>TeamID</key>
 	<string>$(DEVELOPMENT_TEAM)</string>
 	<key>UIApplicationSceneManifest</key>

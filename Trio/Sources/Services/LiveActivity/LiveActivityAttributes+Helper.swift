@@ -76,8 +76,21 @@ extension LiveActivityAttributes.ContentState {
         let trendString = bg.direction?.symbol as? String
         let change = Self.calculateChange(chart: chart, units: units)
 
+        // Only ship chart/forecast data when a Detailed surface will actually
+        // draw it. Even then, cap history: 6h of points plus forecasts already
+        // approaches ActivityKit's content-state size limit (liveactivitiesd
+        // logs "Content state size %ld exceeds maximum size %ld").
+        let needsChart = settings.lockScreenView == .detailed || settings.smartStackView == .detailed
+        let maxChartPoints = 36 // 3h at 5-minute CGM intervals
+        let chartItems: [LiveActivityAttributes.ChartItem] = needsChart
+            ? chart.prefix(maxChartPoints).map {
+                LiveActivityAttributes.ChartItem(value: Decimal($0.glucose), date: $0.date)
+            }
+            : []
+        let includeForecasts = needsChart && settings.displayGlucoseForecasts
+
         let detailedState = LiveActivityAttributes.ContentAdditionalState(
-            chart: chart.map { LiveActivityAttributes.ChartItem(value: Decimal($0.glucose), date: $0.date) },
+            chart: chartItems,
             rotationDegrees: rotationDegrees,
             cob: Decimal(determination?.cob ?? 0),
             iob: iob ?? 0 as Decimal,
@@ -93,11 +106,11 @@ extension LiveActivityAttributes.ContentState {
             tempTargetDuration: tempTarget?.duration ?? 0,
             tempTargetTarget: tempTarget?.target ?? 0,
             widgetItems: widgetItems ?? [], // set empty array here to silence compiler; this can never be nil
-            minForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+            minForecast: includeForecasts && settings.forecastDisplayType == .cone
                 ? (determination?.minForecast ?? []) : [],
-            maxForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+            maxForecast: includeForecasts && settings.forecastDisplayType == .cone
                 ? (determination?.maxForecast ?? []) : [],
-            forecastLines: settings.displayGlucoseForecasts && settings.forecastDisplayType == .lines
+            forecastLines: includeForecasts && settings.forecastDisplayType == .lines
                 ? (determination?.forecastLines ?? [])
                 .map { LiveActivityAttributes.ForecastLine(type: $0.type, values: $0.values) }
                 : [],

@@ -372,7 +372,7 @@ final class HealthIngestHealthKitReader {
     }
 
     private static func mapSleep(_ sample: HKCategorySample) -> HealthIngestRecord? {
-        guard let payload = HealthIngestHealthMapping.sleepPayload(hkValue: sample.value) else { return nil }
+        let payload = HealthIngestHealthMapping.sleepPayload(hkValue: sample.value)
         guard case .value(let end) = HealthIngestHealthMapping.sampleEnd(
             recordType: HealthIngestType.sleepStage,
             start: sample.startDate,

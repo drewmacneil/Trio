@@ -160,6 +160,11 @@ enum HealthIngestType {
         workout, heartRate, restingHR, hrv, sleepStage, activeEnergy, exerciseMinutes
     ]
 
+    /// Trio's own records. They upload ahead of a HealthKit backfill.
+    static func isPriorityLane(_ type: String) -> Bool {
+        !healthKitTypes.contains(type)
+    }
+
     /// Types a mapping bump should drop and send again. The server dedupes.
     static let contractResendTypes: Set<String> = healthKitTypes.union([loopCycle, effectiveProfile])
 

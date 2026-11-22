@@ -730,6 +730,178 @@ import Testing
         #expect(finished.fraction == 1)
     }
 
+    @Test func diabetesItemsLeaveAheadOfAHealthKitBackfill() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let total = 1_200
+        var sent = 0
+        while sent < total {
+            let upper = min(sent + 400, total)
+            let records = (sent ..< upper).map { makeRecord(id: "hr-\($0)", type: HealthIngestType.heartRate) }
+            #expect(await queue.enqueue(records).queued == records.count)
+            sent = upper
+        }
+        let recent = [
+            makeRecord(id: "glucose-now", type: HealthIngestType.glucose),
+            makeRecord(id: "loop-now", type: HealthIngestType.loopCycle),
+            makeRecord(id: "bolus-now", type: HealthIngestType.bolus),
+            makeRecord(id: "carbs-now", type: HealthIngestType.carbs),
+            makeRecord(id: "basal-now", type: HealthIngestType.tempBasal)
+        ]
+        #expect(await queue.enqueue(recent).queued == recent.count)
+        #expect(await queue.regularDepth() == total)
+        #expect(await queue.priorityDepth() == recent.count)
+        #expect(await queue.windowCount() <= HealthIngestQueue.windowCap)
+
+        let batch = await queue.nextBatch(limit: HealthIngestWire.maxBatchRecords, maxBytes: HealthIngestWire.maxBatchBytes)
+        #expect(Array(batch.prefix(recent.count)).map(\.id) == recent.map(\.id))
+        #expect(batch.count > recent.count)
+        #expect(batch[recent.count].type == HealthIngestType.heartRate)
+
+        let acks = recent.map { HealthIngestAck(type: $0.type, id: $0.id, status: .accepted) }
+        _ = await queue.resolve(batch: recent, acks: acks, transportFailed: false)
+        #expect(await queue.priorityDepth() == 0)
+        #expect(await queue.regularDepth() == total)
+        let next = await queue.nextBatch(limit: 1, maxBytes: 1_000_000)
+        #expect(next.first?.type == HealthIngestType.heartRate)
+    }
+
+    @Test func diabetesReadIsNotSkippedWhenHealthKitBacklogIsAtHighWater() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let backlog = (0 ..< 40).map { makeRecord(id: "hr-\($0)", type: HealthIngestType.heartRate) }
+        #expect(await queue.enqueue(backlog).queued == backlog.count)
+        let highWater = await queue.regularDepth()
+        #expect(highWater == backlog.count)
+        let open = HealthIngestReadGate.decide(
+            healthKitDepth: highWater,
+            priorityDepth: await queue.priorityDepth(),
+            highWater: highWater,
+            throttled: false
+        )
+        #expect(open.readDiabetes)
+        #expect(!open.readHealthKit)
+
+        let under = HealthIngestReadGate.decide(
+            healthKitDepth: highWater,
+            priorityDepth: 0,
+            highWater: highWater + 1,
+            throttled: false
+        )
+        #expect(under.readDiabetes)
+        #expect(under.readHealthKit)
+
+        let capped = HealthIngestReadGate.decide(
+            healthKitDepth: 0,
+            priorityDepth: HealthIngestReadGate.priorityCap,
+            highWater: highWater,
+            throttled: false
+        )
+        #expect(!capped.readDiabetes)
+        #expect(capped.readHealthKit)
+
+        let background = HealthIngestReadGate.decide(
+            healthKitDepth: 0,
+            priorityDepth: 0,
+            highWater: highWater,
+            throttled: true
+        )
+        #expect(!background.readDiabetes)
+        #expect(background.readHealthKit)
+    }
+
+    @Test func priorityLaneSurvivesRestart() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let heart = (0 ..< 8).map { makeRecord(id: "hr-\($0)", type: HealthIngestType.heartRate) }
+        let diabetes = [
+            makeRecord(id: "glucose-1", type: HealthIngestType.glucose),
+            makeRecord(id: "bolus-1", type: HealthIngestType.bolus),
+            makeRecord(id: "carbs-1", type: HealthIngestType.carbs),
+            makeRecord(id: "loop-1", type: HealthIngestType.loopCycle),
+            makeRecord(id: "basal-1", type: HealthIngestType.tempBasal)
+        ]
+        #expect(await queue.enqueue(heart).queued == heart.count)
+        #expect(await queue.enqueue(diabetes).queued == diabetes.count)
+
+        let stored = disk.loadQueue(named: "priority.json")
+        #expect(stored.map(\.record.id) == diabetes.map(\.id))
+        #expect(stored.map(\.record.type) == diabetes.map(\.type))
+
+        let reloaded = HealthIngestQueue(disk: disk)
+        #expect(await reloaded.priorityDepth() == diabetes.count)
+        #expect(await reloaded.regularDepth() == heart.count)
+        #expect(await reloaded.depth() == heart.count + diabetes.count)
+        let batch = await reloaded.nextBatch(limit: 20, maxBytes: 1_000_000)
+        #expect(Array(batch.prefix(diabetes.count)).map(\.id) == diabetes.map(\.id))
+        #expect(Array(batch.prefix(diabetes.count)).map(\.type) == diabetes.map(\.type))
+        #expect(batch.map(\.id).contains("hr-0"))
+    }
+
+    @Test func legacyQueueMigratesOntoThePriorityLaneWithoutLoss() async throws {
+        let disk = try makeDisk()
+        let windowCount = HealthIngestQueue.windowCap / 2
+        var window: [HealthIngestQueuedRecord] = []
+        var segment: [HealthIngestQueuedRecord] = []
+        var expectedPriority: [String] = []
+        var expectedRegular: [String] = []
+        for index in 0 ..< windowCount {
+            let priority = index.isMultiple(of: 5)
+            let type = priority ? HealthIngestType.glucose : HealthIngestType.heartRate
+            let id = priority ? "glucose-\(index)" : "hr-\(index)"
+            window.append(queued(id: id, type: type, hash: "w\(index)"))
+            if priority { expectedPriority.append(id) } else { expectedRegular.append(id) }
+        }
+        for index in 0 ..< 80 {
+            let priority = index.isMultiple(of: 2)
+            let type = priority ? HealthIngestType.bolus : HealthIngestType.hrv
+            let id = priority ? "bolus-\(index)" : "hrv-\(index)"
+            segment.append(queued(id: id, type: type, hash: "s\(index)"))
+            if priority { expectedPriority.append(id) } else { expectedRegular.append(id) }
+        }
+        disk.saveQueue(window)
+        disk.saveSpillSegment(1, segment)
+        disk.saveSpillManifest(HealthIngestSpillManifest(segments: [.init(id: 1, count: segment.count)], nextID: 2))
+        #expect(!disk.loadPriorityMigrated())
+
+        let queue = HealthIngestQueue(disk: disk)
+        let total = window.count + segment.count
+        #expect(await queue.depth() == total)
+        #expect(await queue.priorityDepth() == expectedPriority.count)
+        #expect(await queue.regularDepth() == expectedRegular.count)
+        #expect(disk.loadPriorityMigrated())
+        #expect(disk.loadQueue().allSatisfy { !HealthIngestType.isPriorityLane($0.record.type) })
+        let manifest = disk.loadSpillManifest()
+        for part in manifest.segments {
+            let rows = disk.loadSpillSegment(part.id)
+            #expect(rows.allSatisfy { !HealthIngestType.isPriorityLane($0.record.type) })
+        }
+
+        let reloaded = HealthIngestQueue(disk: disk)
+        #expect(await reloaded.depth() == total)
+        #expect(await reloaded.priorityDepth() == expectedPriority.count)
+        var delivered: [String] = []
+        while delivered.count < total {
+            let batch = await reloaded.nextBatch(limit: HealthIngestWire.maxBatchRecords, maxBytes: HealthIngestWire.maxBatchBytes)
+            if batch.isEmpty { break }
+            delivered.append(contentsOf: batch.map(\.id))
+            let acks = batch.map { HealthIngestAck(type: $0.type, id: $0.id, status: .accepted) }
+            _ = await reloaded.resolve(batch: batch, acks: acks, transportFailed: false)
+        }
+        #expect(delivered == expectedPriority + expectedRegular)
+        #expect(await reloaded.depth() == 0)
+    }
+
+    private func queued(id: String, type: String, hash: String) -> HealthIngestQueuedRecord {
+        HealthIngestQueuedRecord(
+            record: makeRecord(id: id, type: type),
+            bytes: 200,
+            hash: hash,
+            failures: 0,
+            notBefore: Date(timeIntervalSince1970: 0)
+        )
+    }
+
     private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)

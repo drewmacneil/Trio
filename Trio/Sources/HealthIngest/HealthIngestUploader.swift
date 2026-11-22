@@ -170,7 +170,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         backfillRowsSent = 0
         stateLock.unlock()
         poke()
-        publishSnapshot(depth: status.queueDepth)
+        publishSnapshot(depth: status.queueDepth, priorityDepth: status.priorityDepth)
     }
 
     @MainActor func clearRejections() {
@@ -179,7 +179,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             if let queue = try? self.prepare() {
                 await queue.clearRejections()
                 let depth = await queue.depth()
-                self.publishSnapshot(depth: depth)
+                let priorityDepth = await queue.priorityDepth()
+                self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
             }
         }
     }
@@ -201,9 +202,10 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         HealthIngestLoopCapture.requeueStoredProfiles()
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
         let depth = await queue.depth()
+        let priorityDepth = await queue.priorityDepth()
         await MainActor.run { [weak self] in
             guard let self else { return }
-            self.publishSnapshot(depth: depth)
+            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
             self.backfill(days: days)
         }
     }
@@ -219,7 +221,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
         rewindCoreDataRead(days: 90)
         let depth = await queue.depth()
-        publishSnapshot(depth: depth)
+        let priorityDepth = await queue.priorityDepth()
+        publishSnapshot(depth: depth, priorityDepth: priorityDepth)
     }
 
     /// Next diabetes read starts at the beginning of the window so stored loop cycles are sent again.
@@ -305,7 +308,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             stateLock.lock()
             lastError = "Could not open the on-device queue."
             stateLock.unlock()
-            publishSnapshot(depth: 0)
+            publishSnapshot(depth: 0, priorityDepth: 0)
             warning(.healthKit, "Health Ingest queue failed to open", error: error)
             return
         }
@@ -465,13 +468,18 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
 
         if !failed, !Task.isCancelled {
-            let backlog = await queue.depth()
             let now = Date()
-            let catchingUp = lockedDiabetesResume() != nil
             let throttled = budget.minDiabetesInterval > 0
                 && (lockedLastDiabetesRead().map { now.timeIntervalSince($0) < budget.minDiabetesInterval } ?? false)
-            let backedUp = catchingUp && backlog >= budget.backlogHighWater
-            if !throttled, !backedUp {
+            // HealthKit depth used to skip this read while catching up, so recent glucose
+            // and treatments waited behind a backfill. Only this lane's own cap applies.
+            let gate = HealthIngestReadGate.decide(
+                healthKitDepth: await queue.regularDepth(),
+                priorityDepth: await queue.priorityDepth(),
+                highWater: budget.backlogHighWater,
+                throttled: throttled
+            )
+            if gate.readDiabetes {
                 let since = takeSince()
                 // A long catch-up or backfill is read one window at a time, not as one fetch.
                 let until = windowEnd(from: since.date, chunk: budget.diabetesChunk)
@@ -513,9 +521,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             }
         }
         if !failed, !Task.isCancelled {
-            // Health reads stream page by page into the queue. They pause while the queue is
-            // backed up, so a long backfill cannot outrun the uploads.
-            if await queue.depth() < budget.backlogHighWater {
+            // Health reads stream page by page into their own lane. They pause while that
+            // lane is backed up. Trio rows do not count toward this and are not paused by it.
+            let healthGate = HealthIngestReadGate.decide(
+                healthKitDepth: await queue.regularDepth(),
+                priorityDepth: await queue.priorityDepth(),
+                highWater: budget.backlogHighWater,
+                throttled: false
+            )
+            if healthGate.readHealthKit {
                 if health.hasPendingBackfill(preferences: prefs) {
                     errors.append(
                         contentsOf: await health.backfill(
@@ -565,7 +579,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
         storeBackfillRunning(health.hasPendingBackfill(preferences: prefs))
         let depth = await queue.depth()
-        publishSnapshot(depth: depth)
+        let priorityDepth = await queue.priorityDepth()
+        publishSnapshot(depth: depth, priorityDepth: priorityDepth)
         disk.saveStatus(HealthIngestPersistedStatus(lastSuccess: lockedSuccess(), lastError: lockedError()))
     }
 
@@ -767,7 +782,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         )
     }
 
-    private func publishSnapshot(depth: Int) {
+    private func publishSnapshot(depth: Int, priorityDepth: Int) {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
@@ -775,6 +790,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
             queueDepth: depth,
+            priorityDepth: priorityDepth,
             rejectedCount: log.total,
             hasToken: settingsStore.hasToken(),
             backfillRunning: running,

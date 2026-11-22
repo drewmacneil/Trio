@@ -223,7 +223,8 @@ struct HealthIngestSettingsForm: View {
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
             VStack(alignment: .leading, spacing: 2) {
                 labeledRow("Queue", status.queueDepth.formatted())
-                Text("Rows waiting to upload.")
+                labeledRow("Trio first", status.priorityDepth.formatted())
+                Text("Rows waiting to upload. Trio rows are sent first.")
                     .font(.footnote)
                     .foregroundColor(.secondary)
             }

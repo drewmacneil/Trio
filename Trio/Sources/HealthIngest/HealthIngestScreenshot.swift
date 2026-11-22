@@ -97,6 +97,7 @@ struct HealthIngestScreenshotHost: View {
             lastSuccess: fixture.lastSuccess.map { Date(timeIntervalSince1970: $0) },
             lastError: fixture.lastError,
             queueDepth: fixture.queueDepth,
+            priorityDepth: 0,
             rejectedCount: fixture.rejectedCount,
             hasToken: fixture.hasToken,
             backfillRunning: fixture.backfillRunning,

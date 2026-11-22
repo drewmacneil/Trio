@@ -171,35 +171,63 @@ final class HealthIngestDisk {
     }
 
     func loadQueue() -> [HealthIngestQueuedRecord] {
-        load([HealthIngestQueuedRecord].self, name: "queue.json") ?? []
+        loadQueue(named: "queue.json")
+    }
+
+    func loadQueue(named name: String) -> [HealthIngestQueuedRecord] {
+        load([HealthIngestQueuedRecord].self, name: name) ?? []
     }
 
     func saveQueue(_ items: [HealthIngestQueuedRecord]) {
-        save(items, name: "queue.json")
+        saveQueue(items, named: "queue.json")
+    }
+
+    func saveQueue(_ items: [HealthIngestQueuedRecord], named name: String) {
+        save(items, name: name)
     }
 
     /// Records beyond the in-memory window live in small segment files of at most
     /// `HealthIngestQueue.segmentSize` rows each, so memory and every rewrite stay bounded.
     func loadSpillManifest() -> HealthIngestSpillManifest {
-        load(HealthIngestSpillManifest.self, name: "queue-spill.json") ?? HealthIngestSpillManifest()
+        loadSpillManifest(named: "queue-spill.json")
+    }
+
+    func loadSpillManifest(named name: String) -> HealthIngestSpillManifest {
+        load(HealthIngestSpillManifest.self, name: name) ?? HealthIngestSpillManifest()
     }
 
     func saveSpillManifest(_ manifest: HealthIngestSpillManifest) {
-        save(manifest, name: "queue-spill.json")
+        saveSpillManifest(manifest, named: "queue-spill.json")
+    }
+
+    func saveSpillManifest(_ manifest: HealthIngestSpillManifest, named name: String) {
+        save(manifest, name: name)
     }
 
     func loadSpillSegment(_ id: Int) -> [HealthIngestQueuedRecord] {
-        load([HealthIngestQueuedRecord].self, name: "queue-spill-\(id).json") ?? []
+        loadSpillSegment(prefix: "queue-spill-", id: id)
+    }
+
+    func loadSpillSegment(prefix: String, id: Int) -> [HealthIngestQueuedRecord] {
+        load([HealthIngestQueuedRecord].self, name: "\(prefix)\(id).json") ?? []
     }
 
     func saveSpillSegment(_ id: Int, _ items: [HealthIngestQueuedRecord]) {
-        save(items, name: "queue-spill-\(id).json")
+        saveSpillSegment(prefix: "queue-spill-", id: id, items)
+    }
+
+    func saveSpillSegment(prefix: String, id: Int, _ items: [HealthIngestQueuedRecord]) {
+        save(items, name: "\(prefix)\(id).json")
     }
 
     func deleteSpillSegment(_ id: Int) {
+        deleteSpillSegment(prefix: "queue-spill-", id: id)
+    }
+
+    func deleteSpillSegment(prefix: String, id: Int) {
         lock.lock()
         defer { lock.unlock() }
-        try? FileManager.default.removeItem(at: directory.appendingPathComponent("queue-spill-\(id).json"))
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(prefix)\(id).json"))
     }
 
     func loadReceipts() -> [HealthIngestReceipt] {
@@ -300,6 +328,15 @@ final class HealthIngestDisk {
         save(version, name: "mapping-version.json")
     }
 
+    /// Set once the pre-priority queue has been split. A crash before this is written retries.
+    func loadPriorityMigrated() -> Bool {
+        load(Bool.self, name: "priority-migrated.json") ?? false
+    }
+
+    func savePriorityMigrated() {
+        save(true, name: "priority-migrated.json")
+    }
+
     private func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
         lock.lock()
         defer { lock.unlock() }
@@ -317,15 +354,81 @@ final class HealthIngestDisk {
     }
 }
 
+/// Which reads one pass may start. A HealthKit backlog never blocks Trio records.
+enum HealthIngestReadGate {
+    struct Decision: Equatable {
+        var readDiabetes: Bool
+        var readHealthKit: Bool
+    }
+
+    /// Trio reads wait only when their own lane holds this many rows. A foreground
+    /// catch-up is a two-day chunk, so this fits several chunks, then pauses until
+    /// uploads drain the lane.
+    static let priorityCap = 2_000
+
+    static func decide(
+        healthKitDepth: Int,
+        priorityDepth: Int,
+        highWater: Int,
+        throttled: Bool,
+        priorityCap: Int = priorityCap
+    ) -> Decision {
+        Decision(
+            readDiabetes: !throttled && priorityDepth < priorityCap,
+            readHealthKit: healthKitDepth < highWater
+        )
+    }
+}
+
+/// Two on-disk lanes. Trio records sit in the priority lane and leave `nextBatch` first.
+/// HealthKit backfill stays in the original queue. A queue written before the priority
+/// lane is split on open so those rows still upload.
 actor HealthIngestQueue {
-    /// Rows kept in memory and in `queue.json`. Anything beyond this goes to spill segments.
+    /// Rows kept in memory per lane. Anything beyond this goes to spill segments.
     static let windowCap = 1_000
     static let segmentSize = 500
 
+    private struct LaneFiles {
+        var queueName: String
+        var manifestName: String
+        var segmentPrefix: String
+
+        static let regular = LaneFiles(
+            queueName: "queue.json",
+            manifestName: "queue-spill.json",
+            segmentPrefix: "queue-spill-"
+        )
+        static let priority = LaneFiles(
+            queueName: "priority.json",
+            manifestName: "priority-spill.json",
+            segmentPrefix: "priority-spill-"
+        )
+    }
+
+    private final class Lane {
+        var items: [HealthIngestQueuedRecord]
+        var windowKeys: Set<String>
+        var spill: HealthIngestSpillManifest
+        let files: LaneFiles
+
+        var count: Int { items.count + spill.count }
+
+        init(
+            items: [HealthIngestQueuedRecord],
+            windowKeys: Set<String>,
+            spill: HealthIngestSpillManifest,
+            files: LaneFiles
+        ) {
+            self.items = items
+            self.windowKeys = windowKeys
+            self.spill = spill
+            self.files = files
+        }
+    }
+
     private let disk: HealthIngestDisk
-    private var items: [HealthIngestQueuedRecord]
-    private var windowKeys: Set<String>
-    private var spill: HealthIngestSpillManifest
+    private let priority: Lane
+    private let regular: Lane
     private var receipts: [HealthIngestReceipt]
     private var receiptByKey: [String: HealthIngestReceipt]
     private var firstSeen: [String: Date]
@@ -338,51 +441,112 @@ actor HealthIngestQueue {
 
     init(disk: HealthIngestDisk) {
         self.disk = disk
-        var window = disk.loadQueue()
-        var manifest = disk.loadSpillManifest()
-        // A queue file written before spill segments existed can hold tens of thousands
-        // of rows. Move the excess to segments once so memory is bounded from here on.
-        if window.count > Self.windowCap {
-            let excess = Array(window[Self.windowCap...])
-            window = Array(window[..<Self.windowCap])
-            var start = 0
-            while start < excess.count {
-                let end = min(start + Self.segmentSize, excess.count)
-                let chunk = Array(excess[start ..< end])
-                disk.saveSpillSegment(manifest.nextID, chunk)
-                manifest.segments.append(HealthIngestSpillSegment(id: manifest.nextID, count: chunk.count))
-                manifest.nextID += 1
-                start = end
-            }
-            disk.saveSpillManifest(manifest)
-            disk.saveQueue(window)
+        regular = Self.loadLane(.regular, disk: disk)
+        priority = Self.loadLane(.priority, disk: disk)
+        if !disk.loadPriorityMigrated() {
+            Self.migrateLegacyPriorityRows(disk: disk, regular: regular, priority: priority)
+            disk.savePriorityMigrated()
         }
-        // Pull the oldest segments back in until the window is half full.
-        while window.count < Self.windowCap / 2, let first = manifest.segments.first {
-            window.append(contentsOf: disk.loadSpillSegment(first.id))
-            manifest.segments.removeFirst()
-            disk.saveQueue(window)
-            disk.saveSpillManifest(manifest)
-            disk.deleteSpillSegment(first.id)
-        }
-        items = window
-        windowKeys = Set(window.map { Self.key($0.record) })
-        spill = manifest
         let stored = disk.loadReceipts()
         receipts = stored
         receiptByKey = Dictionary(stored.map { ($0.key, $0) }, uniquingKeysWith: { _, new in new })
         firstSeen = disk.loadFirstSeen()
     }
 
+    /// A queue file written before spill segments existed can hold tens of thousands
+    /// of rows. Move the excess to segments once so memory is bounded from here on.
+    private static func loadLane(_ files: LaneFiles, disk: HealthIngestDisk) -> Lane {
+        var window = disk.loadQueue(named: files.queueName)
+        var manifest = disk.loadSpillManifest(named: files.manifestName)
+        if window.count > windowCap {
+            let excess = Array(window[windowCap...])
+            window = Array(window[..<windowCap])
+            var start = 0
+            while start < excess.count {
+                let end = min(start + segmentSize, excess.count)
+                let chunk = Array(excess[start ..< end])
+                disk.saveSpillSegment(prefix: files.segmentPrefix, id: manifest.nextID, chunk)
+                manifest.segments.append(HealthIngestSpillSegment(id: manifest.nextID, count: chunk.count))
+                manifest.nextID += 1
+                start = end
+            }
+            disk.saveSpillManifest(manifest, named: files.manifestName)
+            disk.saveQueue(window, named: files.queueName)
+        }
+        // Pull the oldest segments back in until the window is half full.
+        while window.count < windowCap / 2, let first = manifest.segments.first {
+            window.append(contentsOf: disk.loadSpillSegment(prefix: files.segmentPrefix, id: first.id))
+            manifest.segments.removeFirst()
+            disk.saveQueue(window, named: files.queueName)
+            disk.saveSpillManifest(manifest, named: files.manifestName)
+            disk.deleteSpillSegment(prefix: files.segmentPrefix, id: first.id)
+        }
+        return Lane(
+            items: window,
+            windowKeys: Set(window.map { key($0.record) }),
+            spill: manifest,
+            files: files
+        )
+    }
+
+    /// Copies Trio rows out of the original queue, then removes them. The copy is saved
+    /// first so a crash leaves a duplicate, which the server upserts, rather than a gap.
+    private static func migrateLegacyPriorityRows(disk: HealthIngestDisk, regular: Lane, priority: Lane) {
+        var moved: [HealthIngestQueuedRecord] = []
+        moved.append(contentsOf: regular.items.filter { HealthIngestType.isPriorityLane($0.record.type) })
+        var segmentRows: [(segment: HealthIngestSpillSegment, stay: [HealthIngestQueuedRecord], go: [HealthIngestQueuedRecord])] = []
+        for segment in regular.spill.segments {
+            let rows = disk.loadSpillSegment(prefix: regular.files.segmentPrefix, id: segment.id)
+            let go = rows.filter { HealthIngestType.isPriorityLane($0.record.type) }
+            let stay = rows.filter { !HealthIngestType.isPriorityLane($0.record.type) }
+            if !go.isEmpty {
+                moved.append(contentsOf: go)
+            }
+            segmentRows.append((segment, stay, go))
+        }
+        guard !moved.isEmpty else { return }
+
+        var seen = keys(in: priority, disk: disk)
+        var fresh: [HealthIngestQueuedRecord] = []
+        for row in moved where seen.insert(key(row.record)).inserted {
+            fresh.append(row)
+        }
+        appendPending(fresh, to: priority, disk: disk)
+
+        regular.items.removeAll { HealthIngestType.isPriorityLane($0.record.type) }
+        regular.windowKeys = Set(regular.items.map { key($0.record) })
+        var kept: [HealthIngestSpillSegment] = []
+        for entry in segmentRows {
+            if entry.go.isEmpty {
+                kept.append(entry.segment)
+                continue
+            }
+            if entry.stay.isEmpty {
+                disk.deleteSpillSegment(prefix: regular.files.segmentPrefix, id: entry.segment.id)
+            } else {
+                disk.saveSpillSegment(prefix: regular.files.segmentPrefix, id: entry.segment.id, entry.stay)
+                kept.append(HealthIngestSpillSegment(id: entry.segment.id, count: entry.stay.count))
+            }
+        }
+        regular.spill.segments = kept
+        disk.saveQueue(regular.items, named: regular.files.queueName)
+        disk.saveSpillManifest(regular.spill, named: regular.files.manifestName)
+        refillWindow(regular, disk: disk)
+        refillWindow(priority, disk: disk)
+    }
+
     /// Same `(type, id)` is reused. A changed payload replaces a pending row and is sent again
     /// after a previous accept. An unchanged snapshot is sent again once a day.
     /// Callers pass at most a few hundred records at a time. Rows beyond the memory window are
     /// written to spill segments, so a large backfill never grows the in-memory queue.
+    /// Trio records go to the priority lane. HealthKit records stay on the original lane.
     func enqueue(_ records: [HealthIngestRecord], now: Date = Date()) -> HealthIngestEnqueueResult {
         var queued = 0
         var oversized = 0
-        var changed = false
-        var overflow: [HealthIngestQueuedRecord] = []
+        var priorityDirty = false
+        var regularDirty = false
+        var priorityOverflow: [HealthIngestQueuedRecord] = []
+        var regularOverflow: [HealthIngestQueuedRecord] = []
         var firstSeenChanged = false
         for incoming in records {
             var record = incoming
@@ -404,14 +568,16 @@ actor HealthIngestQueue {
             let hash = HealthIngestCanonicalJSON.digest(canonical: canonical)
             let key = Self.key(record)
             let bytes = Self.estimatedBytes(record, payloadBytes: payloadBytes)
-            if windowKeys.contains(key), let index = items.firstIndex(where: { Self.key($0.record) == key }) {
-                guard items[index].hash != hash else { continue }
-                items[index].record = record
-                items[index].bytes = bytes
-                items[index].hash = hash
-                items[index].notBefore = now
+            let priorityLane = HealthIngestType.isPriorityLane(record.type)
+            let lane = priorityLane ? priority : regular
+            if lane.windowKeys.contains(key), let index = lane.items.firstIndex(where: { Self.key($0.record) == key }) {
+                guard lane.items[index].hash != hash else { continue }
+                lane.items[index].record = record
+                lane.items[index].bytes = bytes
+                lane.items[index].hash = hash
+                lane.items[index].notBefore = now
                 queued += 1
-                changed = true
+                if priorityLane { priorityDirty = true } else { regularDirty = true }
                 continue
             }
             if let receipt = receiptByKey[key], receipt.hash == hash {
@@ -427,24 +593,34 @@ actor HealthIngestQueue {
                 failures: 0,
                 notBefore: now
             )
-            if items.count < Self.windowCap {
-                items.append(row)
-                windowKeys.insert(key)
-                changed = true
+            if lane.items.count < Self.windowCap {
+                lane.items.append(row)
+                lane.windowKeys.insert(key)
+                if priorityLane { priorityDirty = true } else { regularDirty = true }
             } else {
                 // A repeat of a spilled row is harmless: the server upserts by (type, id).
-                overflow.append(row)
+                if priorityLane {
+                    priorityOverflow.append(row)
+                } else {
+                    regularOverflow.append(row)
+                }
             }
             queued += 1
         }
         if firstSeenChanged {
             disk.saveFirstSeen(firstSeen)
         }
-        if changed {
-            disk.saveQueue(items)
+        if priorityDirty {
+            disk.saveQueue(priority.items, named: priority.files.queueName)
         }
-        if !overflow.isEmpty {
-            writeSpill(overflow)
+        if regularDirty {
+            disk.saveQueue(regular.items, named: regular.files.queueName)
+        }
+        if !priorityOverflow.isEmpty {
+            writeSpill(priorityOverflow, lane: priority)
+        }
+        if !regularOverflow.isEmpty {
+            writeSpill(regularOverflow, lane: regular)
         }
         return HealthIngestEnqueueResult(queued: queued, oversized: oversized)
     }
@@ -454,56 +630,113 @@ actor HealthIngestQueue {
         payloadBytes + record.type.utf8.count + record.id.utf8.count + record.tz.utf8.count + 96
     }
 
-    private func writeSpill(_ rows: [HealthIngestQueuedRecord]) {
+    private func writeSpill(_ rows: [HealthIngestQueuedRecord], lane: Lane) {
+        Self.writeSpill(rows, lane: lane, disk: disk)
+    }
+
+    private static func writeSpill(_ rows: [HealthIngestQueuedRecord], lane: Lane, disk: HealthIngestDisk) {
         var start = 0
         while start < rows.count {
-            let end = min(start + Self.segmentSize, rows.count)
+            let end = min(start + segmentSize, rows.count)
             let chunk = Array(rows[start ..< end])
-            disk.saveSpillSegment(spill.nextID, chunk)
-            spill.segments.append(HealthIngestSpillSegment(id: spill.nextID, count: chunk.count))
-            spill.nextID += 1
+            disk.saveSpillSegment(prefix: lane.files.segmentPrefix, id: lane.spill.nextID, chunk)
+            lane.spill.segments.append(HealthIngestSpillSegment(id: lane.spill.nextID, count: chunk.count))
+            lane.spill.nextID += 1
             start = end
         }
-        disk.saveSpillManifest(spill)
+        disk.saveSpillManifest(lane.spill, named: lane.files.manifestName)
     }
 
     /// Loads the oldest spill segments once the window has drained below half.
-    private func refillWindow() {
-        while items.count < Self.windowCap / 2, let first = spill.segments.first {
-            let rows = disk.loadSpillSegment(first.id)
+    private func refillWindow(_ lane: Lane) {
+        Self.refillWindow(lane, disk: disk)
+    }
+
+    /// Window first, then the manifest, then the file: a crash leaves a duplicate, not a loss.
+    private static func refillWindow(_ lane: Lane, disk: HealthIngestDisk) {
+        while lane.items.count < windowCap / 2, let first = lane.spill.segments.first {
+            let rows = disk.loadSpillSegment(prefix: lane.files.segmentPrefix, id: first.id)
             for row in rows {
-                items.append(row)
-                windowKeys.insert(Self.key(row.record))
+                lane.items.append(row)
+                lane.windowKeys.insert(key(row.record))
             }
-            spill.segments.removeFirst()
-            // Window first, then the manifest, then the file: a crash leaves a duplicate, not a loss.
-            disk.saveQueue(items)
-            disk.saveSpillManifest(spill)
-            disk.deleteSpillSegment(first.id)
+            lane.spill.segments.removeFirst()
+            disk.saveQueue(lane.items, named: lane.files.queueName)
+            disk.saveSpillManifest(lane.spill, named: lane.files.manifestName)
+            disk.deleteSpillSegment(prefix: lane.files.segmentPrefix, id: first.id)
         }
     }
 
+    private static func appendPending(_ rows: [HealthIngestQueuedRecord], to lane: Lane, disk: HealthIngestDisk) {
+        guard !rows.isEmpty else { return }
+        var overflow: [HealthIngestQueuedRecord] = []
+        var changed = false
+        for row in rows {
+            let rowKey = key(row.record)
+            if lane.windowKeys.contains(rowKey) { continue }
+            if lane.items.count < windowCap {
+                lane.items.append(row)
+                lane.windowKeys.insert(rowKey)
+                changed = true
+            } else {
+                overflow.append(row)
+            }
+        }
+        if changed {
+            disk.saveQueue(lane.items, named: lane.files.queueName)
+        }
+        if !overflow.isEmpty {
+            writeSpill(overflow, lane: lane, disk: disk)
+        }
+    }
+
+    private static func keys(in lane: Lane, disk: HealthIngestDisk) -> Set<String> {
+        var found = lane.windowKeys
+        for segment in lane.spill.segments {
+            for row in disk.loadSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id) {
+                found.insert(key(row.record))
+            }
+        }
+        return found
+    }
+
+    /// Priority lane first, then the HealthKit lane. One batch can hold both when the
+    /// priority rows do not fill it. Ids are unchanged.
     func nextBatch(limit: Int, maxBytes: Int) -> [HealthIngestRecord] {
         let now = Date()
         var batch: [HealthIngestRecord] = []
         var bytes = 0
-        for item in items where item.notBefore <= now {
-            if !batch.isEmpty, bytes + item.bytes > maxBytes || batch.count >= limit {
-                break
-            }
-            batch.append(item.record)
-            bytes += item.bytes
-            if batch.count >= limit || bytes >= maxBytes {
-                break
+        var seen = Set<String>()
+        func take(_ lane: Lane) {
+            for item in lane.items where item.notBefore <= now {
+                let rowKey = Self.key(item.record)
+                if seen.contains(rowKey) { continue }
+                if !batch.isEmpty, bytes + item.bytes > maxBytes || batch.count >= limit {
+                    break
+                }
+                batch.append(item.record)
+                seen.insert(rowKey)
+                bytes += item.bytes
+                if batch.count >= limit || bytes >= maxBytes {
+                    break
+                }
             }
         }
+        take(priority)
+        take(regular)
         return batch
     }
 
-    func depth() -> Int { items.count + spill.count }
+    func depth() -> Int { priority.count + regular.count }
 
-    /// Rows held in memory. Never above `windowCap` after init or an enqueue.
-    func windowCount() -> Int { items.count }
+    /// Trio rows waiting, including their spill segments.
+    func priorityDepth() -> Int { priority.count }
+
+    /// HealthKit rows waiting, including their spill segments.
+    func regularDepth() -> Int { regular.count }
+
+    /// HealthKit rows held in memory. Never above `windowCap` after init or an enqueue.
+    func windowCount() -> Int { regular.items.count }
 
     /// Sum of the per-reason counts. Matches the detail screen, including reasons
     /// whose samples have already rolled off the 200-event buffer.
@@ -550,25 +783,27 @@ actor HealthIngestQueue {
     }
 
     func dropTypes(_ types: Set<String>) {
-        items.removeAll { types.contains($0.record.type) }
-        windowKeys = Set(items.map { Self.key($0.record) })
-        disk.saveQueue(items)
-        var kept: [HealthIngestSpillSegment] = []
-        for segment in spill.segments {
-            let rows = disk.loadSpillSegment(segment.id)
-            let remaining = rows.filter { !types.contains($0.record.type) }
-            if remaining.isEmpty {
-                disk.deleteSpillSegment(segment.id)
-            } else {
-                if remaining.count != rows.count {
-                    disk.saveSpillSegment(segment.id, remaining)
+        for lane in [priority, regular] {
+            lane.items.removeAll { types.contains($0.record.type) }
+            lane.windowKeys = Set(lane.items.map { Self.key($0.record) })
+            disk.saveQueue(lane.items, named: lane.files.queueName)
+            var kept: [HealthIngestSpillSegment] = []
+            for segment in lane.spill.segments {
+                let rows = disk.loadSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id)
+                let remaining = rows.filter { !types.contains($0.record.type) }
+                if remaining.isEmpty {
+                    disk.deleteSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id)
+                } else {
+                    if remaining.count != rows.count {
+                        disk.saveSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id, remaining)
+                    }
+                    kept.append(HealthIngestSpillSegment(id: segment.id, count: remaining.count))
                 }
-                kept.append(HealthIngestSpillSegment(id: segment.id, count: remaining.count))
             }
+            lane.spill.segments = kept
+            disk.saveSpillManifest(lane.spill, named: lane.files.manifestName)
+            refillWindow(lane)
         }
-        spill.segments = kept
-        disk.saveSpillManifest(spill)
-        refillWindow()
     }
 
     /// Remember ids the server accepted so a later disappearance can become a deletion.
@@ -598,7 +833,7 @@ actor HealthIngestQueue {
 
     func hasReady() -> Bool {
         let now = Date()
-        return items.contains { $0.notBefore <= now }
+        return priority.items.contains { $0.notBefore <= now } || regular.items.contains { $0.notBefore <= now }
     }
 
     /// Accepted and duplicate are done. A rejection is retried a few times, then dropped
@@ -614,7 +849,7 @@ actor HealthIngestQueue {
         if transportFailed {
             let delay = HealthIngestBackoff.delay(afterFailures: bumpFailures(keys))
             postpone(keys, until: now.addingTimeInterval(delay))
-            disk.saveQueue(items)
+            saveLanes()
             return nil
         }
 
@@ -627,8 +862,7 @@ actor HealthIngestQueue {
         var postponeKeys: [String] = []
         for record in batch {
             let key = Self.key(record)
-            guard windowKeys.contains(key),
-                  let index = items.firstIndex(where: { Self.key($0.record) == key }) else { continue }
+            guard let located = locate(key) else { continue }
             guard let ack = byKey[key] else {
                 postponeKeys.append(key)
                 continue
@@ -638,17 +872,17 @@ actor HealthIngestQueue {
                  .duplicate:
                 remove.insert(key)
                 accepted.append(record)
-                remember(key: key, hash: items[index].hash, state: .accepted, at: now)
+                remember(key: key, hash: located.lane.items[located.index].hash, state: .accepted, at: now)
             case .rejected:
                 let reason = ack.reason ?? "rejected"
                 let message = ack.message?.trimmingCharacters(in: .whitespacesAndNewlines)
                 let detail = (message?.isEmpty == false) ? message! : reason
                 lastReject = "\(ack.type) \(ack.id): \(detail)"
-                items[index].failures += 1
+                located.lane.items[located.index].failures += 1
                 recordRejection(type: ack.type, reason: reason, message: detail, at: now)
-                if items[index].failures >= 3 {
+                if located.lane.items[located.index].failures >= 3 {
                     remove.insert(key)
-                    remember(key: key, hash: items[index].hash, state: .rejected, at: now)
+                    remember(key: key, hash: located.lane.items[located.index].hash, state: .rejected, at: now)
                 } else {
                     postponeKeys.append(key)
                 }
@@ -658,16 +892,36 @@ actor HealthIngestQueue {
             postpone(postponeKeys, until: now.addingTimeInterval(HealthIngestBackoff.delay(afterFailures: 1)))
         }
         if !remove.isEmpty {
-            items.removeAll { remove.contains(Self.key($0.record)) }
-            windowKeys.subtract(remove)
+            for lane in [priority, regular] {
+                lane.items.removeAll { remove.contains(Self.key($0.record)) }
+                lane.windowKeys.subtract(remove)
+            }
         }
         if !accepted.isEmpty {
             noteUploaded(accepted)
         }
-        disk.saveQueue(items)
+        saveLanes()
         disk.saveReceipts(receipts)
-        refillWindow()
+        refillWindow(priority)
+        refillWindow(regular)
         return lastReject
+    }
+
+    private func saveLanes() {
+        disk.saveQueue(priority.items, named: priority.files.queueName)
+        disk.saveQueue(regular.items, named: regular.files.queueName)
+    }
+
+    private func locate(_ key: String) -> (lane: Lane, index: Int)? {
+        if priority.windowKeys.contains(key),
+           let index = priority.items.firstIndex(where: { Self.key($0.record) == key }) {
+            return (priority, index)
+        }
+        if regular.windowKeys.contains(key),
+           let index = regular.items.firstIndex(where: { Self.key($0.record) == key }) {
+            return (regular, index)
+        }
+        return nil
     }
 
     private static func key(_ record: HealthIngestRecord) -> String {
@@ -685,17 +939,21 @@ actor HealthIngestQueue {
     private func bumpFailures(_ keys: [String]) -> Int {
         let keySet = Set(keys)
         var maxFailures = 1
-        for index in items.indices where keySet.contains(Self.key(items[index].record)) {
-            items[index].failures += 1
-            maxFailures = max(maxFailures, items[index].failures)
+        for lane in [priority, regular] {
+            for index in lane.items.indices where keySet.contains(Self.key(lane.items[index].record)) {
+                lane.items[index].failures += 1
+                maxFailures = max(maxFailures, lane.items[index].failures)
+            }
         }
         return maxFailures
     }
 
     private func postpone(_ keys: [String], until date: Date) {
         let keySet = Set(keys)
-        for index in items.indices where keySet.contains(Self.key(items[index].record)) {
-            items[index].notBefore = date
+        for lane in [priority, regular] {
+            for index in lane.items.indices where keySet.contains(Self.key(lane.items[index].record)) {
+                lane.items[index].notBefore = date
+            }
         }
     }
 

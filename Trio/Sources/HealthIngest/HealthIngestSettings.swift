@@ -196,6 +196,8 @@ struct HealthIngestStatus: Equatable {
     var lastSuccess: Date?
     var lastError: String?
     var queueDepth: Int = 0
+    /// Trio rows included in `queueDepth`. These leave the queue before HealthKit backfill.
+    var priorityDepth: Int = 0
     var rejectedCount: Int = 0
     var hasToken = false
     var backfillRunning = false

@@ -126,8 +126,12 @@ enum HealthIngestLoopCapture {
 
     private static func extraDetermination(_ determination: Determination) -> [String: HealthIngestJSON] {
         var fields: [String: HealthIngestJSON] = [:]
-        if let value = determination.minPredBG { fields["minPredBG"] = .number(Double(value)) }
-        if let value = determination.minGuardBG { fields["minGuardBG"] = .number(Double(value)) }
+        if let value = determination.minPredBG, let number = HealthIngestPayload.predictedBG(Double(value)) {
+            fields["minPredBG"] = number
+        }
+        if let value = determination.minGuardBG, let number = HealthIngestPayload.predictedBG(Double(value)) {
+            fields["minGuardBG"] = number
+        }
         if let value = determination.tdd { fields["tdd"] = .number(NSDecimalNumber(decimal: value).doubleValue) }
         if let stamp = determination.timestamp {
             fields["timestamp"] = .string(HealthIngestTime.string(from: stamp))

@@ -37,12 +37,22 @@ enum HealthIngestWire {
         return components.url
     }
 
+    /// Bump when on-device payloads change so rejected receipts and HealthKit
+    /// backfill cursors can be cleared and the records sent again.
+    static let mappingVersion = 2
+
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
-        try makeEncoder().encode(envelope)
+        // CanonicalJSON matches the server's stableJson, so content-addressed
+        // ids and the bytes on the wire cannot drift apart.
+        Data(HealthIngestCanonicalJSON.string(envelope.asJSON()).utf8)
     }
 
     static func encode(_ value: some Encodable) throws -> Data {
         try makeEncoder().encode(value)
+    }
+
+    static func encodePayload(_ payload: HealthIngestJSON) -> Data {
+        Data(HealthIngestCanonicalJSON.string(payload).utf8)
     }
 
     /// Gzip when it actually shrinks the body. Callers send the original bytes when this returns nil.
@@ -65,11 +75,11 @@ enum HealthIngestWire {
     }
 
     static func payloadHash(_ payload: HealthIngestJSON) -> String {
-        contentID(for: payload)
+        HealthIngestCanonicalJSON.digest(payload)
     }
 
     static func payloadByteCount(_ payload: HealthIngestJSON) -> Int {
-        (try? encode(payload).count) ?? 0
+        encodePayload(payload).count
     }
 
     static func makeEncoder() -> JSONEncoder {
@@ -106,8 +116,7 @@ enum HealthIngestWire {
     }
 
     static func contentID(for payload: HealthIngestJSON) -> String {
-        let data = (try? makeEncoder().encode(payload)) ?? Data()
-        return HealthIngestIdentity.hex(SHA256.hash(data: data), bytes: 16)
+        HealthIngestCanonicalJSON.digest(payload)
     }
 }
 
@@ -142,6 +151,10 @@ enum HealthIngestType {
     static let tzChange = "tz_change"
 
     static let contentAddressed: Set<String> = [profileSnapshot, settingsSnapshot, effectiveProfile]
+
+    static let healthKitTypes: Set<String> = [
+        workout, heartRate, restingHR, hrv, sleepStage, activeEnergy, exerciseMinutes
+    ]
 
     static let all: Set<String> = [
         activeEnergy,
@@ -270,6 +283,23 @@ enum HealthIngestPayload {
         guard multiplier > 0, multiplier <= 10 else { return nil }
         return .number(multiplier)
     }
+
+    /// Optional predicted-BG fields. Omit non-finite or, until the server allows
+    /// oref negatives, values below 0, so one field does not fail the whole cycle.
+    static func predictedBG(_ value: Double) -> HealthIngestJSON? {
+        guard value.isFinite, value >= 0, value <= 2000 else { return nil }
+        return .number(value)
+    }
+
+    static func predictedBG(_ value: Decimal?) -> HealthIngestJSON? {
+        guard let value else { return nil }
+        return predictedBG(NSDecimalNumber(decimal: value).doubleValue)
+    }
+
+    static func predictedBG(_ value: NSDecimalNumber?) -> HealthIngestJSON? {
+        guard let value else { return nil }
+        return predictedBG(value.doubleValue)
+    }
 }
 
 struct HealthIngestDevice: Codable, Equatable {
@@ -282,6 +312,18 @@ struct HealthIngestEnvelope: Encodable, Equatable {
     var schemaVersion: Int
     var device: HealthIngestDevice
     var records: [HealthIngestRecord]
+
+    func asJSON() -> HealthIngestJSON {
+        .object([
+            "schemaVersion": .number(Double(schemaVersion)),
+            "device": .object([
+                "id": .string(device.id),
+                "app": .string(device.app),
+                "appVersion": .string(device.appVersion)
+            ]),
+            "records": .array(records.map { $0.asJSON() })
+        ])
+    }
 }
 
 struct HealthIngestRecord: Codable, Equatable {
@@ -291,6 +333,17 @@ struct HealthIngestRecord: Codable, Equatable {
     var end: Date?
     var tz: String
     var payload: HealthIngestJSON
+
+    func asJSON() -> HealthIngestJSON {
+        .object([
+            "type": .string(type),
+            "id": .string(id),
+            "start": .string(HealthIngestTime.string(from: start)),
+            "end": end.map { .string(HealthIngestTime.string(from: $0)) },
+            "tz": .string(tz),
+            "payload": payload
+        ])
+    }
 
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
@@ -407,21 +460,52 @@ enum HealthIngestJSON: Codable, Equatable {
     }
 
     func encode(to encoder: Encoder) throws {
-        var container = encoder.singleValueContainer()
         switch self {
         case let .string(value):
+            var container = encoder.singleValueContainer()
             try container.encode(value)
         case let .number(value):
+            var container = encoder.singleValueContainer()
             try container.encode(value)
         case let .bool(value):
+            var container = encoder.singleValueContainer()
             try container.encode(value)
         case let .object(value):
-            try container.encode(value)
+            // Encode through a keyed container. Encoding `[String: HealthIngestJSON]`
+            // as a single-value Dictionary can drop keys on some JSONEncoder paths.
+            var container = encoder.container(keyedBy: JSONKey.self)
+            for (key, nested) in value {
+                try container.encode(nested, forKey: JSONKey(key))
+            }
         case let .array(value):
-            try container.encode(value)
+            var container = encoder.unkeyedContainer()
+            for item in value {
+                try container.encode(item)
+            }
         case .null:
+            var container = encoder.singleValueContainer()
             try container.encodeNil()
         }
+    }
+}
+
+private struct JSONKey: CodingKey {
+    var stringValue: String
+    var intValue: Int?
+
+    init(_ string: String) {
+        stringValue = string
+        intValue = nil
+    }
+
+    init?(stringValue: String) {
+        self.stringValue = stringValue
+        intValue = nil
+    }
+
+    init?(intValue: Int) {
+        self.stringValue = String(intValue)
+        self.intValue = intValue
     }
 }
 

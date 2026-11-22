@@ -102,11 +102,13 @@ struct HealthIngestSettingsView: View {
                 }
                 Button("Backfill") { uploader.backfill(days: backfillDays) }
                     .disabled(!uploader.preferences.enabled)
+                Button("Reset backfill") { uploader.resetBackfill(days: backfillDays) }
+                    .disabled(!uploader.preferences.enabled)
             } header: {
                 Text("Backfill")
             } footer: {
                 Text(
-                    "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. Overrides and prediction curves are kept for less time, so leave upload on to catch them. The first Health sync is the last day; Backfill reads older Health samples."
+                    "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. Overrides and prediction curves are kept for less time, so leave upload on to catch them. The first Health sync is the last day; Backfill reads older Health samples. Reset backfill clears Health cursors and rejected receipts, then reads that window again. Use it after an app update that fixes rejected Health records."
                 )
             }
             .listRowBackground(Color.chart)

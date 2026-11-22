@@ -142,6 +142,14 @@ final class HealthIngestDisk {
         save(identifier, name: "timezone.json")
     }
 
+    func loadMappingVersion() -> Int {
+        load(Int.self, name: "mapping-version.json") ?? 0
+    }
+
+    func saveMappingVersion(_ version: Int) {
+        save(version, name: "mapping-version.json")
+    }
+
     private func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
         lock.lock()
         defer { lock.unlock() }
@@ -164,7 +172,11 @@ actor HealthIngestQueue {
     private var items: [HealthIngestQueuedRecord]
     private var receipts: [HealthIngestReceipt]
     private var firstSeen: [String: Date]
-    private let receiptCap = 30_000
+    /// Accepted receipts stay so deletions can be detected. Rejected receipts
+    /// only need to prevent an immediate resend; a large rejected set made
+    /// `receipts.json` expensive to decode at launch.
+    private let receiptCap = 4_000
+    private let rejectedReceiptCap = 2_000
     private let snapshotInterval: TimeInterval = 24 * 3600
 
     init(disk: HealthIngestDisk) {
@@ -253,6 +265,19 @@ actor HealthIngestQueue {
     func depth() -> Int { items.count }
 
     func rejectedCount() -> Int { disk.loadRejectedCount() }
+
+    /// Forgets rejected receipts so a later backfill can enqueue the same ids again
+    /// after a payload or server-contract fix.
+    func forgetRejectedReceipts() {
+        let remaining = receipts.filter { $0.state != .rejected }
+        receipts = remaining
+        disk.saveReceipts(receipts)
+    }
+
+    func dropTypes(_ types: Set<String>) {
+        items.removeAll { types.contains($0.record.type) }
+        disk.saveQueue(items)
+    }
 
     /// Remember ids the server accepted so a later disappearance can become a deletion.
     func noteUploaded(_ records: [HealthIngestRecord]) {
@@ -380,8 +405,26 @@ actor HealthIngestQueue {
     private func remember(key: String, hash: String, state: HealthIngestReceipt.State, at: Date) {
         receipts.removeAll { $0.key == key }
         receipts.append(HealthIngestReceipt(key: key, hash: hash, state: state, at: at))
+        pruneReceipts()
+    }
+
+    private func pruneReceipts() {
+        let rejectedIndexes = receipts.indices.filter { receipts[$0].state == .rejected }
+        if rejectedIndexes.count > rejectedReceiptCap {
+            let evict = Set(rejectedIndexes.prefix(rejectedIndexes.count - rejectedReceiptCap))
+            receipts = receipts.enumerated().compactMap { evict.contains($0.offset) ? nil : $0.element }
+        }
         if receipts.count > receiptCap {
-            receipts.removeFirst(receipts.count - receiptCap)
+            // Drop oldest rejected rows first so accepted ids used for deletions remain.
+            var overflow = receipts.count - receiptCap
+            receipts.removeAll { item in
+                guard overflow > 0, item.state == .rejected else { return false }
+                overflow -= 1
+                return true
+            }
+            if receipts.count > receiptCap {
+                receipts.removeFirst(receipts.count - receiptCap)
+            }
         }
     }
 }

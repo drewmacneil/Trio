@@ -24,11 +24,16 @@ enum HealthIngestCanonicalJSON {
         }
     }
 
+    /// First 32 lowercase hex characters of SHA-256 over the canonical payload JSON.
+    /// Matches the server's `contentHash` / `stableJson`.
+    static func digest(_ payload: HealthIngestJSON) -> String {
+        let hashed = SHA256.hash(data: Data(string(payload).utf8))
+        return HealthIngestIdentity.hex(hashed, bytes: 16)
+    }
+
     /// `<prefix>:` plus the first 32 lowercase hex characters of SHA-256 over the payload only.
     static func contentID(prefix: String, payload: HealthIngestJSON) -> String {
-        let digest = SHA256.hash(data: Data(string(payload).utf8))
-        let hex = digest.prefix(16).map { String(format: "%02x", $0) }.joined()
-        return "\(prefix):\(hex)"
+        "\(prefix):\(digest(payload))"
     }
 
     static func clock(seconds: Int) -> String {

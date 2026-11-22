@@ -371,7 +371,145 @@ import Testing
         #expect(await queue.enqueue([record]).queued == 0)
     }
 
-        private func makeDisk() throws -> HealthIngestDisk {
+    @Test func healthKitWireJSONMatchesTheServerContract() throws {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let cases: [(String, HealthIngestJSON, Set<String>, Set<String>)] = [
+            (
+                HealthIngestType.hrv,
+                try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 45)),
+                ["sdnnMs", "source"],
+                ["sdnnMilliseconds", "milliseconds"]
+            ),
+            (
+                HealthIngestType.activeEnergy,
+                try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.activeEnergy, value: 1.5)),
+                ["kcal", "source"],
+                ["kilocalories", "activeEnergy", "calories"]
+            ),
+            (
+                HealthIngestType.exerciseMinutes,
+                try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.exerciseMinutes, value: 12)),
+                ["minutes", "source"],
+                ["durationMinutes", "exerciseMinutes"]
+            ),
+            (
+                HealthIngestType.heartRate,
+                try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 72)),
+                ["bpm", "source"],
+                ["beatsPerMinute", "heartRate"]
+            ),
+            (
+                HealthIngestType.workout,
+                try #require(HealthIngestHealthMapping.workoutPayload(
+                    activity: "running",
+                    durationSeconds: 1800,
+                    energyKcal: 120,
+                    distanceMeters: 4000,
+                    avgHeartRate: 140
+                )),
+                ["activity", "durationSeconds", "energyKcal", "distanceMeters", "avgHeartRate", "source"],
+                ["activityType", "energyKilocalories", "averageHeartRateBpm", "kilocalories"]
+            ),
+            (
+                HealthIngestType.sleepStage,
+                HealthIngestHealthMapping.sleepPayload(hkValue: HKCategoryValueSleepAnalysis.asleepCore.rawValue),
+                ["stage", "source"],
+                ["sleepStage", "value"]
+            )
+        ]
+        for (type, payload, required, forbidden) in cases {
+            let record = HealthIngestRecord(
+                type: type,
+                id: "\(type)-wire-1",
+                start: start,
+                end: type == HealthIngestType.sleepStage || type == HealthIngestType.activeEnergy || type == HealthIngestType.workout
+                    ? start.addingTimeInterval(60)
+                    : nil,
+                tz: "Etc/UTC",
+                payload: payload
+            )
+            let wire = try wirePayload(record)
+            for key in required {
+                #expect(wire[key] != nil, "\(type) wire JSON missing \(key)")
+            }
+            for key in forbidden {
+                #expect(wire[key] == nil, "\(type) wire JSON should not contain \(key)")
+            }
+        }
+    }
+
+    @Test func settingsSnapshotIdMatchesTheServerCanonicalHash() {
+        // Server id is settings:<first 32 lowercase hex chars of SHA-256(stableJson(payload))>.
+        // Keys must be sorted, no insignificant whitespace, payload only (not the envelope).
+        let payload = HealthIngestJSON.object([
+            "values": .object([
+                "pumpSettings": .object([
+                    "maxBolus": .number(10),
+                    "diaHours": .number(6)
+                ])
+            ])
+        ])
+        #expect(HealthIngestCanonicalJSON.string(payload) == "{\"values\":{\"pumpSettings\":{\"diaHours\":6,\"maxBolus\":10}}}")
+        let digest = HealthIngestCanonicalJSON.digest(payload)
+        #expect(digest == "6f7a0ae872e2f1777fa07c58e8410e0e")
+        let id = HealthIngestCanonicalJSON.contentID(prefix: HealthIngestWire.settingsIDPrefix, payload: payload)
+        #expect(id == "settings:\(digest)")
+        #expect(id == HealthIngestCanonicalJSON.contentID(prefix: "settings", payload: payload))
+    }
+
+    @Test func predictedBGOmitsNegativeAndOutOfRangeValues() {
+        #expect(HealthIngestPayload.predictedBG(-12) == nil)
+        #expect(HealthIngestPayload.predictedBG(0) == .number(0))
+        #expect(HealthIngestPayload.predictedBG(110) == .number(110))
+        #expect(HealthIngestPayload.predictedBG(2001) == nil)
+        #expect(HealthIngestPayload.predictedBG(Double.nan) == nil)
+        #expect(HealthIngestPayload.predictedBG(NSDecimalNumber(value: -3)) == nil)
+        #expect(HealthIngestPayload.predictedBG(Optional<Decimal>.none) == nil)
+    }
+
+    @Test func rejectedReceiptsCanBeForgottenForALaterBackfill() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let record = makeRecord(id: "hrv-reset-1", type: HealthIngestType.hrv)
+        #expect(await queue.enqueue([record]).queued == 1)
+        let ack = HealthIngestAck(
+            type: record.type,
+            id: record.id,
+            status: .rejected,
+            reason: "payload.sdnnMs is required"
+        )
+        for _ in 1 ... 3 {
+            _ = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
+        }
+        #expect(await queue.depth() == 0)
+        #expect(await queue.enqueue([record]).queued == 0)
+        await queue.forgetRejectedReceipts()
+        #expect(await queue.enqueue([record]).queued == 1)
+    }
+
+    @Test func rejectedReceiptsAreCappedSoTheQueueFileCannotGrowWithoutBound() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        for index in 1 ... 2_050 {
+            let record = makeRecord(id: "hrv-cap-\(index)", type: HealthIngestType.hrv)
+            #expect(await queue.enqueue([record]).queued == 1)
+            let ack = HealthIngestAck(
+                type: record.type,
+                id: record.id,
+                status: .rejected,
+                reason: "payload.sdnnMs is required"
+            )
+            for _ in 1 ... 3 {
+                _ = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
+            }
+        }
+        // After the cap, the oldest rejected receipt is evicted and that id can be queued again.
+        let first = makeRecord(id: "hrv-cap-1", type: HealthIngestType.hrv)
+        #expect(await queue.enqueue([first]).queued == 1)
+    }
+
+
+    private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)
         return try HealthIngestDisk(directory: directory)
@@ -397,6 +535,19 @@ import Testing
             return Set(fields.keys)
         }
         return []
+    }
+
+    private func wirePayload(_ record: HealthIngestRecord) throws -> [String: Any] {
+        let data = try HealthIngestWire.encodeEnvelope(
+            HealthIngestEnvelope(
+                schemaVersion: HealthIngestWire.schemaVersion,
+                device: HealthIngestDevice(id: "trio-iphone", app: "trio", appVersion: "1.0 (1)"),
+                records: [record]
+            )
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let records = try #require(json["records"] as? [[String: Any]])
+        return try #require(records.first?["payload"] as? [String: Any])
     }
 }
 

@@ -589,7 +589,7 @@ struct HealthIngestDiabetesAdapter {
             "reason": row.reason.map { .string($0) } ?? .null,
             "iob": .decimal(row.iob),
             "cob": .number(Double(row.cob)),
-            "eventualBG": .decimal(row.eventualBG),
+            "eventualBG": HealthIngestPayload.predictedBG(row.eventualBG),
             "sensitivityRatio": .decimal(row.sensitivityRatio),
             "insulinReq": .decimal(row.insulinReq),
             "rate": .decimal(row.rate),

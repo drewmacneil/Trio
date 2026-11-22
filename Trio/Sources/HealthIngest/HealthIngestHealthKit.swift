@@ -89,6 +89,14 @@ final class HealthIngestHealthKitReader {
         persist()
     }
 
+    func resetBackfillCursors() {
+        loadIfNeeded()
+        lock.lock()
+        cursors.removeAll()
+        lock.unlock()
+        persist()
+    }
+
     func hasPendingBackfill(preferences: HealthIngestPreferences) -> Bool {
         lock.lock()
         defer { lock.unlock() }

@@ -45,7 +45,10 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         preferences = loaded
         status.hasToken = settingsStore.hasToken()
         if loaded.enabled {
-            start()
+            // Never decode the on-disk queue or start HealthKit on the
+            // main actor. loadServices() resolves this type on MainActor
+            // before first UI.
+            scheduleStart()
         }
     }
 
@@ -124,6 +127,38 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         publishSnapshot(depth: status.queueDepth)
     }
 
+    /// Clears HealthKit backfill cursors and rejected receipts, drops queued
+    /// HealthKit records from an older mapping, and starts a fresh backfill.
+    @MainActor func resetBackfill(days: Int) {
+        guard currentPreferences().enabled else { return }
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.performResetBackfill(days: days)
+        }
+    }
+
+    private func performResetBackfill(days: Int) async {
+        guard let queue = try? prepare(), let health, let disk else { return }
+        await queue.forgetRejectedReceipts()
+        await queue.dropTypes(HealthIngestType.healthKitTypes)
+        health.resetBackfillCursors()
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        let depth = await queue.depth()
+        await MainActor.run { [weak self] in
+            guard let self else { return }
+            self.publishSnapshot(depth: depth)
+            self.backfill(days: days)
+        }
+    }
+
+    private func applyMappingUpgradeIfNeeded() async {
+        guard let queue = try? prepare(), let health, let disk else { return }
+        guard disk.loadMappingVersion() < HealthIngestWire.mappingVersion else { return }
+        await queue.forgetRejectedReceipts()
+        await queue.dropTypes(HealthIngestType.healthKitTypes)
+        health.resetBackfillCursors()
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+    }
+
     private func commit(_ incoming: HealthIngestPreferences) {
         var prefs = incoming
         prefs.deviceID = prefs.normalizedDeviceID
@@ -133,7 +168,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         settingsStore.save(prefs)
         preferences = prefs
         if prefs.enabled {
-            start()
+            scheduleStart()
         } else {
             stop()
         }
@@ -144,6 +179,14 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return storedPreferences
+    }
+
+    /// Starts the upload loop on a utility thread. Must not be called on the
+    /// main actor: `prepare()` JSON-decodes the on-disk queue and receipts.
+    private func scheduleStart() {
+        Task.detached(priority: .utility) { [weak self] in
+            self?.start()
+        }
     }
 
     private func start() {
@@ -216,6 +259,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     }
 
     private func run() async {
+        await applyMappingUpgradeIfNeeded()
         while !Task.isCancelled {
             let prefs = currentPreferences()
             let configured = HealthIngestOrigin.parse(prefs.baseURL) != nil && settingsStore.hasToken()

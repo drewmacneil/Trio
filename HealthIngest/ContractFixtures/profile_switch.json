@@ -1,0 +1,11 @@
+{
+  "type": "profile_switch",
+  "id": "profile-switch:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "date": "2026-03-01T15:30:00Z",
+    "name": "weekday",
+    "trigger": "manual"
+  }
+}

@@ -1170,6 +1170,8 @@
 		FAB1E00000000000000000C4 /* ParityGoldenTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAB1E00000000000000000B4 /* ParityGoldenTests.swift */; };
 		FAB1E00000000000000000C5 /* ParityPerformanceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FAB1E00000000000000000B5 /* ParityPerformanceTests.swift */; };
 		FB9012AE66284A92A6531037 /* NightscoutUploadSerializerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C39FF1EC12CF4B1EBB13BE26 /* NightscoutUploadSerializerTests.swift */; };
+		HI1A00012E2100000000A012 /* HealthIngestTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = HI1A00012E2100000000A011 /* HealthIngestTests.swift */; };
+		LA1A00012E2100000000A012 /* LiveActivityChartTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = LA1A00012E2100000000A011 /* LiveActivityChartTests.swift */; };
 		FE41E4D629463EE20047FD55 /* NightscoutPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE41E4D529463EE20047FD55 /* NightscoutPreferences.swift */; };
 		FE66D16B291F74F8005D6F77 /* Bundle+Extensions.swift in Sources */ = {isa = PBXBuildFile; fileRef = FE66D16A291F74F8005D6F77 /* Bundle+Extensions.swift */; };
 		FEFFA7A22929FE49007B8193 /* UIDevice+Extensions.swift in Sources */ = {isa = PBXBuildFile; fileRef = FEFFA7A12929FE49007B8193 /* UIDevice+Extensions.swift */; };
@@ -2093,6 +2095,8 @@
 		C2BA6B962F758E7500348E6A /* WatchNotificationHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatchNotificationHandler.swift; sourceTree = "<group>"; };
 		C2BA6B982F758E7600348E6A /* NotificationIdentifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationIdentifiers.swift; sourceTree = "<group>"; };
 		C39FF1EC12CF4B1EBB13BE26 /* NightscoutUploadSerializerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NightscoutUploadSerializerTests.swift; sourceTree = "<group>"; };
+		HI1A00012E2100000000A011 /* HealthIngestTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HealthIngestTests.swift; sourceTree = "<group>"; };
+		LA1A00012E2100000000A011 /* LiveActivityChartTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LiveActivityChartTests.swift; sourceTree = "<group>"; };
 		C7DA23B64976670AC36D9E84 /* QuickPickTreatmentsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickPickTreatmentsTests.swift; sourceTree = "<group>"; };
 		C8D1A7CA8C10C4403D4BBFA7 /* TreatmentsDataFlow.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TreatmentsDataFlow.swift; sourceTree = "<group>"; };
 		CA01000000000000000010C1 /* AlertCatalogVendor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AlertCatalogVendor.swift; sourceTree = "<group>"; };
@@ -2448,6 +2452,7 @@
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		BDFF7A9E2D25FA970016C40C /* Preview Content */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = "Preview Content"; sourceTree = "<group>"; };
 		DDCEBF412CC1B42500DF4C36 /* Views */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = Views; sourceTree = "<group>"; };
+		HI1A00012E2100000000A001 /* HealthIngest */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = HealthIngest; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -2904,6 +2909,7 @@
 				E00EEBFC27368630002FF094 /* Assemblies */,
 				38E98A3225F5300800C0CED0 /* Config */,
 				388E5A5A25B6F05F0019842D /* Helpers */,
+				HI1A00012E2100000000A001 /* HealthIngest */,
 				38DF178A27733E0F00B3528F /* AnimatedBackground */,
 				198377CF266BFEDE004DE65E /* Localizations */,
 				38E98A1A25F52C9300C0CED0 /* Logger */,
@@ -3740,6 +3746,8 @@
 				A5D6B6D83F32CE8BBDDB4E5B /* Logging */,
 				70C3B7105DC451594DF96299 /* ReportProblemTests.swift */,
 				12ECFA954DA8F662969E3223 /* ReportClientTests.swift */,
+				HI1A00012E2100000000A011 /* HealthIngestTests.swift */,
+				LA1A00012E2100000000A011 /* LiveActivityChartTests.swift */,
 			);
 			path = TrioTests;
 			sourceTree = "<group>";
@@ -5464,6 +5472,9 @@
 				6B1A8D272B14D91700E76752 /* PBXTargetDependency */,
 				BDFF799E2D25AA890016C40C /* PBXTargetDependency */,
 			);
+			fileSystemSynchronizedGroups = (
+				HI1A00012E2100000000A001 /* HealthIngest */,
+			);
 			name = Trio;
 			packageProductDependencies = (
 				3811DE0F25C9D37700A708ED /* Swinject */,
@@ -6752,6 +6763,8 @@
 				3BBC22632DF5B94100169236 /* AutosensTests.swift in Sources */,
 				BD8FC0542D66186000B95AED /* TestError.swift in Sources */,
 				FB9012AE66284A92A6531037 /* NightscoutUploadSerializerTests.swift in Sources */,
+				HI1A00012E2100000000A012 /* HealthIngestTests.swift in Sources */,
+				LA1A00012E2100000000A012 /* LiveActivityChartTests.swift in Sources */,
 				782BE9AEFDD94938A6F3EFE9 /* NightscoutImportRoundTripTests.swift in Sources */,
 				DDDD0FFB2F4E22C000F9C645 /* GlucoseSmoothingTests.swift in Sources */,
 				CA0924000000000000000006 /* GRICalculatorTests.swift in Sources */,

@@ -1,0 +1,10 @@
+{
+  "type": "sleep_stage",
+  "id": "sleep:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "stage": "core"
+  },
+  "end": "2026-03-01T16:00:00Z"
+}

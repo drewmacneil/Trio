@@ -1,0 +1,12 @@
+{
+  "type": "deletion",
+  "id": "deletion:carbs:carbs:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "targetType": "carbs",
+    "targetId": "carbs:example-1",
+    "detectedAt": "2026-03-01T15:30:00Z",
+    "reason": "removed"
+  }
+}

@@ -75,6 +75,7 @@ extension Notification.Name {
         _ = resolver.resolve(WatchManager.self)!
         _ = resolver.resolve(ContactImageManager.self)!
         _ = resolver.resolve(HealthKitManager.self)!
+        _ = resolver.resolve(HealthIngestUploader.self)!
         _ = resolver.resolve(GarminManager.self)!
         _ = resolver.resolve(BluetoothStateManager.self)!
         _ = resolver.resolve(PluginManager.self)!
@@ -310,7 +311,22 @@ extension Notification.Name {
     var body: some Scene {
         WindowGroup {
             ZStack {
-                if self.showLoadingView {
+                if healthIngestScreenshot {
+                    #if DEBUG
+                        if HealthIngestScreenshot.mode == "sibling" {
+                            NavigationStack {
+                                NightscoutConfig.RootView(resolver: resolver, displayClose: false)
+                            }
+                            .environment(appState)
+                            .preferredColorScheme(.light)
+                        } else {
+                            HealthIngestScreenshotHost()
+                                .environment(appState)
+                        }
+                    #else
+                        EmptyView()
+                    #endif
+                } else if self.showLoadingView {
                     Main.LoadingView(showError: $showLoadingError, retry: retryCoreDataInitialization)
                         .onAppear {
                             if self.initState.complete {
@@ -405,7 +421,9 @@ extension Notification.Name {
                    let rootVC = windowScene.windows.first(where: { $0.isKeyWindow })?.rootViewController
                 {
                     rootVC.excludeKeyboardFromSafeAreaTree()
-                    AppVersionChecker.shared.checkAndNotifyVersionStatus(in: rootVC)
+                    if !Self.healthIngestCaptureLaunch {
+                        AppVersionChecker.shared.checkAndNotifyVersionStatus(in: rootVC)
+                    }
                 }
                 requestAlarmAuthorizationIfNeeded()
                 if initState.complete {
@@ -421,8 +439,19 @@ extension Notification.Name {
         guard initState.complete, !onboardingManager.shouldShowOnboarding else {
             return
         }
+        if Self.healthIngestCaptureLaunch { return }
 
         Task { await CriticalAlertAlarmScheduler.requestAuthorization() }
+    }
+
+    /// Debug launches that capture Health Ingest must not cover the screen with startup alerts.
+    private static var healthIngestCaptureLaunch: Bool {
+        #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            return args.contains("-HealthIngestScreenshot") || args.contains("-HealthIngestEmbedded")
+        #else
+            return false
+        #endif
     }
 
     func configureTabBarAppearance() {
@@ -433,6 +462,14 @@ extension Notification.Name {
 
         UITabBar.appearance().standardAppearance = appearance
         UITabBar.appearance().scrollEdgeAppearance = appearance
+    }
+
+    private var healthIngestScreenshot: Bool {
+        #if DEBUG
+            HealthIngestScreenshot.isActive
+        #else
+            false
+        #endif
     }
 
     private func colorScheme(for colorScheme: ColorSchemeOption) -> ColorScheme? {

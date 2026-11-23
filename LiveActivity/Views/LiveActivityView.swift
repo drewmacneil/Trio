@@ -242,7 +242,12 @@ struct LiveActivityExpandedBottomView: View {
         if context.state.isInitialState {
             Text("Live Activity Expired. Open Trio to Refresh").minimumScaleFactor(0.01)
         } else if context.state.useDetailedViewIOS {
+            // Lock-screen Detailed caps this chart at height 80; the island
+            // expanded region did not, which can produce an oversized jindo
+            // archive or a layout iOS then refuses to snapshot.
             LiveActivityChartView(context: context, additionalState: context.state.detailedViewState)
+                .frame(maxWidth: .infinity)
+                .frame(height: 80)
                 .addIsWatchOS()
         }
     }

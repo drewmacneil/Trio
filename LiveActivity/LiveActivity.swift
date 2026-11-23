@@ -90,9 +90,8 @@ private extension LiveActivityAttributes.ContentState {
 
     static var detailedViewState =
         LiveActivityAttributes.ContentAdditionalState(
-            chart: chartData.map {
-                LiveActivityAttributes.ChartItem(value: Decimal($0.glucose), date: $0.date)
-            },
+            chartStart: Date().addingTimeInterval(-600),
+            chartGlucose: chartData.map { $0.glucose as Int? },
             rotationDegrees: 0,
             cob: 20,
             iob: 1.5,

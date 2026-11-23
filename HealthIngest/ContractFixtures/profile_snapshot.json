@@ -1,0 +1,40 @@
+{
+  "type": "profile_snapshot",
+  "id": "profile:a60da8c090d7e1726952811f3b681790",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "activeProfileName": "weekday",
+    "profiles": [
+      {
+        "name": "weekday",
+        "diaHours": 6,
+        "basal": [
+          {
+            "start": "00:00",
+            "rate": 0.9
+          }
+        ],
+        "carbRatio": [
+          {
+            "start": "00:00",
+            "gramsPerUnit": 10
+          }
+        ],
+        "isf": [
+          {
+            "start": "00:00",
+            "mgdlPerUnit": 50
+          }
+        ],
+        "target": [
+          {
+            "start": "00:00",
+            "lowMgdl": 100,
+            "highMgdl": 120
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "type": "exercise_minutes",
+  "id": "exercise:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "minutes": 30
+  },
+  "end": "2026-03-01T16:00:00Z"
+}

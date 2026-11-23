@@ -88,12 +88,14 @@
 	<key>NSFaceIDUsageDescription</key>
 	<string>For authorized access to bolus</string>
 	<key>NSHealthShareUsageDescription</key>
-	<string>Health App is used to store blood glucose, carbs and insulin</string>
+	<string>Health App is used to store blood glucose, carbs and insulin, and to read workouts, heart rate, heart rate variability, resting heart rate, sleep, active energy, and exercise time for your private data export.</string>
 	<key>NSHealthUpdateUsageDescription</key>
 	<string>Health App is used to store blood glucose, carbs and insulin</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>$(COPYRIGHT_NOTICE)</string>
 	<key>NSSupportsLiveActivities</key>
+	<true/>
+	<key>NSSupportsLiveActivitiesFrequentUpdates</key>
 	<true/>
 	<key>TeamID</key>
 	<string>$(DEVELOPMENT_TEAM)</string>

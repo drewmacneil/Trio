@@ -25,6 +25,30 @@ extension LiveActivityAttributes.SimpleViewStyle {
     }
 }
 
+extension LiveActivityAttributes {
+    /// Places readings into fixed 5-minute slots ending at the newest reading's slot.
+    /// A slot with no reading stays nil, so a gap does not move the dots after it.
+    /// Two readings in one slot keep the later one. Readings outside the 72-slot window are dropped.
+    static func chartSlots(from readings: [GlucoseData]) -> (start: Date, glucose: [Int?]) {
+        guard let newest = readings.map(\.date).max() else {
+            return (Date(timeIntervalSince1970: 0), [])
+        }
+        let newestBin = floor(newest.timeIntervalSince1970 / chartStride) * chartStride
+        let start = Date(timeIntervalSince1970: newestBin - TimeInterval(chartSlotCount - 1) * chartStride)
+        var slots = [Int?](repeating: nil, count: chartSlotCount)
+        var slotDates = [Date?](repeating: nil, count: chartSlotCount)
+        for reading in readings {
+            let bin = floor(reading.date.timeIntervalSince1970 / chartStride) * chartStride
+            let index = Int(((bin - start.timeIntervalSince1970) / chartStride).rounded())
+            guard slots.indices.contains(index) else { continue }
+            if let existing = slotDates[index], existing >= reading.date { continue }
+            slots[index] = reading.glucose
+            slotDates[index] = reading.date
+        }
+        return (start, slots)
+    }
+}
+
 extension LiveActivityAttributes.ContentState {
     static func calculateChange(chart: [GlucoseData], units: GlucoseUnits) -> String {
         guard chart.count >= 2 else { return "" }
@@ -76,8 +100,18 @@ extension LiveActivityAttributes.ContentState {
         let trendString = bg.direction?.symbol as? String
         let change = Self.calculateChange(chart: chart, units: units)
 
+        // Only ship chart/forecast data when a Detailed surface will actually
+        // draw it. History is 72 fixed 5-minute slots (6h), not one date per point,
+        // so the full window stays under ActivityKit's content-state limit.
+        let needsChart = settings.lockScreenView == .detailed || settings.smartStackView == .detailed
+        let slots = needsChart
+            ? LiveActivityAttributes.chartSlots(from: chart)
+            : (start: Date(timeIntervalSince1970: 0), glucose: [Int?]())
+        let includeForecasts = needsChart && settings.displayGlucoseForecasts
+
         let detailedState = LiveActivityAttributes.ContentAdditionalState(
-            chart: chart.map { LiveActivityAttributes.ChartItem(value: Decimal($0.glucose), date: $0.date) },
+            chartStart: slots.start,
+            chartGlucose: slots.glucose,
             rotationDegrees: rotationDegrees,
             cob: Decimal(determination?.cob ?? 0),
             iob: iob ?? 0 as Decimal,
@@ -93,11 +127,11 @@ extension LiveActivityAttributes.ContentState {
             tempTargetDuration: tempTarget?.duration ?? 0,
             tempTargetTarget: tempTarget?.target ?? 0,
             widgetItems: widgetItems ?? [], // set empty array here to silence compiler; this can never be nil
-            minForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+            minForecast: includeForecasts && settings.forecastDisplayType == .cone
                 ? (determination?.minForecast ?? []) : [],
-            maxForecast: settings.displayGlucoseForecasts && settings.forecastDisplayType == .cone
+            maxForecast: includeForecasts && settings.forecastDisplayType == .cone
                 ? (determination?.maxForecast ?? []) : [],
-            forecastLines: settings.displayGlucoseForecasts && settings.forecastDisplayType == .lines
+            forecastLines: includeForecasts && settings.forecastDisplayType == .lines
                 ? (determination?.forecastLines ?? [])
                 .map { LiveActivityAttributes.ForecastLine(type: $0.type, values: $0.values) }
                 : [],

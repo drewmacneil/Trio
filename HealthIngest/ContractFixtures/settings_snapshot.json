@@ -1,0 +1,29 @@
+{
+  "type": "settings_snapshot",
+  "id": "settings:9e193d8b299c35f7def08e28e718d707",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "values": {
+      "preferences": {
+        "units": "mg/dL"
+      },
+      "pumpSettings": {
+        "diaHours": 6,
+        "maxBolus": 10,
+        "maxBasal": 3,
+        "pumpModel": "example-pump",
+        "supportedBasalRates": [
+          0,
+          0.05,
+          0.1,
+          1
+        ]
+      },
+      "trioSettings": {
+        "smbEnabled": true,
+        "maxSmbUnits": 0.5
+      }
+    }
+  }
+}

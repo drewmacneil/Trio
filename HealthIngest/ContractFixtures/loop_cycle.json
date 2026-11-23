@@ -1,0 +1,73 @@
+{
+  "type": "loop_cycle",
+  "id": "loop:2026-03-01T15:30:00.000Z",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "iob": 1.2,
+    "cob": 15,
+    "autosensRatio": 1.1,
+    "determination": {
+      "reason": "enacted smb",
+      "duration": 30,
+      "rate": 1.1,
+      "smb": 0.1,
+      "minDelta": 2,
+      "expectedDelta": 4,
+      "scheduledBasal": 0.9,
+      "received": true
+    },
+    "predictions": {
+      "iob": [
+        121,
+        118
+      ],
+      "cob": [
+        121,
+        130
+      ],
+      "zt": [
+        121,
+        110
+      ],
+      "uam": [
+        121,
+        119
+      ]
+    },
+    "enacted": {
+      "smbUnits": 0.1,
+      "tempBasalRate": 1.1,
+      "tempBasalDurationMinutes": 30
+    },
+    "effectiveProfileId": "effective:17cfbb129c6e54e7daaf46a533a6c2af",
+    "timeZone": "America/Los_Angeles",
+    "appGitSha": "0123456789abcdef0123456789abcdef01234567",
+    "autosensRaw": 1.2,
+    "dynamicIsf": {
+      "tddHistory": [
+        {
+          "date": "2026-03-01",
+          "tdd": 35
+        }
+      ],
+      "weightedAverage": 34,
+      "average2h": 1.5
+    },
+    "iobBreakdown": {
+      "iob": 1.2,
+      "activity": 0.01,
+      "basaliob": 0.4,
+      "bolusiob": 0.8,
+      "netbasalinsulin": 0.2,
+      "iobWithZeroTemp": 1.4
+    },
+    "meal": {
+      "mealCOB": 15,
+      "carbs": 40,
+      "slopeFromMaxDeviation": 2,
+      "slopeFromMinDeviation": -1,
+      "lastCarbTime": "2026-03-01T14:00:00Z"
+    }
+  }
+}

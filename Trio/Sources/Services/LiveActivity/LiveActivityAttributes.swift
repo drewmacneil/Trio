@@ -46,8 +46,20 @@ struct LiveActivityAttributes: ActivityAttributes {
         let isInitialState: Bool
     }
 
+    /// Five-minute chart. Slot 0 is `chartStart`; slot i is that date plus i × 300 seconds.
+    static let chartStride: TimeInterval = 300
+    static let chartSlotCount = 72
+
+    struct ChartReading: Hashable {
+        var date: Date
+        var value: Int
+    }
+
     struct ContentAdditionalState: Codable, Hashable {
-        let chart: [ChartItem]
+        /// Time of glucose slot 0. Unix epoch when no chart is sent.
+        let chartStart: Date
+        /// mg/dL for each 5-minute slot. Nil is a missed reading.
+        let chartGlucose: [Int?]
         let rotationDegrees: Double
         let cob: Decimal
         let iob: Decimal
@@ -67,11 +79,14 @@ struct LiveActivityAttributes: ActivityAttributes {
         let maxForecast: [Int]
         let forecastLines: [ForecastLine]
         let forecastDisplayType: String
-    }
 
-    struct ChartItem: Codable, Hashable {
-        let value: Decimal
-        let date: Date
+        func chartReadings() -> [ChartReading] {
+            chartGlucose.enumerated().compactMap { index, mgdl in
+                guard let mgdl else { return nil }
+                let date = chartStart.addingTimeInterval(TimeInterval(index) * LiveActivityAttributes.chartStride)
+                return ChartReading(date: date, value: mgdl)
+            }
+        }
     }
 
     struct ForecastLine: Codable, Hashable {

@@ -443,6 +443,17 @@ enum SettingItems {
             path: ["Services", "Nightscout", "Fetch and Remote Control"]
         ),
         SettingItem(title: "Tidepool", view: .serviceSettings, path: ["Services"]),
+        SettingItem(
+            title: "Health Ingest",
+            view: .healthIngest,
+            searchContents: [
+                "Upload to private server",
+                "Device id",
+                "Test connection",
+                "Backfill"
+            ],
+            path: ["Services", "Health Ingest"]
+        ),
         SettingItem(title: "Apple Health", view: .healthkit, path: ["Services"])
     ]
 

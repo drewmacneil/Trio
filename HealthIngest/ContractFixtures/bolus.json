@@ -1,0 +1,13 @@
+{
+  "type": "bolus",
+  "id": "bolus:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "units": 2.5,
+    "isMutable": false,
+    "peakTime": 75,
+    "actionDuration": 6,
+    "insulinType": "example-rapid"
+  }
+}

@@ -189,7 +189,7 @@ jobs:
   build:
     name: Build
     needs: [check_certs, check_status]
-    runs-on: macos-26
+    runs-on: xcode-27
     permissions:
       contents: write
     if:
@@ -199,7 +199,7 @@ jobs:
         (vars.SCHEDULED_SYNC != 'false' && needs.check_status.outputs.NEW_COMMITS == 'true' )
     steps:
       - name: Select Xcode version
-        run: "sudo xcode-select --switch /Applications/Xcode_26.5.app/Contents/Developer"
+        run: "sudo xcode-select --switch /Applications/Xcode_27.2.app/Contents/Developer"
       
       - name: Checkout Repo for building
         uses: actions/checkout@v5
@@ -237,6 +237,88 @@ jobs:
           # and make sure to specify the submodule by setting "--directory=(submodule_name)".
           # Several patches may be added per submodule.
           # Adding comments (#) is strongly recommended to easily tell the individual patches apart.
+
+      # Fork gate. The checkout above is the branch tip after upstream sync
+      # (and after any local patches). A failure here stops the job before
+      # archive and TestFlight upload. Scoped to the fork's own tests so a
+      # clean but broken upstream merge cannot ship. CI=true skips the
+      # SwiftFormat build phase. DerivedData stays in the runner default
+      # location, outside the repo, so later runs compile incrementally.
+      - name: Test synced tree before archive
+        env:
+          CI: true
+          # xcodebuild blocks its log when stdout is a pipe. Without this the
+          # runner looks idle for the whole compile.
+          NSUnbufferedIO: YES
+          # Do not let the workflow token reach the test log.
+          GH_PAT: ""
+        run: |
+          set -euo pipefail
+          echo "Testing $(git rev-parse HEAD)"
+          snapshot="$(mktemp -d)"
+          git ls-files '*Package.resolved' > "$snapshot/list"
+          while IFS= read -r path; do
+            [[ -z "$path" ]] && continue
+            mkdir -p "$snapshot/$(dirname "$path")"
+            cp "$path" "$snapshot/$path"
+          done < "$snapshot/list"
+          restore_resolved() {
+            while IFS= read -r path; do
+              [[ -z "$path" ]] && continue
+              cp "$snapshot/$path" "$path"
+            done < "$snapshot/list"
+          }
+          trap restore_resolved EXIT
+
+          dest="$(xcrun simctl list devices available | awk '
+            /iPhone/ && $0 !~ /unavailable/ {
+              if (match($0, /\([0-9A-Fa-f-]{36}\)/)) {
+                print substr($0, RSTART + 1, RLENGTH - 2)
+                exit
+              }
+            }
+          ')"
+          if [[ -z "$dest" ]]; then
+            echo "::error::No available iPhone simulator on this runner"
+            exit 1
+          fi
+          echo "simulator: $dest"
+
+          # Download pinned packages on a cold runner. No-op once DerivedData
+          # already holds this Package.resolved.
+          xcodebuild -resolvePackageDependencies \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -onlyUsePackageVersionsFromResolvedFile
+
+          set -o pipefail
+          xcodebuild \
+            -workspace Trio.xcworkspace \
+            -scheme "Trio Tests" \
+            -configuration Debug \
+            -destination "platform=iOS Simulator,id=${dest}" \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -disableAutomaticPackageResolution \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CI=true \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM= \
+            PROVISIONING_PROFILE_SPECIFIER= \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            test \
+            -only-testing:TrioTests/HealthIngestTests \
+            -only-testing:TrioTests/LiveActivityChartTests \
+            2>&1 | tee xcodebuild-fork-gate.log
+
+      - name: Upload fork test gate log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fork-test-gate-log
+          path: xcodebuild-fork-gate.log
+          if-no-files-found: ignore
 
       # Patch Fastlane Match to not print tables
       - name: Patch Match Tables

@@ -1,0 +1,10 @@
+{
+  "type": "temp_basal",
+  "id": "temp:example-1",
+  "start": "2026-03-01T15:30:00Z",
+  "tz": "America/Los_Angeles",
+  "payload": {
+    "rate": 0,
+    "durationMinutes": 0
+  }
+}

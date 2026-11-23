@@ -55,6 +55,7 @@ enum Screen: Identifiable, Hashable {
     case appDiagnostics
     case settingsExport
     case treatmentsSettings
+    case healthIngest
 
     var id: Int { String(reflecting: self).hashValue }
 }
@@ -173,6 +174,8 @@ extension Screen {
             ContactImage.RootView(resolver: resolver)
         case .serviceSettings:
             ServicesView(resolver: resolver, state: Settings.StateModel())
+        case .healthIngest:
+            HealthIngestSettingsView(resolver: resolver)
         case .autosensSettings:
             AutosensSettings.RootView(resolver: resolver)
         case .smbSettings:

@@ -9,6 +9,15 @@ import zlib
 ///
 /// HTTP 200 body: `{ "results": [ { "type", "id", "status", "reason"? } ] }`.
 /// `status` is `accepted`, `duplicate`, or `rejected`. The upsert key is `(type, id)`.
+///
+/// A HealthKit sample may add optional siblings of `payload`: `sourceName`,
+/// `sourceBundleIdentifier`, `deviceName`, `deviceModel`, `deviceManufacturer`.
+/// Each value is 1...256 UTF-16 code units (JavaScript string length) and has no
+/// Unicode control characters. An empty, too-long, or control-bearing value is
+/// omitted. Values are not trimmed or shortened. There is no device object when
+/// the sample has no `HKDevice`. `payload.source` stays the coarse label
+/// (`healthkit`). Trio's own records omit the siblings. On a matching `(type, id)`
+/// the server updates those source columns instead of treating the row as a duplicate.
 enum HealthIngestWire {
     static let schemaVersion = 1
     static let appName = "trio"
@@ -37,13 +46,18 @@ enum HealthIngestWire {
         return components.url
     }
 
-    /// Bump when on-device payloads change so rejected receipts and HealthKit
-    /// backfill cursors can be cleared and the records sent again.
+    /// Bump when stored HealthKit rows must be read and sent again. A higher version
+    /// clears rejected receipts, drops queued contract rows, resets HealthKit
+    /// backfill cursors, and rewinds the Core Data read. The following pass uses
+    /// the same page size, batch limits, and backlog pause as any other backfill.
     /// 4 resends Core Data loop cycles and effective profiles the server used to reject
     /// (finite predicted glucose, and schedule starts in HH:MM or HH:MM:SS).
     /// 5 clears the reject counter and the reason log together. Version 4 left the
     /// old counter in place after the new buffer was empty.
-    static let mappingVersion = 5
+    /// 6 resends HealthKit history with each sample's source and device beside
+    /// `payload`. The payload is unchanged, so the local receipt hash includes
+    /// those fields and an accepted `(type, id)` is queued again.
+    static let mappingVersion = 6
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed
@@ -156,6 +170,9 @@ enum HealthIngestType {
 
     static let contentAddressed: Set<String> = [profileSnapshot, settingsSnapshot, effectiveProfile]
 
+    /// Samples read from HealthKit. Trio glucose is not in this set: the uploader
+    /// does not read HealthKit glucose, and Trio's own glucose records do not
+    /// carry HealthKit source fields.
     static let healthKitTypes: Set<String> = [
         workout, heartRate, restingHR, hrv, sleepStage, activeEnergy, exerciseMinutes
     ]
@@ -334,16 +351,42 @@ struct HealthIngestRecord: Codable, Equatable {
     var end: Date?
     var tz: String
     var payload: HealthIngestJSON
+    /// HealthKit `HKSource.name`. Omitted for Trio's own records.
+    var sourceName: String? = nil
+    /// HealthKit `HKSource.bundleIdentifier`.
+    var sourceBundleIdentifier: String? = nil
+    /// HealthKit `HKDevice.name`. Nil when the sample has no device.
+    var deviceName: String? = nil
+    /// HealthKit `HKDevice.model`.
+    var deviceModel: String? = nil
+    /// HealthKit `HKDevice.manufacturer`.
+    var deviceManufacturer: String? = nil
 
     func asJSON() -> HealthIngestJSON {
-        .object([
+        var fields: [String: HealthIngestJSON?] = [
             "type": .string(type),
             "id": .string(id),
             "start": .string(HealthIngestTime.string(from: start)),
             "end": end.map { .string(HealthIngestTime.string(from: $0)) },
             "tz": .string(tz),
             "payload": payload
-        ])
+        ]
+        for (key, value) in provenanceWireFields() {
+            fields[key] = .string(value)
+        }
+        return .object(fields)
+    }
+
+    /// Local dedup text. Equals the payload JSON unless a HealthKit source field
+    /// is present, so an accepted receipt does not block the same id after mapping 6.
+    func receiptCanonical(payloadCanonical: String) -> String {
+        let extras = provenanceWireFields()
+        guard !extras.isEmpty else { return payloadCanonical }
+        var fields: [String: HealthIngestJSON?] = [:]
+        for (key, value) in extras {
+            fields[key] = .string(value)
+        }
+        return payloadCanonical + "\n" + HealthIngestCanonicalJSON.string(.object(fields))
     }
 
     func encode(to encoder: Encoder) throws {
@@ -354,6 +397,26 @@ struct HealthIngestRecord: Codable, Equatable {
         try container.encodeIfPresent(end, forKey: .end)
         try container.encode(tz, forKey: .tz)
         try container.encode(payload, forKey: .payload)
+        let provenance = provenanceWireFields()
+        try container.encodeIfPresent(provenance["sourceName"], forKey: .sourceName)
+        try container.encodeIfPresent(provenance["sourceBundleIdentifier"], forKey: .sourceBundleIdentifier)
+        try container.encodeIfPresent(provenance["deviceName"], forKey: .deviceName)
+        try container.encodeIfPresent(provenance["deviceModel"], forKey: .deviceModel)
+        try container.encodeIfPresent(provenance["deviceManufacturer"], forKey: .deviceManufacturer)
+    }
+
+    func provenanceWireUTF8Count() -> Int {
+        provenanceWireFields().values.reduce(0) { $0 + $1.utf8.count }
+    }
+
+    private func provenanceWireFields() -> [String: String] {
+        HealthIngestProvenance.wireFields(
+            sourceName: sourceName,
+            sourceBundleIdentifier: sourceBundleIdentifier,
+            deviceName: deviceName,
+            deviceModel: deviceModel,
+            deviceManufacturer: deviceManufacturer
+        )
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -363,6 +426,41 @@ struct HealthIngestRecord: Codable, Equatable {
         case end
         case tz
         case payload
+        case sourceName
+        case sourceBundleIdentifier
+        case deviceName
+        case deviceModel
+        case deviceManufacturer
+    }
+}
+
+/// HealthKit source and device strings the server will store beside `payload`.
+enum HealthIngestProvenance {
+    /// Keeps a string the server accepts. Empty, longer than 256 UTF-16 code units,
+    /// or containing a Unicode control character is dropped whole. Nothing is trimmed
+    /// or shortened to pass that check.
+    static func accepted(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let length = raw.utf16.count
+        guard length >= 1, length <= 256 else { return nil }
+        guard raw.unicodeScalars.allSatisfy({ $0.properties.generalCategory != .control }) else { return nil }
+        return raw
+    }
+
+    static func wireFields(
+        sourceName: String?,
+        sourceBundleIdentifier: String?,
+        deviceName: String?,
+        deviceModel: String?,
+        deviceManufacturer: String?
+    ) -> [String: String] {
+        var fields: [String: String] = [:]
+        if let value = accepted(sourceName) { fields["sourceName"] = value }
+        if let value = accepted(sourceBundleIdentifier) { fields["sourceBundleIdentifier"] = value }
+        if let value = accepted(deviceName) { fields["deviceName"] = value }
+        if let value = accepted(deviceModel) { fields["deviceModel"] = value }
+        if let value = accepted(deviceManufacturer) { fields["deviceManufacturer"] = value }
+        return fields
     }
 }
 

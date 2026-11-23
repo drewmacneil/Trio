@@ -431,6 +431,237 @@ import Testing
         }
     }
 
+    @Test func healthKitSourceFieldsSitBesidePayload() throws {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let payload = try #require(
+            HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 72)
+        )
+        let record = HealthIngestRecord(
+            type: HealthIngestType.heartRate,
+            id: "hr-source-1",
+            start: start,
+            end: nil,
+            tz: "Etc/UTC",
+            payload: payload,
+            sourceName: "Apple Watch",
+            sourceBundleIdentifier: "com.apple.health",
+            deviceName: "Apple Watch",
+            deviceModel: "Watch",
+            deviceManufacturer: "Apple Inc."
+        )
+        let wire = try wireRecord(record)
+        #expect(wire["sourceName"] as? String == "Apple Watch")
+        #expect(wire["sourceBundleIdentifier"] as? String == "com.apple.health")
+        #expect(wire["deviceName"] as? String == "Apple Watch")
+        #expect(wire["deviceModel"] as? String == "Watch")
+        #expect(wire["deviceManufacturer"] as? String == "Apple Inc.")
+        let body = try #require(wire["payload"] as? [String: Any])
+        #expect(body["source"] as? String == "healthkit")
+        #expect(body["bpm"] != nil)
+        for key in ["sourceName", "sourceBundleIdentifier", "deviceName", "deviceModel", "deviceManufacturer"] {
+            #expect(body[key] == nil, "payload should not contain \(key)")
+        }
+
+        let healthKitTypes = [
+            HealthIngestType.heartRate,
+            HealthIngestType.restingHR,
+            HealthIngestType.hrv,
+            HealthIngestType.sleepStage,
+            HealthIngestType.activeEnergy,
+            HealthIngestType.exerciseMinutes,
+            HealthIngestType.workout
+        ]
+        for type in healthKitTypes {
+            let encoded = try wireRecord(
+                HealthIngestRecord(
+                    type: type,
+                    id: "\(type)-source",
+                    start: start,
+                    end: nil,
+                    tz: "Etc/UTC",
+                    payload: .object(["source": .string(HealthIngestHealthMapping.source)]),
+                    sourceName: "Apple Watch",
+                    sourceBundleIdentifier: "com.apple.health"
+                )
+            )
+            #expect(encoded["id"] as? String == "\(type)-source")
+            #expect(encoded["sourceName"] as? String == "Apple Watch")
+            #expect(encoded["sourceBundleIdentifier"] as? String == "com.apple.health")
+            #expect(encoded["deviceName"] == nil)
+            #expect(encoded["deviceModel"] == nil)
+            #expect(encoded["deviceManufacturer"] == nil)
+            let encodedPayload = try #require(encoded["payload"] as? [String: Any])
+            #expect(encodedPayload["source"] as? String == "healthkit")
+        }
+
+        let trioTypes = [
+            HealthIngestType.glucose,
+            HealthIngestType.bolus,
+            HealthIngestType.carbs,
+            HealthIngestType.loopCycle
+        ]
+        for type in trioTypes {
+            let encoded = try wireRecord(makeRecord(id: "\(type)-native", type: type))
+            for key in ["sourceName", "sourceBundleIdentifier", "deviceName", "deviceModel", "deviceManufacturer"] {
+                #expect(encoded[key] == nil, "\(type) should not send \(key)")
+            }
+        }
+    }
+
+    @Test func healthKitSourceOmitsMissingDeviceAndInvalidStrings() throws {
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let noDevice = HealthIngestRecord(
+            type: HealthIngestType.hrv,
+            id: "hrv-no-device",
+            start: start,
+            end: nil,
+            tz: "Etc/UTC",
+            payload: .object(["source": .string("healthkit"), "sdnnMs": .number(45)]),
+            sourceName: " Watch ",
+            sourceBundleIdentifier: "com.apple.health",
+            deviceName: nil,
+            deviceModel: nil,
+            deviceManufacturer: nil
+        )
+        let bare = try wireRecord(noDevice)
+        #expect(bare["sourceName"] as? String == " Watch ")
+        #expect(bare["sourceBundleIdentifier"] as? String == "com.apple.health")
+        #expect(bare["deviceName"] == nil)
+        #expect(bare["deviceModel"] == nil)
+        #expect(bare["deviceManufacturer"] == nil)
+        let bareText = try wireText(noDevice)
+        #expect(!bareText.contains("\"deviceName\""))
+        #expect(!bareText.contains("\"deviceModel\""))
+        #expect(!bareText.contains("\"deviceManufacturer\""))
+        #expect(!bareText.contains("null"))
+
+        let tooLong = String(repeating: "q", count: 257)
+        let emojiLimit = String(repeating: "😀", count: 128)
+        let emojiOver = String(repeating: "😀", count: 129)
+        #expect(emojiLimit.utf16.count == 256)
+        #expect(emojiOver.count == 129)
+        #expect(emojiOver.utf16.count > 256)
+        let invalid = HealthIngestRecord(
+            type: HealthIngestType.sleepStage,
+            id: "sleep-invalid",
+            start: start,
+            end: start.addingTimeInterval(60),
+            tz: "Etc/UTC",
+            payload: .object(["source": .string("healthkit"), "stage": .string("core")]),
+            sourceName: "",
+            sourceBundleIdentifier: "bad\u{0007}tail",
+            deviceName: "line\nbreak",
+            deviceModel: tooLong,
+            deviceManufacturer: emojiOver
+        )
+        let dropped = try wireRecord(invalid)
+        #expect(dropped["sourceName"] == nil)
+        #expect(dropped["sourceBundleIdentifier"] == nil)
+        #expect(dropped["deviceName"] == nil)
+        #expect(dropped["deviceModel"] == nil)
+        #expect(dropped["deviceManufacturer"] == nil)
+        let droppedPayload = try #require(dropped["payload"] as? [String: Any])
+        #expect(droppedPayload["source"] as? String == "healthkit")
+        #expect(droppedPayload["stage"] as? String == "core")
+        let droppedText = try wireText(invalid)
+        #expect(!droppedText.contains(tooLong))
+        #expect(!droppedText.contains(String(repeating: "q", count: 256)))
+        #expect(!droppedText.contains("bad"))
+        #expect(!droppedText.contains("tail"))
+        #expect(!droppedText.contains("line"))
+        #expect(!droppedText.contains(emojiOver))
+
+        let kept = HealthIngestRecord(
+            type: HealthIngestType.activeEnergy,
+            id: "energy-limits",
+            start: start,
+            end: start,
+            tz: "Etc/UTC",
+            payload: .object(["source": .string("healthkit"), "kcal": .number(1)]),
+            sourceName: String(repeating: "a", count: 256),
+            sourceBundleIdentifier: emojiLimit,
+            deviceName: "tab\tfails",
+            deviceModel: "del\u{007F}fails",
+            deviceManufacturer: "keep\u{2028}line"
+        )
+        let limits = try wireRecord(kept)
+        #expect(limits["sourceName"] as? String == String(repeating: "a", count: 256))
+        #expect(limits["sourceBundleIdentifier"] as? String == emojiLimit)
+        #expect(limits["deviceName"] == nil)
+        #expect(limits["deviceModel"] == nil)
+        #expect(limits["deviceManufacturer"] as? String == "keep\u{2028}line")
+        let limitsText = try wireText(kept)
+        #expect(!limitsText.contains("tab"))
+        #expect(!limitsText.contains("fails"))
+    }
+
+    @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
+        #expect(HealthIngestWire.mappingVersion == 6)
+        let disk = try makeDisk()
+        disk.saveMappingVersion(5)
+        #expect(disk.loadMappingVersion() < HealthIngestWire.mappingVersion)
+
+        let queue = HealthIngestQueue(disk: disk)
+        let heart = makeRecord(id: "hr-same", type: HealthIngestType.heartRate)
+        #expect(await queue.enqueue([heart]).queued == 1)
+        _ = await queue.resolve(
+            batch: [heart],
+            acks: [HealthIngestAck(type: heart.type, id: heart.id, status: .accepted)],
+            transportFailed: false
+        )
+        #expect(await queue.enqueue([heart]).queued == 0)
+
+        var blank = heart
+        blank.sourceName = ""
+        blank.deviceName = "\n"
+        blank.deviceModel = String(repeating: "m", count: 257)
+        #expect(await queue.enqueue([blank]).queued == 0)
+
+        var sourced = heart
+        sourced.sourceName = "Apple Watch"
+        sourced.sourceBundleIdentifier = "com.apple.health"
+        sourced.deviceName = "Apple Watch"
+        sourced.deviceModel = "Watch"
+        sourced.deviceManufacturer = "Apple Inc."
+        #expect(sourced.id == heart.id)
+        #expect(await queue.enqueue([sourced]).queued == 1)
+        let batch = await queue.nextBatch(limit: 10, maxBytes: HealthIngestWire.maxBatchBytes)
+        #expect(batch.map(\.id) == ["hr-same"])
+        #expect(batch.first?.sourceBundleIdentifier == "com.apple.health")
+        _ = await queue.resolve(
+            batch: batch,
+            acks: [HealthIngestAck(type: heart.type, id: heart.id, status: .accepted)],
+            transportFailed: false
+        )
+        #expect(await queue.enqueue([sourced]).queued == 0)
+
+        let glucose = makeRecord(id: "glucose-same", type: HealthIngestType.glucose)
+        #expect(await queue.enqueue([glucose]).queued == 1)
+        _ = await queue.resolve(
+            batch: [glucose],
+            acks: [HealthIngestAck(type: glucose.type, id: glucose.id, status: .accepted)],
+            transportFailed: false
+        )
+        #expect(await queue.enqueue([glucose]).queued == 0)
+
+        var persisted = makeRecord(id: "hr-disk", type: HealthIngestType.restingHR)
+        persisted.sourceName = "Apple Watch"
+        persisted.sourceBundleIdentifier = "com.apple.health"
+        persisted.deviceName = ""
+        persisted.deviceModel = "Watch"
+        let persistDisk = try makeDisk()
+        let store = HealthIngestQueue(disk: persistDisk)
+        #expect(await store.enqueue([persisted]).queued == 1)
+        let reloaded = HealthIngestQueue(disk: persistDisk)
+        let restored = await reloaded.nextBatch(limit: 5, maxBytes: HealthIngestWire.maxBatchBytes)
+        #expect(restored.first?.id == "hr-disk")
+        #expect(restored.first?.sourceName == "Apple Watch")
+        #expect(restored.first?.sourceBundleIdentifier == "com.apple.health")
+        #expect(restored.first?.deviceName == nil)
+        #expect(restored.first?.deviceModel == "Watch")
+        #expect(restored.first?.deviceManufacturer == nil)
+    }
+
     @Test func settingsSnapshotIdMatchesTheServerCanonicalHash() {
         // Server id is settings:<first 32 lowercase hex chars of SHA-256(stableJson(payload))>.
         // Keys must be sorted, no insignificant whitespace, payload only (not the envelope).
@@ -575,7 +806,7 @@ import Testing
         #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
         #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
         #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
-        #expect(HealthIngestWire.mappingVersion == 5)
+        #expect(HealthIngestWire.mappingVersion == 6)
         #expect(HealthIngestAck.acceptedRowCount([
             HealthIngestAck(type: "hrv", id: "1", status: .accepted),
             HealthIngestAck(type: "hrv", id: "2", status: .duplicate),
@@ -1077,6 +1308,30 @@ import Testing
             return Set(fields.keys)
         }
         return []
+    }
+
+    private func wireRecord(_ record: HealthIngestRecord) throws -> [String: Any] {
+        let data = try HealthIngestWire.encodeEnvelope(
+            HealthIngestEnvelope(
+                schemaVersion: HealthIngestWire.schemaVersion,
+                device: HealthIngestDevice(id: "trio-iphone", app: "trio", appVersion: "1.0 (1)"),
+                records: [record]
+            )
+        )
+        let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let records = try #require(json["records"] as? [[String: Any]])
+        return try #require(records.first)
+    }
+
+    private func wireText(_ record: HealthIngestRecord) throws -> String {
+        let data = try HealthIngestWire.encodeEnvelope(
+            HealthIngestEnvelope(
+                schemaVersion: HealthIngestWire.schemaVersion,
+                device: HealthIngestDevice(id: "trio-iphone", app: "trio", appVersion: "1.0 (1)"),
+                records: [record]
+            )
+        )
+        return try #require(String(data: data, encoding: .utf8))
     }
 
     private func wirePayload(_ record: HealthIngestRecord) throws -> [String: Any] {

@@ -443,8 +443,8 @@ actor HealthIngestQueue {
     /// Accepted receipts stay so deletions can be detected. Rejected receipts
     /// only need to prevent an immediate resend; a large rejected set made
     /// `receipts.json` expensive to decode at launch.
-    private let receiptCap = 4_000
-    private let rejectedReceiptCap = 2_000
+    static let receiptCap = 4_000
+    static let rejectedReceiptCap = 2_000
     private let snapshotInterval: TimeInterval = 24 * 3600
 
     init(disk: HealthIngestDisk) {
@@ -981,20 +981,20 @@ actor HealthIngestQueue {
 
     private func pruneReceipts() {
         let rejectedIndexes = receipts.indices.filter { receipts[$0].state == .rejected }
-        if rejectedIndexes.count > rejectedReceiptCap {
-            let evict = Set(rejectedIndexes.prefix(rejectedIndexes.count - rejectedReceiptCap))
+        if rejectedIndexes.count > Self.rejectedReceiptCap {
+            let evict = Set(rejectedIndexes.prefix(rejectedIndexes.count - Self.rejectedReceiptCap))
             receipts = receipts.enumerated().compactMap { evict.contains($0.offset) ? nil : $0.element }
         }
-        if receipts.count > receiptCap {
+        if receipts.count > Self.receiptCap {
             // Drop oldest rejected rows first so accepted ids used for deletions remain.
-            var overflow = receipts.count - receiptCap
+            var overflow = receipts.count - Self.receiptCap
             receipts.removeAll { item in
                 guard overflow > 0, item.state == .rejected else { return false }
                 overflow -= 1
                 return true
             }
-            if receipts.count > receiptCap {
-                receipts.removeFirst(receipts.count - receiptCap)
+            if receipts.count > Self.receiptCap {
+                receipts.removeFirst(receipts.count - Self.receiptCap)
             }
         }
         if receiptByKey.count != receipts.count {

@@ -691,6 +691,89 @@ import Testing
         #expect(disk.loadRejectedCount() == 4)
     }
 
+    @Test func backfillProgressPersistsRestoresAndClears() throws {
+        let disk = try makeDisk()
+        let start = Date(timeIntervalSince1970: 1_700_000_000)
+        let stored = HealthIngestPersistedBackfill(
+            days: 90,
+            windowStart: start,
+            rowsSent: 40,
+            chosenDays: 90,
+            active: true
+        )
+        disk.saveBackfillProgress(stored)
+        #expect(disk.loadBackfillProgress() == stored)
+
+        let restored = HealthIngestBackfillRestore.resolve(
+            stored: disk.loadBackfillProgress(),
+            pending: true,
+            earliestCursor: start.addingTimeInterval(10 * 24 * 3600),
+            now: start.addingTimeInterval(90 * 24 * 3600)
+        )
+        #expect(restored.active)
+        #expect(restored.days == 90)
+        #expect(restored.windowStart == start)
+        #expect(restored.rowsSent == 40)
+        #expect(restored.chosenDays == 90)
+
+        let cleared = HealthIngestBackfillRestore.resolve(
+            stored: stored,
+            pending: false,
+            earliestCursor: nil,
+            now: start
+        )
+        #expect(!cleared.active)
+        #expect(cleared.days == 0)
+        #expect(cleared.rowsSent == 0)
+        #expect(cleared.chosenDays == 90)
+        disk.saveBackfillProgress(
+            HealthIngestPersistedBackfill(
+                days: cleared.days,
+                windowStart: cleared.windowStart,
+                rowsSent: cleared.rowsSent,
+                chosenDays: cleared.chosenDays,
+                active: cleared.active
+            )
+        )
+        let loaded = try #require(disk.loadBackfillProgress())
+        #expect(!loaded.active)
+        #expect(loaded.rowsSent == 0)
+        #expect(loaded.chosenDays == 90)
+    }
+
+    @Test func missingBackfillProgressUsesTheEarliestCursor() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        // 68 days unread means the pass has covered 22 days of a window that must be 90.
+        let cursor = now.addingTimeInterval(-68 * 24 * 3600)
+        let resolved = HealthIngestBackfillRestore.resolve(
+            stored: nil,
+            pending: true,
+            earliestCursor: cursor,
+            now: now
+        )
+        #expect(resolved.active)
+        #expect(resolved.days == 90)
+        #expect(resolved.rowsSent == 0)
+        #expect(resolved.chosenDays == 90)
+        let progress = HealthIngestBackfillProgress.measure(
+            start: resolved.windowStart,
+            frontier: cursor,
+            days: resolved.days,
+            rowsSent: resolved.rowsSent,
+            phase: "Reading Health samples"
+        )
+        #expect(progress.day == 23)
+        #expect(progress.days == 90)
+        #expect(progress.fraction > 0)
+        #expect(progress.fraction < 1)
+
+        let recent = HealthIngestBackfillProgress.recover(
+            earliestCursor: now.addingTimeInterval(-2 * 24 * 3600),
+            now: now
+        )
+        #expect(recent.days == 3)
+    }
+
     @Test func freshBackfillReadsAsDayOneUntilTheCursorMoves() {
         let start = Date(timeIntervalSince1970: 1_700_000_000)
         let untouched = HealthIngestBackfillProgress.frontier(start: start, cursor: nil, resume: nil)

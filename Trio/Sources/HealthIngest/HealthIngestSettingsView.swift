@@ -10,19 +10,18 @@ struct HealthIngestSettingsView: View {
     @State private var tokenDraft = ""
     @State private var testResult: String?
     @State private var testing = false
-    @State private var backfillDays = 7
+    @State private var backfillDays: Int
     @State private var confirmReset = false
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(AppState.self) private var appState
-
-    private let backfillChoices = [1, 3, 7, 14, 30, 90]
 
     init(resolver: Resolver) {
         let uploader = resolver.resolve(HealthIngestUploader.self)!
         _uploader = ObservedObject(wrappedValue: uploader)
         _baseURL = State(initialValue: uploader.preferences.baseURL)
         _deviceID = State(initialValue: uploader.preferences.deviceID)
+        _backfillDays = State(initialValue: uploader.backfillDayChoice)
     }
 
     var body: some View {
@@ -48,6 +47,7 @@ struct HealthIngestSettingsView: View {
             },
             testConnection: runTest,
             startBackfill: { uploader.backfill(days: backfillDays) },
+            rememberBackfillDays: { uploader.rememberBackfillDays($0) },
             resetBackfill: {
                 let days = uploader.status.backfillRunning ? (uploader.status.backfill?.days ?? backfillDays) : backfillDays
                 uploader.resetBackfill(days: days)
@@ -55,6 +55,11 @@ struct HealthIngestSettingsView: View {
             clearRejections: { uploader.clearRejections() },
             background: appState.trioBackgroundColor(for: colorScheme)
         )
+        .onChange(of: uploader.backfillDayChoice) { _, newValue in
+            if !uploader.status.backfillRunning {
+                backfillDays = newValue
+            }
+        }
     }
 
     private func saveToken() {
@@ -96,12 +101,13 @@ struct HealthIngestSettingsForm: View {
     var removeToken: () -> Void
     var testConnection: () -> Void
     var startBackfill: () -> Void
+    var rememberBackfillDays: (Int) -> Void
     var resetBackfill: () -> Void
     var clearRejections: () -> Void
     var background: LinearGradient
     var scrollAnchor: String? = nil
 
-    private let backfillChoices = [1, 3, 7, 14, 30, 90]
+    private let backfillChoices = HealthIngestBackfillProgress.dayChoices
 
     var body: some View {
         ScrollViewReader { proxy in
@@ -221,13 +227,12 @@ struct HealthIngestSettingsForm: View {
                 }
             }
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
-            VStack(alignment: .leading, spacing: 2) {
-                labeledRow("Queue", status.queueDepth.formatted())
-                labeledRow("Trio first", status.priorityDepth.formatted())
-                Text("Rows waiting to upload. Trio rows are sent first.")
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
-            }
+            labeledRow("Waiting to upload", status.queueDepth.formatted())
+            labeledRow("Trio data", status.priorityDepth.formatted())
+            labeledRow("Health data", status.healthDepth.formatted())
+            Text("Trio data uploads first.")
+                .font(.footnote)
+                .foregroundColor(.secondary)
             NavigationLink {
                 HealthIngestRejectedView(groups: status.rejectGroups, onClear: clearRejections)
             } label: {
@@ -325,6 +330,7 @@ struct HealthIngestSettingsForm: View {
             set: { newValue in
                 if !status.backfillRunning {
                     backfillDays = newValue
+                    rememberBackfillDays(newValue)
                 }
             }
         )

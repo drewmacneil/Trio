@@ -262,6 +262,14 @@ final class HealthIngestDisk {
         save(cursors, name: "cursors.json")
     }
 
+    func loadBackfillProgress() -> HealthIngestPersistedBackfill? {
+        load(HealthIngestPersistedBackfill.self, name: "backfill-progress.json")
+    }
+
+    func saveBackfillProgress(_ progress: HealthIngestPersistedBackfill) {
+        save(progress, name: "backfill-progress.json")
+    }
+
     func loadStatus() -> HealthIngestPersistedStatus {
         load(HealthIngestPersistedStatus.self, name: "status.json") ?? HealthIngestPersistedStatus()
     }

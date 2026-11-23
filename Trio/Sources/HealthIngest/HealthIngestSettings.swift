@@ -190,14 +190,90 @@ struct HealthIngestBackfillProgress: Equatable {
             fraction: fraction
         )
     }
+
+    /// Picker values. A cursor only moves forward from the window start, so its age is a
+    /// lower bound on which of these windows could still be in progress.
+    static let dayChoices = [1, 3, 7, 14, 30, 90]
+
+    /// Progress for a backfill that resumed with cursors but no saved window. The smallest
+    /// choice that still reaches the earliest cursor becomes the window, and that cursor
+    /// is the frontier inside it. A 68-day-old cursor can only be a 90-day pass.
+    static func recover(earliestCursor: Date, now: Date, choices: [Int] = dayChoices) -> (days: Int, windowStart: Date) {
+        let age = max(0, now.timeIntervalSince(earliestCursor))
+        let sorted = choices.sorted()
+        let days = sorted.first { Double($0) * 24 * 3600 >= age } ?? sorted.last ?? 90
+        let start = now.addingTimeInterval(-Double(days) * 24 * 3600)
+        return (days, start)
+    }
+}
+
+/// Days, window start, and accepted-row count for the backfill that is running.
+/// `chosenDays` is the picker value used once that pass is finished.
+struct HealthIngestPersistedBackfill: Codable, Equatable {
+    var days: Int
+    var windowStart: Date
+    var rowsSent: Int
+    var chosenDays: Int
+    var active: Bool
+}
+
+enum HealthIngestBackfillRestore {
+    struct State: Equatable {
+        var days: Int
+        var windowStart: Date
+        var rowsSent: Int
+        var chosenDays: Int
+        var active: Bool
+    }
+
+    /// Pending cursors keep a saved pass. With no saved pass, the earliest cursor
+    /// supplies the window. A finished pass drops the counts and keeps the picker value.
+    static func resolve(
+        stored: HealthIngestPersistedBackfill?,
+        pending: Bool,
+        earliestCursor: Date?,
+        now: Date
+    ) -> State {
+        let savedChoice = stored?.chosenDays
+        guard pending else {
+            return State(
+                days: 0,
+                windowStart: Date(timeIntervalSince1970: 0),
+                rowsSent: 0,
+                chosenDays: savedChoice ?? 7,
+                active: false
+            )
+        }
+        if let stored, stored.active, stored.days > 0 {
+            return State(
+                days: stored.days,
+                windowStart: stored.windowStart,
+                rowsSent: stored.rowsSent,
+                chosenDays: stored.chosenDays,
+                active: true
+            )
+        }
+        let cursor = earliestCursor ?? now
+        let recovered = HealthIngestBackfillProgress.recover(earliestCursor: cursor, now: now)
+        return State(
+            days: recovered.days,
+            windowStart: recovered.windowStart,
+            rowsSent: 0,
+            chosenDays: savedChoice ?? recovered.days,
+            active: true
+        )
+    }
 }
 
 struct HealthIngestStatus: Equatable {
     var lastSuccess: Date?
     var lastError: String?
+    /// Trio rows plus Health rows still waiting.
     var queueDepth: Int = 0
     /// Trio rows included in `queueDepth`. These leave the queue before HealthKit backfill.
     var priorityDepth: Int = 0
+
+    var healthDepth: Int { max(0, queueDepth - priorityDepth) }
     var rejectedCount: Int = 0
     var hasToken = false
     var backfillRunning = false

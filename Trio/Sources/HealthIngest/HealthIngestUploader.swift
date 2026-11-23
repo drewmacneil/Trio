@@ -15,6 +15,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
 
     @Published private(set) var preferences = HealthIngestPreferences.initial
     @Published private(set) var status = HealthIngestStatus()
+    /// Picker value when no backfill is running. A running pass shows its own day count.
+    @Published private(set) var backfillDayChoice = 7
 
     private var settingsStore: HealthIngestSettingsStore!
     private let stateLock = NSLock()
@@ -43,6 +45,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private var backfillDayCount = 0
     private var backfillWindowStart: Date?
     private var backfillRowsSent = 0
+    private var backfillChosenDays = 7
+    private var backfillProgressSavedAt: Date?
     private var lifecycle = Set<AnyCancellable>()
 
     /// How much one pass may read, hold, and send. Backgrounded work is kept small because
@@ -171,6 +175,22 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.unlock()
         poke()
         publishSnapshot(depth: status.queueDepth, priorityDepth: status.priorityDepth)
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self, (try? self.prepare()) != nil else { return }
+            self.saveActiveBackfill()
+        }
+    }
+
+    @MainActor func rememberBackfillDays(_ days: Int) {
+        let bounded = min(max(days, 1), 90)
+        backfillDayChoice = bounded
+        stateLock.lock()
+        backfillChosenDays = bounded
+        stateLock.unlock()
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self, (try? self.prepare()) != nil else { return }
+            self.saveBackfillChoice()
+        }
     }
 
     @MainActor func clearRejections() {
@@ -236,6 +256,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         backfillWindowStart = since
         backfillRowsSent = 0
         stateLock.unlock()
+        saveActiveBackfill()
     }
 
     private func commit(_ incoming: HealthIngestPreferences) {
@@ -302,8 +323,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             refreshObservers()
             return
         }
+        let queue: HealthIngestQueue
         do {
-            _ = try prepare()
+            queue = try prepare()
         } catch {
             stateLock.lock()
             lastError = "Could not open the on-device queue."
@@ -322,6 +344,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             await self?.run()
         }
         started = true
+        Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            let depth = await queue.depth()
+            let priorityDepth = await queue.priorityDepth()
+            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+        }
     }
 
     private func stop() {
@@ -363,6 +391,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         lastError = persisted.lastError
         diabetesResume = disk.loadDiabetesResume()
         stateLock.unlock()
+        restoreBackfillProgress()
         return queue
     }
 
@@ -738,8 +767,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
 
     private func storeBackfillRunning(_ running: Bool) {
         stateLock.lock()
-        backfillRunning = running
+        let startQueued = backfillSince != nil
+        let hadWindow = backfillWindowStart != nil
+        backfillRunning = running || startQueued
         stateLock.unlock()
+        if running {
+            saveActiveBackfill()
+        } else if !startQueued, hadWindow {
+            clearActiveBackfill()
+        }
     }
 
     private func lockedSuccess() -> Date? {
@@ -755,11 +791,103 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     }
 
     /// Server-accepted rows for the pass that is running now. Queued and duplicate rows are not included.
+    /// The count is written at most every 30 seconds; the end of the pass flushes it as well.
     private func noteBackfillRows(_ count: Int) {
         guard count > 0 else { return }
         stateLock.lock()
-        if backfillRunning { backfillRowsSent += count }
+        var save = false
+        if backfillRunning {
+            backfillRowsSent += count
+            let now = Date()
+            if backfillProgressSavedAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true {
+                backfillProgressSavedAt = now
+                save = true
+            }
+        }
         stateLock.unlock()
+        if save { saveActiveBackfill() }
+    }
+
+    private func restoreBackfillProgress() {
+        guard let health, let disk else { return }
+        let stored = disk.loadBackfillProgress()
+        let prefs = currentPreferences()
+        let resolved = HealthIngestBackfillRestore.resolve(
+            stored: stored,
+            pending: health.hasPendingBackfill(preferences: prefs),
+            earliestCursor: health.oldestPendingCursor(preferences: prefs),
+            now: Date()
+        )
+        stateLock.lock()
+        backfillChosenDays = resolved.chosenDays
+        backfillDayCount = resolved.active ? resolved.days : 0
+        backfillWindowStart = resolved.active ? resolved.windowStart : nil
+        backfillRowsSent = resolved.active ? resolved.rowsSent : 0
+        if resolved.active { backfillRunning = true }
+        stateLock.unlock()
+        let choice = resolved.chosenDays
+        Task { @MainActor [weak self] in
+            self?.backfillDayChoice = choice
+        }
+        let record = HealthIngestPersistedBackfill(
+            days: resolved.days,
+            windowStart: resolved.windowStart,
+            rowsSent: resolved.rowsSent,
+            chosenDays: resolved.chosenDays,
+            active: resolved.active
+        )
+        if (resolved.active || stored != nil), stored != record {
+            disk.saveBackfillProgress(record)
+        }
+    }
+
+    private func saveActiveBackfill() {
+        guard let disk else { return }
+        stateLock.lock()
+        let record = HealthIngestPersistedBackfill(
+            days: backfillDayCount,
+            windowStart: backfillWindowStart ?? Date(),
+            rowsSent: backfillRowsSent,
+            chosenDays: backfillChosenDays,
+            active: true
+        )
+        backfillProgressSavedAt = Date()
+        stateLock.unlock()
+        disk.saveBackfillProgress(record)
+    }
+
+    private func saveBackfillChoice() {
+        guard let disk else { return }
+        stateLock.lock()
+        let active = backfillWindowStart != nil && backfillRunning
+        let record = HealthIngestPersistedBackfill(
+            days: active ? backfillDayCount : 0,
+            windowStart: backfillWindowStart ?? Date(timeIntervalSince1970: 0),
+            rowsSent: active ? backfillRowsSent : 0,
+            chosenDays: backfillChosenDays,
+            active: active
+        )
+        stateLock.unlock()
+        disk.saveBackfillProgress(record)
+    }
+
+    private func clearActiveBackfill() {
+        guard let disk else { return }
+        stateLock.lock()
+        backfillDayCount = 0
+        backfillWindowStart = nil
+        backfillRowsSent = 0
+        let chosen = backfillChosenDays
+        stateLock.unlock()
+        disk.saveBackfillProgress(
+            HealthIngestPersistedBackfill(
+                days: 0,
+                windowStart: Date(timeIntervalSince1970: 0),
+                rowsSent: 0,
+                chosenDays: chosen,
+                active: false
+            )
+        )
     }
 
     private func backfillProgress(preferences: HealthIngestPreferences) -> HealthIngestBackfillProgress? {

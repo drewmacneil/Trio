@@ -73,6 +73,7 @@ struct HealthIngestScreenshotHost: View {
                     removeToken: {},
                     testConnection: {},
                     startBackfill: {},
+                    rememberBackfillDays: { _ in },
                     resetBackfill: {},
                     clearRejections: {},
                     background: appState.trioBackgroundColor(for: .light),
@@ -97,7 +98,7 @@ struct HealthIngestScreenshotHost: View {
             lastSuccess: fixture.lastSuccess.map { Date(timeIntervalSince1970: $0) },
             lastError: fixture.lastError,
             queueDepth: fixture.queueDepth,
-            priorityDepth: 0,
+            priorityDepth: fixture.priorityDepth,
             rejectedCount: fixture.rejectedCount,
             hasToken: fixture.hasToken,
             backfillRunning: fixture.backfillRunning,
@@ -147,7 +148,7 @@ private struct LightWindowStyle: UIViewControllerRepresentable {
     }
 }
 
-struct HealthIngestScreenshotFixture: Codable {
+struct HealthIngestScreenshotFixture: Decodable {
     var enabled = false
     var baseURL = ""
     var deviceID = "trio-iphone"
@@ -155,6 +156,8 @@ struct HealthIngestScreenshotFixture: Codable {
     var testResult: String?
     var backfillDays = 7
     var queueDepth = 0
+    /// Trio rows included in `queueDepth`. Health rows are the remainder.
+    var priorityDepth = 0
     var rejectedCount = 0
     var lastSuccess: TimeInterval?
     var lastError: String?
@@ -164,6 +167,49 @@ struct HealthIngestScreenshotFixture: Codable {
     var day = 1
     var phase = "Reading Health samples"
     var groups: [HealthIngestScreenshotReject] = []
+
+    private enum CodingKeys: String, CodingKey {
+        case enabled
+        case baseURL
+        case deviceID
+        case hasToken
+        case testResult
+        case backfillDays
+        case queueDepth
+        case priorityDepth
+        case rejectedCount
+        case lastSuccess
+        case lastError
+        case backfillRunning
+        case latestRejectReason
+        case rowsSent
+        case day
+        case phase
+        case groups
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        baseURL = try container.decodeIfPresent(String.self, forKey: .baseURL) ?? ""
+        deviceID = try container.decodeIfPresent(String.self, forKey: .deviceID) ?? "trio-iphone"
+        hasToken = try container.decodeIfPresent(Bool.self, forKey: .hasToken) ?? false
+        testResult = try container.decodeIfPresent(String.self, forKey: .testResult)
+        backfillDays = try container.decodeIfPresent(Int.self, forKey: .backfillDays) ?? 7
+        queueDepth = try container.decodeIfPresent(Int.self, forKey: .queueDepth) ?? 0
+        priorityDepth = try container.decodeIfPresent(Int.self, forKey: .priorityDepth) ?? 0
+        rejectedCount = try container.decodeIfPresent(Int.self, forKey: .rejectedCount) ?? 0
+        lastSuccess = try container.decodeIfPresent(TimeInterval.self, forKey: .lastSuccess)
+        lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
+        backfillRunning = try container.decodeIfPresent(Bool.self, forKey: .backfillRunning) ?? false
+        latestRejectReason = try container.decodeIfPresent(String.self, forKey: .latestRejectReason)
+        rowsSent = try container.decodeIfPresent(Int.self, forKey: .rowsSent) ?? 0
+        day = try container.decodeIfPresent(Int.self, forKey: .day) ?? 1
+        phase = try container.decodeIfPresent(String.self, forKey: .phase) ?? "Reading Health samples"
+        groups = try container.decodeIfPresent([HealthIngestScreenshotReject].self, forKey: .groups) ?? []
+    }
 }
 
 struct HealthIngestScreenshotReject: Codable {

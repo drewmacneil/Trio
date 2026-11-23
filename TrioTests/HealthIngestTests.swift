@@ -713,24 +713,46 @@ import Testing
     }
 
     @Test func rejectedReceiptsAreCappedSoTheQueueFileCannotGrowWithoutBound() async throws {
+        // Each rejection rewrites receipts.json. Rejecting one id past the cap,
+        // 2,050 times, rewrote a growing file thousands of times and took about
+        // three minutes. Seed a file that is already at the cap, then reject one
+        // new id through the queue so the oldest rejected receipt is dropped.
         let disk = try makeDisk()
-        let queue = HealthIngestQueue(disk: disk)
-        for index in 1 ... 2_050 {
+        let cap = HealthIngestQueue.rejectedReceiptCap
+        let oldest = makeRecord(id: "hrv-cap-1", type: HealthIngestType.hrv)
+        let seeded = (1 ... cap).map { index in
             let record = makeRecord(id: "hrv-cap-\(index)", type: HealthIngestType.hrv)
-            #expect(await queue.enqueue([record]).queued == 1)
-            let ack = HealthIngestAck(
-                type: record.type,
-                id: record.id,
-                status: .rejected,
-                reason: "payload.sdnnMs is required"
+            return HealthIngestReceipt(
+                key: "\(record.type)\n\(record.id)",
+                hash: HealthIngestCanonicalJSON.digest(record.payload),
+                state: .rejected,
+                at: Date(timeIntervalSince1970: TimeInterval(index))
             )
-            for _ in 1 ... 3 {
-                _ = await queue.resolve(batch: [record], acks: [ack], transportFailed: false)
-            }
         }
-        // After the cap, the oldest rejected receipt is evicted and that id can be queued again.
-        let first = makeRecord(id: "hrv-cap-1", type: HealthIngestType.hrv)
-        #expect(await queue.enqueue([first]).queued == 1)
+        disk.saveReceipts(seeded)
+
+        let queue = HealthIngestQueue(disk: disk)
+        #expect(await queue.enqueue([oldest]).queued == 0)
+
+        let extra = makeRecord(id: "hrv-cap-\(cap + 1)", type: HealthIngestType.hrv)
+        #expect(await queue.enqueue([extra]).queued == 1)
+        let ack = HealthIngestAck(
+            type: extra.type,
+            id: extra.id,
+            status: .rejected,
+            reason: "payload.sdnnMs is required"
+        )
+        for _ in 1 ... 3 {
+            _ = await queue.resolve(batch: [extra], acks: [ack], transportFailed: false)
+        }
+
+        let rejected = disk.loadReceipts().filter { $0.state == .rejected }
+        #expect(rejected.count == cap)
+        #expect(rejected.count <= HealthIngestQueue.receiptCap)
+        #expect(!rejected.contains { $0.key == "\(HealthIngestType.hrv)\nhrv-cap-1" })
+        #expect(rejected.contains { $0.key == "\(HealthIngestType.hrv)\nhrv-cap-\(cap + 1)" })
+        #expect(await queue.enqueue([oldest]).queued == 1)
+        #expect(await queue.enqueue([makeRecord(id: "hrv-cap-2", type: HealthIngestType.hrv)]).queued == 0)
     }
 
 

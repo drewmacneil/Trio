@@ -37,6 +37,12 @@ final class CriticalAlertAlarmScheduler {
     /// True only if AlarmKit is available (iOS 26+) AND the user authorized it.
     /// When false, callers should use the `CriticalAlertAudioPlayer` fallback.
     var isAuthorizedAndAvailable: Bool {
+        #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            if args.contains("-HealthIngestScreenshot") || args.contains("-HealthIngestEmbedded") {
+                return false
+            }
+        #endif
         guard #available(iOS 26, *) else { return false }
         #if canImport(AlarmKit)
             return AlarmManager.shared.authorizationState == .authorized
@@ -48,6 +54,12 @@ final class CriticalAlertAlarmScheduler {
     /// Request AlarmKit authorization if it hasn't been decided yet. No-op
     /// below iOS 26 or once already granted/denied.
     static func requestAuthorization() async {
+        #if DEBUG
+            let args = ProcessInfo.processInfo.arguments
+            if args.contains("-HealthIngestScreenshot") || args.contains("-HealthIngestEmbedded") {
+                return
+            }
+        #endif
         guard #available(iOS 26, *) else { return }
         #if canImport(AlarmKit)
             guard AlarmManager.shared.authorizationState == .notDetermined else { return }

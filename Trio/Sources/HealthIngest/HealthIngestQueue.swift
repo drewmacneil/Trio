@@ -566,14 +566,16 @@ actor HealthIngestQueue {
                     firstSeenChanged = true
                 }
             }
-            // One canonical serialization feeds both the size check and the hash.
+            // Payload size is the cap. The receipt hash is that same JSON, plus
+            // HealthKit source fields when they are present, so a mapping bump can
+            // resend an accepted id without changing the payload.
             let canonical = HealthIngestCanonicalJSON.string(record.payload)
             let payloadBytes = canonical.utf8.count
             if payloadBytes > HealthIngestWire.maxPayloadBytes {
                 oversized += 1
                 continue
             }
-            let hash = HealthIngestCanonicalJSON.digest(canonical: canonical)
+            let hash = HealthIngestCanonicalJSON.digest(canonical: record.receiptCanonical(payloadCanonical: canonical))
             let key = Self.key(record)
             let bytes = Self.estimatedBytes(record, payloadBytes: payloadBytes)
             let priorityLane = HealthIngestType.isPriorityLane(record.type)
@@ -635,7 +637,12 @@ actor HealthIngestQueue {
 
     /// Serialized size is only used to cap a batch, so a cheap estimate is enough.
     private static func estimatedBytes(_ record: HealthIngestRecord, payloadBytes: Int) -> Int {
-        payloadBytes + record.type.utf8.count + record.id.utf8.count + record.tz.utf8.count + 96
+        payloadBytes
+            + record.type.utf8.count
+            + record.id.utf8.count
+            + record.tz.utf8.count
+            + record.provenanceWireUTF8Count()
+            + 96
     }
 
     private func writeSpill(_ rows: [HealthIngestQueuedRecord], lane: Lane) {

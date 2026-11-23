@@ -96,6 +96,14 @@ Use generic wording in commits, pull requests, and skills. Keep fixture JSON and
 
 Before every push, read the full diff being pushed (`git diff`, `git diff --cached`, and `git log`/`git show` for the new commits). Confirm none of the items above appear, including in skill text and commit messages.
 
+## Health ingest
+
+The upload JSON contract is `HealthIngestWire` in `Trio/Sources/HealthIngest/HealthIngestWireFormat.swift`.
+
+HealthKit samples may send optional fields beside `payload`: `sourceName`, `sourceBundleIdentifier`, `deviceName`, `deviceModel`, and `deviceManufacturer`. They come from `HKSample.sourceRevision.source` and `HKSample.device`. Omit a missing device and omit any value that is empty, longer than 256 UTF-16 code units, or contains a Unicode control character. Do not trim or truncate. `payload.source` stays `healthkit`. Trio's own records, including Trio glucose, insulin, carbs, and loop cycles, do not send these fields. The uploader does not read HealthKit glucose.
+
+`HealthIngestWire.mappingVersion` is the switch that re-reads stored HealthKit history through the existing paged backfill (same page size, batch limits, and backlog pause). The local receipt hash includes the source fields, so an unchanged payload is still sent again with the same `(type, id)`.
+
 ## Sessions
 
 Start a new agent session for each piece of work. Do not carry assumptions from an earlier chat. If something required to work in this repo is missing here, verify it and update this skill in that same change.

@@ -427,12 +427,12 @@ final class HealthIngestHealthKitReader {
             distanceMeters: distance,
             avgHeartRate: heartRate
         ) else { return nil }
-        return HealthIngestRecord(
+        return record(
+            sample: workout,
             type: HealthIngestType.workout,
             id: workout.uuid.uuidString,
             start: workout.startDate,
             end: workout.endDate,
-            tz: HealthIngestTime.zoneIdentifier,
             payload: payload
         )
     }
@@ -460,12 +460,12 @@ final class HealthIngestHealthKitReader {
             start: sample.startDate,
             end: sample.endDate
         ) else { return nil }
-        return HealthIngestRecord(
+        return record(
+            sample: sample,
             type: recordType,
             id: sample.uuid.uuidString,
             start: sample.startDate,
             end: end,
-            tz: HealthIngestTime.zoneIdentifier,
             payload: payload
         )
     }
@@ -477,13 +477,41 @@ final class HealthIngestHealthKitReader {
             start: sample.startDate,
             end: sample.endDate
         ) else { return nil }
-        return HealthIngestRecord(
+        return record(
+            sample: sample,
             type: HealthIngestType.sleepStage,
             id: sample.uuid.uuidString,
             start: sample.startDate,
             end: end,
-            tz: HealthIngestTime.zoneIdentifier,
             payload: payload
+        )
+    }
+
+    /// Copies `HKSample.sourceRevision.source` and, when present, `HKDevice`.
+    /// Invalid strings are omitted later by `HealthIngestProvenance`; a missing device
+    /// leaves the device fields nil.
+    private static func record(
+        sample: HKSample,
+        type: String,
+        id: String,
+        start: Date,
+        end: Date?,
+        payload: HealthIngestJSON
+    ) -> HealthIngestRecord {
+        let source = sample.sourceRevision.source
+        let device = sample.device
+        return HealthIngestRecord(
+            type: type,
+            id: id,
+            start: start,
+            end: end,
+            tz: HealthIngestTime.zoneIdentifier,
+            payload: payload,
+            sourceName: source.name,
+            sourceBundleIdentifier: source.bundleIdentifier,
+            deviceName: device?.name,
+            deviceModel: device?.model,
+            deviceManufacturer: device?.manufacturer
         )
     }
 

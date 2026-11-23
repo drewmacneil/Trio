@@ -1,9 +1,11 @@
 ---
 name: trio-build
-description: Build, test, capture screenshots, and dispatch CI for Trio using the workspace and optional helper scripts.
+description: Build, test, capture screenshots, and dispatch CI for Trio using the workspace and optional helper scripts. For the fork branch model, upstream sync, the test gate before TestFlight, and public-repo hygiene, use trio-fork-workflow.
 ---
 
 # Trio build
+
+Branch model, upstream sync, the test gate before a TestFlight build, and public-repo hygiene are in `.cursor/skills/trio-fork-workflow/SKILL.md`.
 
 If the `TRIO_CI_SCRIPTS` environment variable is set, use the scripts in that directory instead of inventing `xcodebuild` or workflow-dispatch commands:
 

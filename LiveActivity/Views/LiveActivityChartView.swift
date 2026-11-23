@@ -28,8 +28,9 @@ struct LiveActivityChartView: View {
         let maxThreshhold: Decimal = isWatchOS ? 220 : 300
 
         // Determine scale, accounting for both glucose history and prediction values
-        let chartMin = additionalState.chart.min(by: { $0.value < $1.value })?.value ?? 39
-        let chartMax = additionalState.chart.max(by: { $0.value < $1.value })?.value ?? maxThreshhold
+        let history = additionalState.chartReadings()
+        let chartMin = history.map { Decimal($0.value) }.min() ?? 39
+        let chartMax = history.map { Decimal($0.value) }.max() ?? maxThreshhold
         let forecastMin = additionalState.minForecast.min().map { Decimal($0) } ?? chartMin
         let forecastMax = min(additionalState.maxForecast.max().map { Decimal($0) } ?? chartMax, maxThreshhold)
         let minValue = min(min(chartMin, forecastMin), 39)
@@ -250,15 +251,17 @@ struct LiveActivityChartView: View {
         let isMgdL = context.state.unit == "mg/dL"
 
         let threeHours = TimeInterval(10800)
-        let chartData = isWatchOS ? additionalState.chart
-            .filter { abs($0.date.timeIntervalSinceNow) < threeHours } : additionalState
-            .chart
+        let readings = additionalState.chartReadings()
+        let chartData = isWatchOS
+            ? readings.filter { abs($0.date.timeIntervalSinceNow) < threeHours }
+            : readings
 
-        return ForEach(chartData, id: \.self) { item in
-            let displayValue = isMgdL ? item.value : item.value.asMmolL
+        return ForEach(chartData, id: \.date) { item in
+            let mgdl = Decimal(item.value)
+            let displayValue = isMgdL ? mgdl : mgdl.asMmolL
 
             let pointMarkColor = Color.getDynamicGlucoseColor(
-                glucoseValue: item.value,
+                glucoseValue: mgdl,
                 highGlucoseColorValue: !hasStaticColorScheme ? hardCodedHigh : context.state.highGlucose,
                 lowGlucoseColorValue: !hasStaticColorScheme ? hardCodedLow : context.state.lowGlucose,
                 targetGlucose: context.state.target,

@@ -228,8 +228,8 @@ struct HealthIngestSettingsForm: View {
             }
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
             labeledRow("Waiting to upload", status.queueDepth.formatted())
-            labeledRow("Trio data", status.priorityDepth.formatted())
-            labeledRow("Health data", status.healthDepth.formatted())
+            queuePartRow("Trio data", status.priorityDepth.formatted())
+            queuePartRow("Health data", status.healthDepth.formatted())
             Text("Trio data uploads first.")
                 .font(.footnote)
                 .foregroundColor(.secondary)
@@ -394,6 +394,18 @@ struct HealthIngestSettingsForm: View {
             Spacer()
             Text(value).foregroundStyle(.secondary)
         }
+    }
+
+    /// A part of the waiting total. Indented and secondary so it reads under that row.
+    private func queuePartRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+        }
+        .font(.subheadline)
+        .foregroundStyle(.secondary)
+        .padding(.leading, 16)
     }
 
     private func connectionResult(_ text: String) -> some View {

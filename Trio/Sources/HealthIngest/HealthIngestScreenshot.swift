@@ -36,15 +36,41 @@ struct HealthIngestScreenshotHost: View {
     @State private var backfillDays: Int
     @State private var confirmReset: Bool
     private let loaded: HealthIngestScreenshotFixture
+    private let relaunched: HealthIngestStatus?
     @Environment(AppState.self) private var appState
 
     init() {
         let loaded = Self.loadFixture()
         self.loaded = loaded
+        let relaunched = HealthIngestScreenshot.mode.hasPrefix("relaunch") ? Self.relaunchStatus() : nil
+        self.relaunched = relaunched
         _baseURL = State(initialValue: loaded.baseURL)
         _deviceID = State(initialValue: loaded.deviceID)
-        _backfillDays = State(initialValue: loaded.backfillDays)
+        _backfillDays = State(initialValue: relaunched?.backfill?.days ?? loaded.backfillDays)
         _confirmReset = State(initialValue: HealthIngestScreenshot.mode == "reset")
+    }
+
+    /// On-disk cursors and a saved 90-day pass, then the same restore a relaunch publishes.
+    /// The reader is not loaded before that restore. `chosenDays` is the picker default, 7.
+    private static func relaunchStatus() -> HealthIngestStatus? {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-relaunch-shot", isDirectory: true)
+        guard let disk = try? HealthIngestDisk(directory: directory) else { return nil }
+        let now = Date()
+        disk.saveCursors([HealthIngestType.heartRate: now.addingTimeInterval(-68 * 24 * 3600)])
+        disk.saveBackfillProgress(
+            HealthIngestPersistedBackfill(
+                days: 90,
+                windowStart: now.addingTimeInterval(-90 * 24 * 3600),
+                rowsSent: 1_240,
+                chosenDays: 7,
+                active: true
+            )
+        )
+        var preferences = HealthIngestPreferences.initial
+        preferences.enabled = true
+        preferences.baseURL = "https://example.ts.net"
+        return HealthIngestUploader(relaunchFrom: disk, preferences: preferences).publishRelaunchStatus()
     }
 
     private var fixture: HealthIngestScreenshotFixture { loaded }
@@ -94,7 +120,18 @@ struct HealthIngestScreenshotHost: View {
     }
 
     private var status: HealthIngestStatus {
-        HealthIngestStatus(
+        if let relaunched {
+            var status = relaunched
+            status.queueDepth = fixture.queueDepth
+            status.priorityDepth = fixture.priorityDepth
+            status.hasToken = fixture.hasToken
+            status.lastSuccess = fixture.lastSuccess.map { Date(timeIntervalSince1970: $0) }
+            status.rejectedCount = fixture.rejectedCount
+            status.latestRejectReason = fixture.latestRejectReason
+            status.rejectGroups = groups
+            return status
+        }
+        return HealthIngestStatus(
             lastSuccess: fixture.lastSuccess.map { Date(timeIntervalSince1970: $0) },
             lastError: fixture.lastError,
             queueDepth: fixture.queueDepth,

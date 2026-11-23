@@ -774,6 +774,72 @@ import Testing
         #expect(recent.days == 3)
     }
 
+    @Test func relaunchWithSavedBackfillPublishesTheWindowBeforeCursorsLoad() throws {
+        let now = Date()
+        let start = now.addingTimeInterval(-90 * 24 * 3600)
+        let cursor = now.addingTimeInterval(-68 * 24 * 3600)
+        let status = try relaunchStatus(
+            stored: HealthIngestPersistedBackfill(
+                days: 90,
+                windowStart: start,
+                rowsSent: 1_240,
+                chosenDays: 7,
+                active: true
+            ),
+            cursor: cursor
+        )
+        let progress = try #require(status.backfill)
+        #expect(status.backfillRunning)
+        #expect(progress.days == 90)
+        #expect(progress.day == 23)
+        #expect(progress.rowsSent == 1_240)
+        #expect(progress.fraction > 0.2)
+        #expect(progress.fraction < 0.3)
+    }
+
+    @Test func relaunchWithoutSavedBackfillRecoversTheWindowFromCursors() throws {
+        let cursor = Date().addingTimeInterval(-68 * 24 * 3600)
+        let missing = try relaunchStatus(stored: nil, cursor: cursor)
+        try expectRecoveredNinetyDayWindow(missing)
+
+        let inactive = try relaunchStatus(
+            stored: HealthIngestPersistedBackfill(
+                days: 0,
+                windowStart: Date(timeIntervalSince1970: 0),
+                rowsSent: 0,
+                chosenDays: 7,
+                active: false
+            ),
+            cursor: cursor
+        )
+        try expectRecoveredNinetyDayWindow(inactive)
+    }
+
+    private func expectRecoveredNinetyDayWindow(_ status: HealthIngestStatus) throws {
+        let progress = try #require(status.backfill)
+        #expect(status.backfillRunning)
+        #expect(progress.days == 90)
+        // The cursor is 68 days before the test's clock. Recovery uses a slightly later
+        // "now", so the covered span is just under 22 days (day 22) or exactly 22 (day 23).
+        #expect(progress.day == 22 || progress.day == 23)
+        #expect(progress.fraction > 0.2)
+        #expect(progress.fraction < 0.3)
+    }
+
+    /// Fresh uploader and reader over on-disk cursors. The reader is not loaded first.
+    private func relaunchStatus(stored: HealthIngestPersistedBackfill?, cursor: Date) throws -> HealthIngestStatus {
+        let disk = try makeDisk()
+        if let stored {
+            disk.saveBackfillProgress(stored)
+        }
+        disk.saveCursors([HealthIngestType.heartRate: cursor])
+        var preferences = HealthIngestPreferences.initial
+        preferences.enabled = true
+        preferences.baseURL = "https://example.ts.net"
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: preferences)
+        return uploader.publishRelaunchStatus()
+    }
+
     @Test func freshBackfillReadsAsDayOneUntilTheCursorMoves() {
         let start = Date(timeIntervalSince1970: 1_700_000_000)
         let untouched = HealthIngestBackfillProgress.frontier(start: start, cursor: nil, resume: nil)

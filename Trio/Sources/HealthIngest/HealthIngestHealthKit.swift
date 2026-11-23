@@ -114,6 +114,7 @@ final class HealthIngestHealthKitReader {
     }
 
     func hasPendingBackfill(preferences: HealthIngestPreferences) -> Bool {
+        loadIfNeeded()
         lock.lock()
         defer { lock.unlock() }
         return Self.readTypes().contains { preferences.isOn($0.category) && cursors[$0.recordType] != nil }
@@ -313,6 +314,7 @@ final class HealthIngestHealthKitReader {
     }
 
     func oldestPendingCursor(preferences: HealthIngestPreferences) -> Date? {
+        loadIfNeeded()
         lock.lock()
         defer { lock.unlock() }
         let dates = Self.readTypes().compactMap { kind -> Date? in

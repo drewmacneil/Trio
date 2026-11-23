@@ -230,9 +230,6 @@ struct HealthIngestSettingsForm: View {
             labeledRow("Waiting to upload", status.queueDepth.formatted())
             queuePartRow("Trio data", status.priorityDepth.formatted())
             queuePartRow("Health data", status.healthDepth.formatted())
-            Text("Trio data uploads first.")
-                .font(.footnote)
-                .foregroundColor(.secondary)
             NavigationLink {
                 HealthIngestRejectedView(groups: status.rejectGroups, onClear: clearRejections)
             } label: {
@@ -253,6 +250,8 @@ struct HealthIngestSettingsForm: View {
             }
         } header: {
             Text("Status")
+        } footer: {
+            Text("Trio data uploads first.")
         }
         .listRowBackground(Color.chart)
     }

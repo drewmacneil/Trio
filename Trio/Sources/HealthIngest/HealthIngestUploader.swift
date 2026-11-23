@@ -97,6 +97,33 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
     }
 
+    /// A relaunch over an existing directory. The reader is created and not loaded;
+    /// the status is the one `prepare()` publishes. Tests use this to catch a restore
+    /// that reads cursors before they are loaded from disk.
+    init(relaunchFrom disk: HealthIngestDisk, preferences: HealthIngestPreferences) {
+        container = Assembler().resolver
+        let defaults = UserDefaults(suiteName: "health-ingest-relaunch-\(UUID().uuidString)") ?? .standard
+        settingsStore = HealthIngestSettingsStore(
+            defaults: defaults,
+            keychain: BaseKeychain(serviceName: "trio.health-ingest.relaunch.\(UUID().uuidString)", synchronizable: false)
+        )
+        storedPreferences = preferences
+        self.preferences = preferences
+        self.disk = disk
+        health = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk)
+    }
+
+    /// Restores backfill progress the way a launch does, then returns the status snapshot
+    /// that launch publishes. The reader must still be unloaded.
+    func publishRelaunchStatus() -> HealthIngestStatus {
+        restoreBackfillProgress()
+        let snapshot = makeSnapshot(depth: 0, priorityDepth: 0)
+        Task { @MainActor [weak self] in
+            self?.status = snapshot
+        }
+        return snapshot
+    }
+
     @MainActor func setEnabled(_ enabled: Bool, baseURL: String, deviceID: String) {
         var prefs = currentPreferences()
         prefs.enabled = enabled
@@ -772,6 +799,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         backfillRunning = running || startQueued
         stateLock.unlock()
         if running {
+            recoverMissingBackfillWindow()
             saveActiveBackfill()
         } else if !startQueued, hadWindow {
             clearActiveBackfill()
@@ -890,7 +918,36 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         )
     }
 
+    /// A pass can be marked running before `backfill(days:)` writes a window: cursors were
+    /// restored, or a diabetes catch-up called `beginBackfill`. The earliest cursor is the
+    /// same window `HealthIngestBackfillRestore` uses, not the picker's default of 7 days.
+    private func recoverMissingBackfillWindow() {
+        stateLock.lock()
+        let running = backfillRunning
+        let missing = backfillDayCount == 0 || backfillWindowStart == nil
+        stateLock.unlock()
+        guard running, missing, let health else { return }
+        let cursor = health.oldestPendingCursor(preferences: currentPreferences())
+        guard let cursor else { return }
+        let recovered = HealthIngestBackfillProgress.recover(earliestCursor: cursor, now: Date())
+        stateLock.lock()
+        let stillMissing = backfillDayCount == 0 || backfillWindowStart == nil
+        if stillMissing {
+            backfillDayCount = recovered.days
+            backfillWindowStart = recovered.windowStart
+            backfillChosenDays = recovered.days
+        }
+        stateLock.unlock()
+        guard stillMissing else { return }
+        saveActiveBackfill()
+        let choice = recovered.days
+        Task { @MainActor [weak self] in
+            self?.backfillDayChoice = choice
+        }
+    }
+
     private func backfillProgress(preferences: HealthIngestPreferences) -> HealthIngestBackfillProgress? {
+        recoverMissingBackfillWindow()
         stateLock.lock()
         let running = backfillRunning
         let days = backfillDayCount
@@ -911,10 +968,17 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     }
 
     private func publishSnapshot(depth: Int, priorityDepth: Int) {
+        let snapshot = makeSnapshot(depth: depth, priorityDepth: priorityDepth)
+        Task { @MainActor [weak self] in
+            self?.status = snapshot
+        }
+    }
+
+    private func makeSnapshot(depth: Int, priorityDepth: Int) -> HealthIngestStatus {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
-        let snapshot = HealthIngestStatus(
+        return HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
             queueDepth: depth,
@@ -926,9 +990,6 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             rejectGroups: log.groups(),
             backfill: running ? backfillProgress(preferences: prefs) : nil
         )
-        Task { @MainActor [weak self] in
-            self?.status = snapshot
-        }
     }
 
     private func lockedBackfillRunning() -> Bool {

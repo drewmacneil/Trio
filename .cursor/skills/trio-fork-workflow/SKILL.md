@@ -25,6 +25,13 @@ When a `dev` sync conflicts, resolve it in a pull request. Do not retry the fail
 3. When the resolution is clear, prefer upstream structure and keep fork-only steps and features. A conflict on a value the fork deliberately set is not a clear "take upstream" case. That includes the toolchain or Xcode version, the runner label, and fork-only steps or settings. Keep the fork's value when it is known to work. Adopt upstream's value only when there is a clear reason, such as upstream code that requires it. If unsure, flag it to the repository owner. Do not switch it silently.
 
    Merge `38d943997` ("Merge upstream nightscout/Trio dev into the fork", November 2026) is the structural precedent and the toolchain counterexample. Keep the fork's pre-archive test step in `build_trio.yml`, and take upstream's synchronized Xcode project so fork sources stay members of the Trio and TrioTests folders. In that sync the Xcode path was switched from the fork's working 27.2 (`/Applications/Xcode_27.2.app`) to upstream's 27.0 (`/Applications/Xcode_27.0.app`). That path should have been kept, or flagged to the owner. The failed sync just before that merge conflicted in `.github/workflows/build_trio.yml` and `Trio.xcodeproj/project.pbxproj`.
+
+   The Build Trio runner split is fork-pinned and must be kept through upstream syncs, the same way as the toolchain and other fork-only settings above. Hosted `xcode-27` runners are scarce. Only the archive job may use that label:
+
+   - In `.github/workflows/build_trio.yml`, `build` (Build) stays on `xcode-27` and keeps its current Xcode selection (`/Applications/Xcode_27.0.app`). Do not change that runner or that selection unless the owner asks.
+   - `check_status` (Check status) and `cancel_when_no_build` (Cancel run when there is nothing to build) in `build_trio.yml`, and `validate-access-token` (Access) in `.github/workflows/validate_secrets.yml`, stay on `ubuntu-26.04`. They do not need macOS or Xcode.
+   - `validate-fastlane-secrets` (Fastlane) in `validate_secrets.yml`, and `create_certs` (Certificates) and `nuke_certs` (Nuke certificates) in `.github/workflows/create_certs.yml`, stay on `macos-26`. They need macOS for Fastlane Match, the keychain, and `sntp`. They do not select an Xcode. The stock toolchain on `macos-26` is enough.
+   - Upstream commit `c4da92f55` moved this whole macOS set onto `xcode-27`. On the next sync, keep this split. Do not put Fastlane validation, certificates, or nuke certificates back on `xcode-27`.
 4. Stop and ask when the choice is genuinely ambiguous: two fork-only behaviors collide, a deliberate fork value (toolchain, runner label, or fork-only setting) is in conflict and it is unclear whether to keep it, or it is unclear which fork behavior must survive. Do not guess.
 5. Run the full local test gate below.
 6. Scan the diff (see hygiene), push, and open a pull request into `dev`.
@@ -42,7 +49,7 @@ On this worker `TRIO_CI_SCRIPTS` is `/Users/Shared/trio-ci-scripts`. Run it from
 
 Plan on about 25–30 minutes. One full run on this machine, with no filter, finished in about 27 minutes (1172 tests, `TEST SUCCEEDED`). The script prints a short summary and the log path, restores every tracked `Package.resolved`, and does not need its output piped through `head` or `tail`.
 
-This machine's selected Xcode is 26.3 (`/Applications/Xcode-26.3.0.app`). Build Trio on CI runs on the `xcode-27` runner and selects `/Applications/Xcode_27.0.app`. A green local run does not prove the CI compile. The workflow's own pre-archive step tests only `TrioTests/HealthIngestTests` and `TrioTests/LiveActivityChartTests`. That step does not replace the local full gate.
+This machine's selected Xcode is 26.3 (`/Applications/Xcode-26.3.0.app`). Build Trio's archive job on CI runs on the `xcode-27` runner and selects `/Applications/Xcode_27.0.app`. The other jobs in that workflow, and in the reusable workflows it calls, use `ubuntu-26.04` or `macos-26` and do not select an Xcode. That runner split is fork-pinned; see Upstream-sync conflicts. A green local run does not prove the CI compile. The workflow's own pre-archive step tests only `TrioTests/HealthIngestTests` and `TrioTests/LiveActivityChartTests`. That step does not replace the local full gate.
 
 ## Pull requests
 

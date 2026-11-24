@@ -225,6 +225,10 @@ struct HealthIngestSettingsForm: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
+            } else if let phase = status.trioHistoryPhase {
+                Text(phase)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
             }
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
             labeledRow("Waiting to upload", status.queueDepth.formatted())

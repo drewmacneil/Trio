@@ -610,8 +610,181 @@ import Testing
         #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
         #expect(disk.loadCursors()["heart_rate"] == cursor)
         #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        let resume = try #require(disk.loadHistoricalResume())
+        let age = Date().timeIntervalSince(resume)
+        #expect(age > 89 * 24 * 3600)
+        #expect(age < 91 * 24 * 3600)
+        #expect(disk.loadBackfillProgress()?.active != true)
+        let snapshot = uploader.currentSnapshot()
+        #expect(!snapshot.backfillRunning)
+        #expect(snapshot.backfill == nil)
+        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        #expect(snapshot.trioHistoryPhase?.contains("Health") != true)
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
             HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+    }
+
+    @Test func coreDataRewindReadsLiveRowsBeforeTheHistoricalChunk() async throws {
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([1, 2, 3, 4])
+        disk.saveMappingVersion(6)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await uploader.applyMappingUpgradeIfNeeded()
+        let upgradedAt = Date()
+        let now = upgradedAt.addingTimeInterval(30)
+        let live = makeRecord(id: "loop-live", type: HealthIngestType.loopCycle, start: upgradedAt.addingTimeInterval(10))
+
+        let wider = HealthIngestDiabetesSchedule.liveSince(
+            now: now,
+            lastLiveSuccess: now.addingTimeInterval(-3 * 24 * 3600)
+        )
+        #expect(wider <= now.addingTimeInterval(-3 * 24 * 3600))
+        #expect(wider < now.addingTimeInterval(-36 * 3600))
+        #expect(wider > now.addingTimeInterval(-90 * 24 * 3600))
+        let bounded = HealthIngestDiabetesSchedule.liveSince(
+            now: now,
+            lastLiveSuccess: now.addingTimeInterval(-200 * 24 * 3600)
+        )
+        #expect(abs(bounded.timeIntervalSince(now.addingTimeInterval(-90 * 24 * 3600))) < 1)
+
+        final class Seen: @unchecked Sendable {
+            var reads: [HealthIngestDiabetesSchedule.Read] = []
+            var batches: [[String]] = []
+            var healthKitStarts: [Date] = []
+        }
+        let seen = Seen()
+        _ = await uploader.runScheduledDiabetesPass(
+            now: now,
+            chunk: 2 * 24 * 3600,
+            read: { spec in
+                seen.reads.append(spec)
+                let covers = spec.since <= live.start && (spec.until == nil || live.start < spec.until!)
+                return (covers ? [live] : [], [])
+            },
+            onHealthKitBackfill: { since in
+                seen.healthKitStarts.append(since)
+            },
+            enqueue: { records in
+                seen.batches.append(records.map(\.id))
+            }
+        )
+
+        #expect(seen.healthKitStarts.isEmpty)
+        #expect(seen.reads.count == 2)
+        #expect(seen.reads[0].role == .live)
+        #expect(seen.reads[0].since <= live.start)
+        #expect(seen.reads[0].until == nil)
+        #expect(seen.reads[1].role == .historical)
+        #expect(seen.reads[1].since < upgradedAt.addingTimeInterval(-80 * 24 * 3600))
+        #expect(seen.batches.first == ["loop-live"])
+        #expect(seen.batches.dropFirst().allSatisfy { !$0.contains("loop-live") })
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        #expect(disk.loadBackfillProgress()?.active != true)
+        #expect(disk.loadHistoricalResume() != nil)
+        let snapshot = uploader.currentSnapshot()
+        #expect(!snapshot.backfillRunning)
+        #expect(snapshot.backfill == nil)
+        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+    }
+
+    @Test func coreDataRewindSurvivesAKillBeforeTheMappingVersionIsSaved() async throws {
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([9, 9, 9])
+        disk.saveMappingVersion(6)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        uploader.stopAfterPersistingCoreDataRewind = true
+        await uploader.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == 6)
+        let resume = try #require(disk.loadHistoricalResume())
+        let age = Date().timeIntervalSince(resume)
+        #expect(age > 89 * 24 * 3600)
+        #expect(age < 91 * 24 * 3600)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        #expect(disk.loadBackfillProgress()?.active != true)
+
+        let restarted = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await restarted.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+        let kept = try #require(disk.loadHistoricalResume())
+        #expect(abs(kept.timeIntervalSince(resume)) < 0.001)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        #expect(disk.loadBackfillProgress()?.active != true)
+        let snapshot = restarted.currentSnapshot()
+        #expect(!snapshot.backfillRunning)
+        #expect(snapshot.backfill == nil)
+        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+    }
+
+    @Test func coreDataRewindCompletesAndClears() async throws {
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = now.addingTimeInterval(-90 * 24 * 3600)
+        disk.saveHistoricalResume(start)
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        #expect(uploader.currentSnapshot().trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        let chunk: TimeInterval = 2 * 24 * 3600
+        var passes = 0
+        let firstHistorical = HealthIngestDateBox()
+        while disk.loadHistoricalResume() != nil {
+            passes += 1
+            #expect(passes <= 50)
+            _ = await uploader.runScheduledDiabetesPass(
+                now: now,
+                chunk: chunk,
+                read: { spec in
+                    if spec.role == .historical, firstHistorical.date == nil {
+                        firstHistorical.date = spec.since
+                    }
+                    #expect(spec.role != .healthKitBackfill)
+                    return ([], [])
+                },
+                onHealthKitBackfill: { _ in
+                    Issue.record("A Core Data rewind must not start a HealthKit backfill")
+                },
+                enqueue: { _ in }
+            )
+        }
+        #expect(firstHistorical.date == start)
+        #expect(passes >= 45)
+        #expect(passes <= 46)
+        #expect(disk.loadHistoricalResume() == nil)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadBackfillProgress()?.active != true)
+        let done = uploader.currentSnapshot()
+        #expect(done.trioHistoryPhase == nil)
+        #expect(!done.backfillRunning)
+        #expect(done.backfill == nil)
+
+        _ = await uploader.runScheduledDiabetesPass(
+            now: now,
+            chunk: chunk,
+            read: { spec in
+                #expect(spec.role == .live)
+                return ([], [])
+            },
+            onHealthKitBackfill: { _ in
+                Issue.record("A finished rewind must not start a HealthKit backfill")
+            },
+            enqueue: { _ in }
+        )
+        #expect(disk.loadHistoricalResume() == nil)
     }
 
     @Test func mappingUpgradeFromBeforeSixResetsHealthKitCursors() async throws {
@@ -1675,11 +1848,15 @@ import Testing
         return try HealthIngestDisk(directory: directory)
     }
 
-    private func makeRecord(id: String, type: String) -> HealthIngestRecord {
+    private func makeRecord(
+        id: String,
+        type: String,
+        start: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    ) -> HealthIngestRecord {
         HealthIngestRecord(
             type: type,
             id: id,
-            start: Date(timeIntervalSince1970: 1_700_000_000),
+            start: start,
             end: nil,
             tz: "Etc/UTC",
             payload: .object([
@@ -1733,6 +1910,10 @@ import Testing
         let records = try #require(json["records"] as? [[String: Any]])
         return try #require(records.first?["payload"] as? [String: Any])
     }
+}
+
+private final class HealthIngestDateBox: @unchecked Sendable {
+    var date: Date?
 }
 
 private final class HealthIngestURLStub: URLProtocol {

@@ -328,6 +328,16 @@ final class HealthIngestDisk {
         save(date.map { ["resume": $0] } ?? [:], name: "diabetes-resume.json")
     }
 
+    /// Next Core Data read for a mapping rewind that does not reset HealthKit.
+    /// Kept apart from the HealthKit backfill window and from `diabetes-resume.json`.
+    func loadHistoricalResume() -> Date? {
+        load([String: Date].self, name: "historical-resume.json")?["resume"]
+    }
+
+    func saveHistoricalResume(_ date: Date?) {
+        save(date.map { ["resume": $0] } ?? [:], name: "historical-resume.json")
+    }
+
     func loadMappingVersion() -> Int {
         load(Int.self, name: "mapping-version.json") ?? 0
     }

@@ -349,15 +349,17 @@ struct HealthIngestDiabetesAdapter {
     static func mapGlucose(_ row: GlucoseStored, source: String) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let mgdl = Int(row.glucose)
-        let payload = HealthIngestJSON.object([
-            "mgdl": .number(Double(mgdl)),
-            "low": .bool(HealthIngestGlucose.isLow(mgdl: mgdl)),
-            "direction": row.direction.map { .string($0) },
-            "manual": row.isManual ? .bool(true) : nil,
-            "smoothedMgdl": row.smoothedGlucose.flatMap { value in
-                value.doubleValue == 0 ? nil : .decimal(value)
-            }
-        ])
+        let live = row.isManual ? nil : HealthIngestLiveCGM.annotation(at: start)
+        let payload = glucosePayload(
+            mgdl: mgdl,
+            direction: row.direction,
+            manual: row.isManual,
+            smoothedMgdl: row.smoothedGlucose.flatMap { value in
+                value.doubleValue == 0 ? nil : value.doubleValue
+            },
+            trendRate: live?.trendRate,
+            sensor: live?.sensor
+        )
         return record(
             type: HealthIngestType.glucose,
             id: HealthIngestIdentity.glucose(source: source, start: start),
@@ -365,6 +367,36 @@ struct HealthIngestDiabetesAdapter {
             end: nil,
             payload: payload
         )
+    }
+
+    /// `direction` stays so an older reader still sees the arrow. `trend` is the
+    /// same Nightscout word. `trendRate` is mg/dL/min and is omitted outside the
+    /// range the server accepts, so a wild rate cannot reject the glucose row.
+    static func glucosePayload(
+        mgdl: Int,
+        direction: String?,
+        manual: Bool,
+        smoothedMgdl: Double?,
+        trendRate: Double?,
+        sensor: String?
+    ) -> HealthIngestJSON {
+        let trend = HealthIngestLiveCGM.acceptedText(direction, max: 32)
+        let rate = trendRate.flatMap { value -> HealthIngestJSON? in
+            guard value.isFinite, value >= -30, value <= 30 else { return nil }
+            return .number(value)
+        }
+        return HealthIngestJSON.object([
+            "mgdl": .number(Double(mgdl)),
+            "low": .bool(HealthIngestGlucose.isLow(mgdl: mgdl)),
+            "direction": direction.map { .string($0) },
+            "trend": trend.map { .string($0) },
+            "trendRate": rate,
+            "manual": manual ? .bool(true) : nil,
+            "smoothedMgdl": smoothedMgdl.flatMap { value in
+                value == 0 ? nil : HealthIngestPayload.finiteNumber(value)
+            },
+            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) }
+        ])
     }
 
     static func mapPump(

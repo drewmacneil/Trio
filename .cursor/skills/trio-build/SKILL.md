@@ -22,4 +22,5 @@ If the `TRIO_CI_SCRIPTS` environment variable is set, use the scripts in that di
 - Fresh captures only. Do not overwrite an existing PNG, and do not copy an old screenshot to a new name.
 - Keep fixture JSON out of the repository.
 - Do not leave `Package.resolved` dirty. The helper scripts restore it after a build or test.
+- A fresh git worktree does not check out submodules. Run `git submodule update --init --recursive` in that worktree before `build-test.sh`. The workspace package `RoundWhiteDiscKit` is one of those checkouts.
 - If a permission or critical-alert dialog covers the screen in screenshot mode, fix it with a DEBUG-only guard in the app's screenshot host. Do not drive the simulator with HID or other UI automation to dismiss the dialog.

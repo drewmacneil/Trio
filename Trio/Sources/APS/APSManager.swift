@@ -6,6 +6,14 @@ import LoopKitUI
 import SwiftDate
 import Swinject
 
+/// Units the automatic SMB path passes to the pump.
+/// Dev uses `nearestDouble` and does not floor to the pump's bolus increment here.
+enum HealthIngestAutomaticBolus {
+    static func units(_ smbToDeliver: NSDecimalNumber) -> Double {
+        smbToDeliver.decimalValue.nearestDouble
+    }
+}
+
 protocol APSManager {
     func heartbeat(date: Date)
     /// Mark the next loop attempt as user-initiated (e.g. force-loop button).
@@ -721,6 +729,7 @@ final class BaseAPSManager: APSManager, Injectable {
         }
 
         debug(.bolus, "Enacting bolus \(roundedAmount) U, \(isSMB ? "automatic" : "manual")")
+        // Metadata only. The file write is queued and this call does not throw.
         HealthIngestTherapy.rememberBolusLink(decisionId: decisionId, source: source, units: roundedAmount, at: Date())
         HealthIngestTherapy.beginBolusAttempt(units: roundedAmount, source: source, decisionId: decisionId)
 
@@ -913,33 +922,9 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     private func performBolus(pump: PumpManager, smbToDeliver: NSDecimalNumber) async throws {
-        let units = smbToDeliver.decimalValue.nearestDouble
-        let rounded = pump.roundToSupportedBolusVolume(units: units)
-        guard rounded > 0 else {
-            HealthIngestTherapy.storeFailure(
-                requestedUnits: units,
-                source: "automatic",
-                reason: "rounds_to_zero",
-                message: Self.invalidBolusAmountMessage,
-                decisionId: nil
-            )
-            return
-        }
-        HealthIngestTherapy.beginBolusAttempt(units: rounded, source: "automatic", decisionId: nil)
-        do {
-            try await pump.enactBolus(units: rounded, automatic: true, decisionId: nil)
-            bolusProgress.send(0)
-        } catch {
-            HealthIngestTherapy.endBolusAttempt()
-            HealthIngestTherapy.storeFailure(
-                requestedUnits: rounded,
-                source: "automatic",
-                reason: "pump_error",
-                message: error.localizedDescription,
-                decisionId: nil
-            )
-            throw error
-        }
+        // Same units dev sends. Do not round to the pump increment here: some pumps round a small SMB up.
+        try await pump.enactBolus(units: HealthIngestAutomaticBolus.units(smbToDeliver), automatic: true)
+        bolusProgress.send(0)
     }
 
     private func reportEnacted(wasEnacted: Bool) async {
@@ -1163,7 +1148,11 @@ private extension PumpManager {
         }
     }
 
-    func enactBolus(units: Double, automatic: Bool, decisionId: UUID? = nil) async throws {
+    func enactBolus(units: Double, automatic: Bool) async throws {
+        try await enactBolus(units: units, automatic: automatic, decisionId: nil)
+    }
+
+    func enactBolus(units: Double, automatic: Bool, decisionId: UUID?) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let automaticValue = automatic ? BolusActivationType.automatic : BolusActivationType.manualRecommendationAccepted
 

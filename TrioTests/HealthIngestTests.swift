@@ -1329,6 +1329,19 @@ import Testing
         #expect(await reloaded.depth() == 0)
     }
 
+    @Test func automaticSmbUnitsStayOnDevNearestDouble() {
+        let small = Decimal(string: "0.03")!
+        let smallUnits = HealthIngestAutomaticBolus.units(NSDecimalNumber(decimal: small))
+        #expect(smallUnits == small.nearestDouble)
+        #expect(smallUnits > 0)
+        #expect(smallUnits < 0.05)
+
+        let seven = Decimal(string: "0.07")!
+        let sevenUnits = HealthIngestAutomaticBolus.units(NSDecimalNumber(decimal: seven))
+        #expect(sevenUnits == 0.07)
+        #expect(sevenUnits == seven.nearestDouble)
+    }
+
     @Test func therapyRecordsMatchTheServerContract() throws {
         let at = Date(timeIntervalSince1970: 1_700_000_000)
         let decisionId = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!

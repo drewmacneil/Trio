@@ -8,11 +8,15 @@ enum HealthIngestTherapy {
     static let watchRecommendationLifetime: TimeInterval = 10 * 60
 
     private static let lock = NSLock()
+    /// Disk writes for bolus links. The dose path only appends in memory.
+    private static let fileQueue = DispatchQueue(label: "health-ingest.therapy.files", qos: .utility)
     private static var directoryOverride: URL?
     private static var loaded = false
     private static var pending: [HealthIngestRecord] = []
     private static var carbStamps: [String: CarbStamp] = [:]
     private static var bolusLinks: [BolusLink] = []
+    /// Links remembered on the dose path and not yet folded into `bolusLinks`.
+    private static var unsavedLinks: [BolusLink] = []
     private static var pumpNotes: [String: PumpNote] = [:]
     private static var pumpSnapshot: PumpSnapshot?
     private static var watchPending: WatchPending?
@@ -70,6 +74,7 @@ enum HealthIngestTherapy {
         pending = []
         carbStamps = [:]
         bolusLinks = []
+        unsavedLinks = []
         pumpNotes = [:]
         pumpSnapshot = nil
         watchPending = nil
@@ -383,28 +388,26 @@ enum HealthIngestTherapy {
 
     // MARK: - Links onto bolus rows
 
+    /// Records a link for a later bolus row. Returns before any file IO. Does not throw.
     static func rememberBolusLink(decisionId: UUID?, source: String, units: Double, at: Date) {
-        lock.lock()
-        loadLocked()
-        bolusLinks.append(
-            BolusLink(
-                decisionId: decisionId?.uuidString,
-                source: source,
-                units: units,
-                at: at,
-                eventId: nil
-            )
+        let link = BolusLink(
+            decisionId: decisionId?.uuidString,
+            source: source,
+            units: units,
+            at: at,
+            eventId: nil
         )
-        if bolusLinks.count > 200 {
-            bolusLinks.removeFirst(bolusLinks.count - 200)
-        }
-        saveLocked(bolusLinks, name: "bolus-links.json")
+        lock.lock()
+        unsavedLinks.append(link)
         lock.unlock()
+        fileQueue.async {
+            Self.persistBolusLinks()
+        }
     }
 
     static func claimBolusLink(eventId: String, units: Double, at: Date) {
         lock.lock()
-        loadLocked()
+        absorbUnsavedLinksLocked()
         guard !bolusLinks.contains(where: { $0.eventId == eventId }) else {
             lock.unlock()
             return
@@ -428,10 +431,28 @@ enum HealthIngestTherapy {
 
     static func bolusLink(eventId: String) -> (source: String, decisionId: String?)? {
         lock.lock()
-        loadLocked()
+        absorbUnsavedLinksLocked()
         let link = bolusLinks.first { $0.eventId == eventId }
         lock.unlock()
         return link.map { ($0.source, $0.decisionId) }
+    }
+
+    /// Folds dose-path links into the saved list. Caller holds `lock`.
+    private static func absorbUnsavedLinksLocked() {
+        loadLocked()
+        guard !unsavedLinks.isEmpty else { return }
+        bolusLinks.append(contentsOf: unsavedLinks)
+        unsavedLinks.removeAll()
+        if bolusLinks.count > 200 {
+            bolusLinks.removeFirst(bolusLinks.count - 200)
+        }
+    }
+
+    private static func persistBolusLinks() {
+        lock.lock()
+        absorbUnsavedLinksLocked()
+        saveLocked(bolusLinks, name: "bolus-links.json")
+        lock.unlock()
     }
 
     // MARK: - Carbs

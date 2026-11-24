@@ -317,6 +317,8 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         newItem.note = entry.note
         // Nightscout `_id` values are not UUIDs and are replaced.
         newItem.id = entry.id.flatMap(UUID.init(uuidString:)) ?? UUID()
+        let enteredAt = areFetchedFromRemote ? Date() : entry.createdAt
+        HealthIngestTherapy.noteCarbEntered(id: newItem.id, at: enteredAt)
         newItem.isFPU = false
         newItem.isUploadedToNS = areFetchedFromRemote ? true : false
         newItem.isUploadedToHealth = false
@@ -333,6 +335,7 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         newItem.date = entry.actualDate
         newItem.carbs = Double(truncating: NSDecimalNumber(decimal: entry.carbs))
         newItem.id = entry.id.flatMap(UUID.init(uuidString:))
+        HealthIngestTherapy.noteCarbEntered(id: newItem.id, at: entry.createdAt)
         newItem.fpuID = entry.fpuID.flatMap(UUID.init(uuidString:))
         newItem.isFPU = true
         newItem.isUploadedToNS = false
@@ -380,7 +383,10 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
                 context.delete(storedEntry)
             }
 
+            let previousID = storedEntry.id
             self.insertCarbEntry(entry, into: context, areFetchedFromRemote: false)
+            let newID = entry.id.flatMap(UUID.init(uuidString:))
+            HealthIngestTherapy.noteCarbEdited(previousID: previousID, newID: newID, at: Date())
             for carbEquivalent in carbEquivalents {
                 self.insertCarbEquivalent(carbEquivalent, into: context)
             }
@@ -395,6 +401,9 @@ final class BaseCarbsStorage: CarbsStorage, Injectable {
         let context = makeContext()
         context.name = "saveFPUToCoreDataAsBatchInsert"
 
+        for entry in entries {
+            HealthIngestTherapy.noteCarbEntered(id: entry.id.flatMap(UUID.init(uuidString:)), at: entry.createdAt)
+        }
         await context.perform {
             let commonFPUID = UUID(
                 uuidString: entries.first?.fpuID ?? UUID()

@@ -577,6 +577,10 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
                     return $0.dose?.unitsPerHour ?? 0 <= Double(settingsManager.pumpSettings.maxBasal)
                 }
                 debug(.pump, "Storing \(events.count) new pump events")
+                HealthIngestTherapy.notePumpSnapshot(
+                    reservoirUnits: pumpManager?.currentReservoir.map { NSDecimalNumber(decimal: $0).doubleValue },
+                    podActivatedAt: currentInsulinActivatedAt()
+                )
                 let purgedUploadedIds = try await pumpHistoryStorage.storePumpEvents(
                     events,
                     replacePendingEvents: replacePendingEvents
@@ -629,6 +633,17 @@ extension BaseDeviceDataManager: PumpManagerDelegate {
             return
         }
         promise(.success(true))
+    }
+
+    /// When the current pod or patch was activated. Tubed pumps have no insulin age.
+    private func currentInsulinActivatedAt() -> Date? {
+        if let medtrum = pumpManager as? MedtrumPumpManager {
+            return medtrum.state.patchActivatedAt
+        }
+        if let omni = pumpManager as? OmniPumpManager {
+            return omni.state.podState?.activatedAt
+        }
+        return pumpActivatedAtDate.value
     }
 
     func startDateToFilterNewPumpEvents(for _: PumpManager) -> Date {

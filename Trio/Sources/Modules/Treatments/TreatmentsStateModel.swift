@@ -111,6 +111,15 @@ extension Treatments {
 
         var id_: String = ""
         var summary: String = ""
+        /// True after this screen's meal row was stored, so a bolus decision can name it.
+        private var mealSavedForDecision = false
+        private var shownBolus: ShownBolus?
+
+        private struct ShownBolus {
+            var decisionId: UUID
+            var report: BolusCalculationReport
+            var closed: Bool
+        }
 
         var externalInsulin: Bool = false
         var showInfo: Bool = false
@@ -454,7 +463,7 @@ extension Treatments {
             // Check if this is a backdated entry by comparing with the default date using a tolerance
             let isBackdated = abs(date.timeIntervalSince(defaultDate)) > 1.0
 
-            let result = await bolusCalculationManager.handleBolusCalculation(
+            let report = await bolusCalculationManager.calculateBolus(
                 carbs: carbs,
                 useFattyMealCorrection: useFattyMealCorrectionFactor,
                 useSuperBolus: useSuperBolus,
@@ -463,12 +472,14 @@ extension Treatments {
                 simulatedCOB: simulatedCOB,
                 isBackdated: isBackdated
             )
+            let result = report.result
 
             // A superseded run must not overwrite the breakdown a newer run published.
             guard !Task.isCancelled else { return apsManager.roundBolus(amount: result.insulinCalculated) }
 
             // Update state properties with calculation results on main thread
             await MainActor.run {
+                guard self.isActive else { return }
                 targetDifference = result.targetDifference
                 targetDifferenceInsulin = result.targetDifferenceInsulin
                 wholeCob = result.wholeCob
@@ -478,9 +489,39 @@ extension Treatments {
                 wholeCalc = result.wholeCalc
                 factoredInsulin = result.factoredInsulin
                 fifteenMinInsulin = result.fifteenMinutesInsulin
+                if var shown = shownBolus, !shown.closed {
+                    shown.report = report
+                    shownBolus = shown
+                } else if shownBolus == nil {
+                    shownBolus = ShownBolus(decisionId: UUID(), report: report, closed: false)
+                }
             }
 
             return apsManager.roundBolus(amount: result.insulinCalculated)
+        }
+
+        /// Writes the bolus decision for the recommendation on screen. A second call does nothing.
+        func closeBolusRecommendation(enteredUnits: Decimal, external: Bool, skipped: Bool) {
+            guard var shown = shownBolus, !shown.closed else { return }
+            shown.closed = true
+            shownBolus = shown
+            let mealId = mealSavedForDecision && !id_.isEmpty ? id_ : nil
+            HealthIngestTherapy.storeDecision(
+                decisionId: shown.decisionId,
+                source: "phone",
+                report: shown.report,
+                fat: fat,
+                protein: protein,
+                enteredUnits: enteredUnits,
+                external: external,
+                skipped: skipped,
+                carbEntryId: mealId,
+                carbEntryEatenAt: mealId == nil ? nil : date
+            )
+        }
+
+        func abandonBolusRecommendation() {
+            closeBolusRecommendation(enteredUnits: 0, external: false, skipped: true)
         }
 
         // MARK: - Button tasks
@@ -502,6 +543,7 @@ extension Treatments {
                 if isInsulinGiven {
                     await handleInsulin(isExternal: externalInsulin)
                 } else {
+                    abandonBolusRecommendation()
                     hideModal()
                     return
                 }
@@ -625,6 +667,10 @@ extension Treatments {
             }
 
             let maxAmount = Double(min(amount, maxBolus))
+            let decisionId = await MainActor.run { shownBolus?.decisionId }
+            await MainActor.run {
+                self.closeBolusRecommendation(enteredUnits: Decimal(maxAmount), external: false, skipped: false)
+            }
 
             do {
                 let authenticated = try await unlockmanager.unlock()
@@ -634,10 +680,23 @@ extension Treatments {
                         self.isAwaitingDeterminationResult = true
                     }
                     info(.bolus, "Bolus of \(maxAmount) U requested")
-                    await apsManager.enactBolus(amount: maxAmount, isSMB: false, callback: nil)
+                    await apsManager.enactBolus(
+                        amount: maxAmount,
+                        isSMB: false,
+                        decisionId: decisionId,
+                        bolusSource: "phone",
+                        callback: nil
+                    )
                 }
             } catch {
                 warning(.bolus, "Authentication for bolus failed", error: error)
+                HealthIngestTherapy.storeFailure(
+                    requestedUnits: maxAmount,
+                    source: "phone",
+                    reason: HealthIngestTherapy.authenticationFailureReason(error),
+                    message: parseAuthenticationError(from: error),
+                    decisionId: decisionId
+                )
 
                 await MainActor.run {
                     self.isAwaitingDeterminationResult = false
@@ -658,6 +717,11 @@ extension Treatments {
             await MainActor.run {
                 self.amount = min(self.amount, self.maxBolus * 3)
             }
+            let loggedAmount = amount
+            let decisionId = await MainActor.run { shownBolus?.decisionId }
+            await MainActor.run {
+                self.closeBolusRecommendation(enteredUnits: loggedAmount, external: true, skipped: false)
+            }
 
             do {
                 let authenticated = try await unlockmanager.unlock()
@@ -666,14 +730,27 @@ extension Treatments {
                     await MainActor.run {
                         self.isAwaitingDeterminationResult = true
                     }
+                    HealthIngestTherapy.rememberBolusLink(
+                        decisionId: decisionId,
+                        source: "phone",
+                        units: NSDecimalNumber(decimal: loggedAmount).doubleValue,
+                        at: date
+                    )
                     // store external dose to pump history
-                    await pumpHistoryStorage.storeExternalInsulinEvent(amount: amount, timestamp: date)
-                    info(.bolus, "External insulin of \(amount) U logged")
+                    await pumpHistoryStorage.storeExternalInsulinEvent(amount: loggedAmount, timestamp: date)
+                    info(.bolus, "External insulin of \(loggedAmount) U logged")
                     // perform determine basal sync
                     try await apsManager.determineBasalSync()
                 }
             } catch {
                 warning(.bolus, "Authentication for external insulin failed", error: error)
+                HealthIngestTherapy.storeFailure(
+                    requestedUnits: NSDecimalNumber(decimal: loggedAmount).doubleValue,
+                    source: "phone",
+                    reason: HealthIngestTherapy.authenticationFailureReason(error),
+                    message: parseAuthenticationError(from: error),
+                    decisionId: decisionId
+                )
                 await MainActor.run {
                     self.isAwaitingDeterminationResult = false
                     self.showDeterminationFailureAlert = true
@@ -693,6 +770,7 @@ extension Treatments {
                     self.fat = min(self.fat, self.maxFat)
                     self.protein = min(self.protein, self.maxProtein)
                     self.id_ = UUID().uuidString
+                    self.mealSavedForDecision = false
                 }
 
                 let carbsToStore = [CarbsEntry(
@@ -708,6 +786,7 @@ extension Treatments {
                     fpuID: fat > 0 || protein > 0 ? UUID().uuidString : nil
                 )]
                 try await carbsStorage.storeCarbs(carbsToStore, areFetchedFromRemote: false)
+                await MainActor.run { self.mealSavedForDecision = true }
                 info(.treatments, "Meal saved: carbs \(carbs) g, fat \(fat) g, protein \(protein) g")
 
                 // only perform determine basal sync if the user doesn't use the pump bolus, otherwise the enact bolus func in the APSManger does a sync

@@ -14,6 +14,13 @@ protocol APSManager {
     /// they want feedback even if the underlying error is "transient".
     func markNextLoopUserInitiated()
     func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async
+    func enactBolus(
+        amount: Double,
+        isSMB: Bool,
+        decisionId: UUID?,
+        bolusSource: String?,
+        callback: ((Bool, String) -> Void)?
+    ) async
     var pumpManager: PumpManagerUI? { get set }
     var bluetoothManager: BluetoothStateManager? { get }
     var pumpDisplayState: CurrentValueSubject<PumpDisplayState?, Never> { get }
@@ -634,9 +641,33 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     func enactBolus(amount: Double, isSMB: Bool, callback: ((Bool, String) -> Void)?) async {
+        await enactBolus(
+            amount: amount,
+            isSMB: isSMB,
+            decisionId: nil,
+            bolusSource: isSMB ? "automatic" : "phone",
+            callback: callback
+        )
+    }
+
+    func enactBolus(
+        amount: Double,
+        isSMB: Bool,
+        decisionId: UUID?,
+        bolusSource: String?,
+        callback: ((Bool, String) -> Void)?
+    ) async {
+        let source = bolusSource ?? (isSMB ? "automatic" : "phone")
         // Answer every caller: a silent return here left the watch waiting on "Processing…" forever
         guard amount > 0 else {
             warning(.bolus, "Bolus of \(amount) U not enacted, amount must be above 0")
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: amount,
+                source: source,
+                reason: "other",
+                message: Self.invalidBolusAmountMessage,
+                decisionId: decisionId
+            )
             callback?(false, Self.invalidBolusAmountMessage)
             return
         }
@@ -644,6 +675,13 @@ final class BaseAPSManager: APSManager, Injectable {
         if let error = verifyStatus() {
             warning(.bolus, "Bolus of \(amount) U not enacted", error: error)
             processError(error)
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: amount,
+                source: source,
+                reason: "pump_error",
+                message: error.localizedDescription,
+                decisionId: decisionId
+            )
             // Capture broadcaster and queue before async context
             let broadcaster = self.broadcaster
             Task { @MainActor in
@@ -656,6 +694,13 @@ final class BaseAPSManager: APSManager, Injectable {
         }
 
         guard let pump = pumpManager else {
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: amount,
+                source: source,
+                reason: "pump_error",
+                message: String(localized: "Pump not set"),
+                decisionId: decisionId
+            )
             callback?(false, String(localized: "Error! Failed to enact bolus.", comment: "Error message for enacting a bolus"))
             return
         }
@@ -664,14 +709,23 @@ final class BaseAPSManager: APSManager, Injectable {
 
         guard roundedAmount > 0 else {
             warning(.bolus, "Bolus of \(amount) U not enacted, rounds to 0 U on this pump")
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: amount,
+                source: source,
+                reason: "rounds_to_zero",
+                message: Self.invalidBolusAmountMessage,
+                decisionId: decisionId
+            )
             callback?(false, Self.invalidBolusAmountMessage)
             return
         }
 
         debug(.bolus, "Enacting bolus \(roundedAmount) U, \(isSMB ? "automatic" : "manual")")
+        HealthIngestTherapy.rememberBolusLink(decisionId: decisionId, source: source, units: roundedAmount, at: Date())
+        HealthIngestTherapy.beginBolusAttempt(units: roundedAmount, source: source, decisionId: decisionId)
 
         do {
-            try await pump.enactBolus(units: roundedAmount, automatic: isSMB)
+            try await pump.enactBolus(units: roundedAmount, automatic: isSMB, decisionId: decisionId)
             info(.bolus, "Bolus enacted: \(roundedAmount) U, \(isSMB ? "automatic" : "manual")")
             bolusProgress.send(0)
             callback?(true, String(localized: "Bolus enacted successfully.", comment: "Success message for enacting a bolus"))
@@ -683,6 +737,14 @@ final class BaseAPSManager: APSManager, Injectable {
                 }
             }
         } catch let bolusError {
+            HealthIngestTherapy.endBolusAttempt()
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: roundedAmount,
+                source: source,
+                reason: "pump_error",
+                message: bolusError.localizedDescription,
+                decisionId: decisionId
+            )
             error(.bolus, "Bolus of \(roundedAmount) U failed", error: bolusError)
             lastError.send(APSError.pumpError(bolusError))
             issueAlertForCategory(
@@ -717,6 +779,9 @@ final class BaseAPSManager: APSManager, Injectable {
         do {
             _ = try await pump.cancelBolus()
             info(.bolus, "Bolus cancelled")
+            HealthIngestTherapy.cancelInFlightBolus(
+                message: String(localized: "Bolus cancelled successfully.", comment: "Success message for canceling a bolus")
+            )
             callback?(true, String(localized: "Bolus cancelled successfully.", comment: "Success message for canceling a bolus"))
         } catch let cancelError {
             error(.bolus, "Bolus cancellation failed", error: cancelError)
@@ -848,8 +913,33 @@ final class BaseAPSManager: APSManager, Injectable {
     }
 
     private func performBolus(pump: PumpManager, smbToDeliver: NSDecimalNumber) async throws {
-        try await pump.enactBolus(units: smbToDeliver.decimalValue.nearestDouble, automatic: true)
-        bolusProgress.send(0)
+        let units = smbToDeliver.decimalValue.nearestDouble
+        let rounded = pump.roundToSupportedBolusVolume(units: units)
+        guard rounded > 0 else {
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: units,
+                source: "automatic",
+                reason: "rounds_to_zero",
+                message: Self.invalidBolusAmountMessage,
+                decisionId: nil
+            )
+            return
+        }
+        HealthIngestTherapy.beginBolusAttempt(units: rounded, source: "automatic", decisionId: nil)
+        do {
+            try await pump.enactBolus(units: rounded, automatic: true, decisionId: nil)
+            bolusProgress.send(0)
+        } catch {
+            HealthIngestTherapy.endBolusAttempt()
+            HealthIngestTherapy.storeFailure(
+                requestedUnits: rounded,
+                source: "automatic",
+                reason: "pump_error",
+                message: error.localizedDescription,
+                decisionId: nil
+            )
+            throw error
+        }
     }
 
     private func reportEnacted(wasEnacted: Bool) async {
@@ -1073,11 +1163,11 @@ private extension PumpManager {
         }
     }
 
-    func enactBolus(units: Double, automatic: Bool) async throws {
+    func enactBolus(units: Double, automatic: Bool, decisionId: UUID? = nil) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let automaticValue = automatic ? BolusActivationType.automatic : BolusActivationType.manualRecommendationAccepted
 
-            self.enactBolus(decisionId: nil, units: units, activationType: automaticValue) { error in
+            self.enactBolus(decisionId: decisionId, units: units, activationType: automaticValue) { error in
                 if let error = error {
                     debug(.pump, "Bolus command failed: \(units) U")
                     continuation.resume(throwing: error)
@@ -1136,6 +1226,7 @@ extension BaseAPSManager: DoseProgressObserver {
     func doseProgressReporterDidUpdate(_ doseProgressReporter: DoseProgressReporter) {
         bolusProgress.send(Decimal(doseProgressReporter.progress.percentComplete))
         if doseProgressReporter.progress.isComplete {
+            HealthIngestTherapy.endBolusAttempt()
             clearBolusReporter()
         }
     }

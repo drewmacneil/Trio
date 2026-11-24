@@ -384,16 +384,26 @@ struct HealthIngestDiabetesAdapter {
             return mapTempBasal(event, sourceID: sourceID, start: start)
         }
         guard includeEvents else { return nil }
-        let payload = HealthIngestJSON.object([
+        var fields: [String: HealthIngestJSON?] = [
             "event": .string(type),
             "note": event.note.flatMap { $0.isEmpty ? nil : .string($0) }
-        ])
+        ]
+        for (key, value) in HealthIngestTherapy.pumpExtras(eventId: sourceID, eventType: type, note: event.note) {
+            fields[key] = value
+        }
+        let payload = HealthIngestJSON.object(fields)
         return record(type: HealthIngestType.pumpEvent, id: sourceID, start: start, end: nil, payload: payload)
     }
 
     private static func mapBolus(_ event: PumpEventStored, sourceID: String, start: Date) -> HealthIngestRecord {
         let bolus = event.bolus
         let smb = bolus?.isSMB ?? false
+        let link = HealthIngestTherapy.bolusLink(eventId: sourceID)
+        let bolusSource = link?.source ?? ((bolus?.isSMB == true) ? "automatic" : nil)
+        let decisionJSON: HealthIngestJSON? = {
+            guard let id = link?.decisionId, !id.isEmpty else { return nil }
+            return .string(id)
+        }()
         let payload = HealthIngestJSON.object([
             "units": .decimal(bolus?.amount),
             "programmedUnits": .decimal(bolus?.programmedAmount),
@@ -402,7 +412,9 @@ struct HealthIngestDiabetesAdapter {
             "isMutable": .bool(event.isMutable),
             "peakTime": Self.finiteNumber(event.peakTime),
             "actionDuration": Self.finiteNumber(event.actionDuration),
-            "insulinType": event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
+            "insulinType": event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) },
+            "bolusSource": bolusSource.map { .string($0) },
+            "decisionId": decisionJSON
         ])
         return record(
             type: smb ? HealthIngestType.smb : HealthIngestType.bolus,
@@ -446,13 +458,16 @@ struct HealthIngestDiabetesAdapter {
         let note: HealthIngestJSON? = row.note.flatMap { note in note.isEmpty ? nil : .string(note) }
         let fpu: HealthIngestJSON? = row.isFPU ? .bool(true) : nil
         let fpuID: HealthIngestJSON? = row.fpuID.map { .string($0.uuidString) }
+        let times = row.id.map { HealthIngestTherapy.carbTimes(id: $0.uuidString) }
         let payload = HealthIngestJSON.object([
             "grams": .number(row.carbs),
             "fatGrams": fat,
             "proteinGrams": protein,
             "note": note,
             "isFPU": fpu,
-            "fpuID": fpuID
+            "fpuID": fpuID,
+            "enteredAt": times?.enteredAt.map { .string(HealthIngestTime.string(from: $0)) },
+            "editedAt": times?.editedAt.map { .string(HealthIngestTime.string(from: $0)) }
         ])
         return record(type: HealthIngestType.carbs, id: sourceID, start: start, end: nil, payload: payload)
     }
@@ -747,7 +762,7 @@ struct HealthIngestDiabetesAdapter {
         let ratio: HealthIngestJSON? = .decimal(row.sensitivityRatio)
         let reason: HealthIngestJSON = row.reason.map { .string($0) } ?? .null
         let zone = note?.timeZone ?? HealthIngestTime.zoneIdentifier
-        return .object([
+        var fields: [String: HealthIngestJSON?] = [
             "iob": iob,
             "cob": cob,
             "isf": isf,
@@ -763,7 +778,26 @@ struct HealthIngestDiabetesAdapter {
             "dynamicIsf": note?.dynamicIsf,
             "iobBreakdown": note?.iobBreakdown,
             "meal": note?.meal
-        ])
+        ]
+        let glucose = row.glucose?.doubleValue
+        let eventual = row.eventualBG?.doubleValue
+        // Suggested bolus is the stored `bolus` column (nested `units`). `insulinReq` is not that bolus.
+        let recommended = row.bolus?.doubleValue
+        let target = row.currentTarget?.doubleValue
+        let threshold = row.threshold?.doubleValue
+        let ratioUsed = row.carbRatio?.doubleValue
+        for (key, value) in HealthIngestTherapy.loopFields(
+            glucoseMgdl: glucose,
+            eventualBg: eventual,
+            recommendedBolus: recommended,
+            targetMgdl: target,
+            thresholdMgdl: threshold,
+            carbsRequired: Double(row.carbsRequired),
+            crUsed: ratioUsed
+        ) {
+            fields[key] = value
+        }
+        return .object(fields)
     }
 
     private static func addressed(type: String, prefix: String, payload: HealthIngestJSON) -> HealthIngestRecord {

@@ -55,9 +55,15 @@ enum HealthIngestCategory: String, CaseIterable, Identifiable, Codable {
         case .activity: return [HealthIngestType.activeEnergy, HealthIngestType.exerciseMinutes]
         case .adjustments: return [HealthIngestType.override, HealthIngestType.tempTarget]
         case .carbs: return [HealthIngestType.carbs]
-        case .glucose: return [HealthIngestType.glucose]
+        case .glucose: return [HealthIngestType.glucose, HealthIngestType.cgmEvent]
         case .heart: return [HealthIngestType.heartRate, HealthIngestType.hrv, HealthIngestType.restingHR]
-        case .insulin: return [HealthIngestType.bolus, HealthIngestType.smb, HealthIngestType.tempBasal]
+        case .insulin: return [
+                HealthIngestType.bolus,
+                HealthIngestType.bolusDecision,
+                HealthIngestType.bolusFailure,
+                HealthIngestType.smb,
+                HealthIngestType.tempBasal
+            ]
         case .loopCycles: return [
                 HealthIngestType.loopCycle,
                 HealthIngestType.loopStat,

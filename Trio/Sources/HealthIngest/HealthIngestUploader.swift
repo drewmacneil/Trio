@@ -557,6 +557,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                     extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
                 }
                 extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
+                extra.append(contentsOf: HealthIngestTherapy.drain(preferences: prefs))
                 if since.backfill {
                     health.beginBackfill(since: since.date, preferences: prefs)
                 }

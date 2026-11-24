@@ -777,7 +777,7 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                     }
 
                     // Get recommendation from BolusCalculationManager
-                    let result = await bolusCalculationManager.handleBolusCalculation(
+                    let report = await bolusCalculationManager.calculateBolus(
                         carbs: Decimal(carbs),
                         useFattyMealCorrection: false,
                         useSuperBolus: false,
@@ -786,6 +786,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                         simulatedCOB: nil,
                         isBackdated: false // we cannot backdate carbs via watch
                     )
+                    HealthIngestTherapy.stageWatch(report: report)
+                    let result = report.result
 
                     // Send recommendation back to watch
                     let recommendationMessage: [String: Any] = [
@@ -842,8 +844,14 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     /// Processes bolus requests received from the Watch
     /// - Parameter amount: The requested bolus amount in units
     private func handleBolusRequest(_ amount: Decimal) {
+        let decisionId = HealthIngestTherapy.takeWatch(enteredUnits: amount)
         Task {
-            await apsManager.enactBolus(amount: Double(amount), isSMB: false) { success, message in
+            await apsManager.enactBolus(
+                amount: Double(amount),
+                isSMB: false,
+                decisionId: decisionId,
+                bolusSource: "watch"
+            ) { success, message in
                 // Acknowledge success or error of bolus
                 self.sendAcknowledgment(
                     toWatch: success,
@@ -862,10 +870,10 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
     private func handleCarbsRequest(_ amount: Int, _ date: Date) {
         Task {
             let context = CoreDataStack.shared.newTaskContext()
-
+            let carbId = UUID()
             await context.perform {
                 let carbEntry = CarbEntryStored(context: context)
-                carbEntry.id = UUID()
+                carbEntry.id = carbId
                 carbEntry.carbs = Double(truncating: amount as NSNumber)
                 carbEntry.date = date
                 carbEntry.note = String(localized: "Via Watch", comment: "Note added to carb entry when entered via watch")
@@ -885,6 +893,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                         return
                     }
                     try context.save()
+                    HealthIngestTherapy.noteCarbEntered(id: carbId, at: Date())
+                    HealthIngestTherapy.noteWatchCarb(id: carbId, eatenAt: date)
                     debug(.treatments, "Saved \(amount) g carbs from watch")
 
                     // Acknowledge success
@@ -927,9 +937,10 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                 )
 
                 // Save carbs entry in Core Data
+                let carbId = UUID()
                 try await context.perform {
                     let carbEntry = CarbEntryStored(context: context)
-                    carbEntry.id = UUID()
+                    carbEntry.id = carbId
                     carbEntry.carbs = NSDecimalNumber(decimal: carbsAmount).doubleValue
                     carbEntry.date = date
                     carbEntry.note = String(localized: "Via Watch", comment: "Note added to carb entry when entered via watch")
@@ -948,6 +959,8 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
                         return
                     }
                     try context.save()
+                    HealthIngestTherapy.noteCarbEntered(id: carbId, at: Date())
+                    HealthIngestTherapy.noteWatchCarb(id: carbId, eatenAt: date)
                     debug(.treatments, "Saved \(carbsAmount) g carbs from watch")
                 }
 
@@ -963,7 +976,13 @@ final class BaseWatchManager: NSObject, WCSessionDelegate, Injectable, WatchMana
 
                 // Enact bolus via APS Manager
                 let bolusDouble = NSDecimalNumber(decimal: bolusAmount).doubleValue
-                await apsManager.enactBolus(amount: bolusDouble, isSMB: false) { success, message in
+                let decisionId = HealthIngestTherapy.takeWatch(enteredUnits: bolusAmount)
+                await apsManager.enactBolus(
+                    amount: bolusDouble,
+                    isSMB: false,
+                    decisionId: decisionId,
+                    bolusSource: "watch"
+                ) { success, message in
                     // Acknowledge success or error of bolus
                     self.sendAcknowledgment(
                         toWatch: success,

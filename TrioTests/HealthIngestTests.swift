@@ -1989,6 +1989,278 @@ import Testing
         #expect(HealthIngestLiveCGM.endReason(recorded: "replaced", failureMessage: "sensorFailed") == "failed")
     }
 
+    @Test func backfillKeepsTheServerErrorAndTheTrioResendPhase() {
+        let progress = HealthIngestBackfillProgress(
+            days: 90,
+            day: 4,
+            rowsSent: 12,
+            phase: "Reading Health samples",
+            fraction: 0.04
+        )
+        let running = HealthIngestStatus(
+            lastError: "Could not reach the server (code -1009).",
+            queueDepth: 3_538,
+            priorityDepth: 3_538,
+            backfillRunning: true,
+            backfill: progress,
+            trioHistoryPhase: HealthIngestStatus.resendingTrioHistory
+        )
+        #expect(running.stateTitle == "Backfilling")
+        #expect(running.showsLastError)
+        #expect(running.showsTrioHistoryPhase)
+        #expect(running.backfill?.phase == "Reading Health samples")
+        #expect(running.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+
+        let idle = HealthIngestStatus(lastError: "Could not reach the server.")
+        #expect(idle.stateTitle == "Error")
+        #expect(idle.showsLastError)
+        #expect(!idle.showsTrioHistoryPhase)
+        #expect(HealthIngestStatus().stateTitle == "Up to date")
+    }
+
+    @Test func priorityLaneDrainsBeforeAnotherHistoricalRead() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        let total = 1_500
+        var sent = 0
+        while sent < total {
+            let upper = min(sent + 400, total)
+            let records = (sent ..< upper).map { makeRecord(id: "trio-\($0)", type: HealthIngestType.glucose) }
+            #expect(await queue.enqueue(records).queued == records.count)
+            sent = upper
+        }
+        let health = (0 ..< 5).map { makeRecord(id: "hr-\($0)", type: HealthIngestType.heartRate) }
+        #expect(await queue.enqueue(health).queued == health.count)
+
+        final class Sends: @unchecked Sendable { var count = 0 }
+        let sends = Sends()
+        let drained = await uploader.flushPriorityUntilDrained(queue: queue) { batch in
+            sends.count += 1
+            let acks = batch.map { HealthIngestAck(type: $0.type, id: $0.id, status: .accepted) }
+            _ = await queue.resolve(batch: batch, acks: acks, transportFailed: false)
+            return false
+        }
+        #expect(!drained.failed)
+        #expect(!drained.priorityRemaining)
+        #expect(sends.count >= 3)
+        #expect(await queue.priorityDepth() == 0)
+        #expect(await queue.regularDepth() == health.count)
+
+        let failing = try makeDisk()
+        let held = HealthIngestQueue(disk: failing)
+        let heldUploader = HealthIngestUploader(relaunchFrom: failing, preferences: .initial)
+        let rows = (0 ..< 3).map { makeRecord(id: "held-\($0)", type: HealthIngestType.bolus) }
+        #expect(await held.enqueue(rows).queued == rows.count)
+        let stopped = await heldUploader.flushPriorityUntilDrained(queue: held) { _ in true }
+        #expect(stopped.failed)
+        #expect(stopped.priorityRemaining)
+        #expect(await held.priorityDepth() == rows.count)
+
+        let waiting = try makeDisk()
+        let later = HealthIngestQueue(disk: waiting)
+        let laterUploader = HealthIngestUploader(relaunchFrom: waiting, preferences: .initial)
+        let postponed = (0 ..< 2).map { makeRecord(id: "later-\($0)", type: HealthIngestType.carbs) }
+        #expect(await later.enqueue(postponed).queued == postponed.count)
+        let ready = await later.nextBatch(limit: 10, maxBytes: 1_000_000)
+        _ = await later.resolve(batch: ready, acks: [], transportFailed: true)
+        let skipped = await laterUploader.flushPriorityUntilDrained(queue: later) { _ in
+            Issue.record("A Trio row waiting out a backoff is not sent again in this drain")
+            return true
+        }
+        #expect(!skipped.failed)
+        #expect(skipped.priorityRemaining)
+        #expect(await later.priorityDepth() == postponed.count)
+    }
+
+    @Test func storedHistoryWaitsForThePriorityFlush() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = now.addingTimeInterval(-90 * 24 * 3600)
+        let chunk: TimeInterval = 2 * 24 * 3600
+
+        final class Steps: @unchecked Sendable { var values: [String] = [] }
+        let steps = Steps()
+        let disk = try makeDisk()
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        disk.saveHistoricalResume(start)
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        _ = await uploader.runScheduledDiabetesPass(
+            now: now,
+            chunk: chunk,
+            read: { spec in
+                steps.values.append(spec.role == .live ? "live" : "history")
+                return ([], [])
+            },
+            onHealthKitBackfill: { _ in
+                steps.values.append("health")
+            },
+            enqueue: { _ in },
+            beforeStoredHistory: { _ in
+                steps.values.append("flush")
+                return false
+            }
+        )
+        #expect(steps.values == ["live", "flush", "history"])
+
+        let blockedSteps = Steps()
+        let blockedDisk = try makeDisk()
+        blockedDisk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        blockedDisk.saveHistoricalResume(start)
+        let blocked = HealthIngestUploader(relaunchFrom: blockedDisk, preferences: .initial)
+        _ = await blocked.runScheduledDiabetesPass(
+            now: now,
+            chunk: chunk,
+            read: { spec in
+                blockedSteps.values.append(spec.role == .live ? "live" : "history")
+                return ([], [])
+            },
+            onHealthKitBackfill: { _ in },
+            enqueue: { _ in },
+            beforeStoredHistory: { _ in true }
+        )
+        #expect(blockedSteps.values == ["live"])
+        let resume = try #require(blockedDisk.loadHistoricalResume())
+        #expect(abs(resume.timeIntervalSince(start)) < 0.001)
+    }
+
+    @Test func unclaimedBolusLinkJoinsFromTheStoredDose() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-bolus-\(UUID().uuidString)", isDirectory: true)
+        HealthIngestTherapy.useTestDirectory(directory)
+        defer { HealthIngestTherapy.useTestDirectory(nil) }
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        let decision = UUID()
+        HealthIngestTherapy.rememberBolusLink(decisionId: decision, source: "phone", units: 1.05, at: at)
+        #expect(HealthIngestTherapy.bolusLink(eventId: "not-yet") == nil)
+        #expect(HealthIngestTherapy.bolusLink(
+            eventId: "too-late",
+            units: 1.05,
+            programmedUnits: 1.05,
+            at: at.addingTimeInterval(20 * 60)
+        ) == nil)
+        #expect(HealthIngestTherapy.bolusLink(
+            eventId: "other-dose",
+            units: 4,
+            programmedUnits: 4,
+            at: at
+        ) == nil)
+        let joined = HealthIngestTherapy.bolusLink(
+            eventId: "event-1",
+            units: 1.05,
+            programmedUnits: 1.2,
+            at: at.addingTimeInterval(60)
+        )
+        #expect(joined?.source == "phone")
+        #expect(joined?.decisionId == decision.uuidString)
+        #expect(HealthIngestTherapy.bolusLink(eventId: "event-1")?.decisionId == decision.uuidString)
+
+        let programmed = UUID()
+        HealthIngestTherapy.rememberBolusLink(decisionId: programmed, source: "watch", units: 2, at: at)
+        let byProgrammed = HealthIngestTherapy.bolusLink(
+            eventId: "event-2",
+            units: 2.2,
+            programmedUnits: 2,
+            at: at.addingTimeInterval(30)
+        )
+        #expect(byProgrammed?.source == "watch")
+        #expect(byProgrammed?.decisionId == programmed.uuidString)
+
+        #expect(HealthIngestTherapy.bolusLink(
+            eventId: "external",
+            units: 0.5,
+            programmedUnits: 0.5,
+            at: at
+        ) == nil)
+    }
+
+    @Test func trendRateStaysOffUnlessTheLiveSampleIsWithinTwoSeconds() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-rate-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        HealthIngestTherapy.useTestDirectory(directory)
+        defer {
+            HealthIngestTherapy.useTestDirectory(nil)
+            HealthIngestLiveCGM.discardCachedStore()
+        }
+        let activated = Date(timeIntervalSince1970: 1_700_000_000)
+        let reading = activated.addingTimeInterval(3_600)
+        _ = HealthIngestLiveCGM.observe(HealthIngestCGMSnapshot(
+            sensor: "DXCM1A",
+            activatedAt: activated,
+            readingAt: reading,
+            trendRateMgdlPerMin: 1.5,
+            algorithmState: nil,
+            glucoseIsReliable: true,
+            suspectedSessionEndAt: nil,
+            calibration: nil,
+            previous: nil
+        ))
+        let matched = HealthIngestLiveCGM.annotation(at: reading)
+        #expect(matched?.trendRate == 1.5)
+        #expect(matched?.sensor == "DXCM1A")
+        let later = HealthIngestLiveCGM.annotation(at: reading.addingTimeInterval(5 * 60))
+        #expect(later?.sensor == "DXCM1A")
+        #expect(later?.trendRate == nil)
+
+        let payload = try wirePayload(HealthIngestRecord(
+            type: HealthIngestType.glucose,
+            id: "cgm:test:rate",
+            start: reading,
+            end: nil,
+            tz: "UTC",
+            payload: HealthIngestDiabetesAdapter.glucosePayload(
+                mgdl: 118,
+                direction: "Flat",
+                manual: false,
+                smoothedMgdl: nil,
+                trendRate: later?.trendRate,
+                sensor: later?.sensor
+            )
+        ))
+        #expect(payload["trend"] as? String == "Flat")
+        #expect(payload["sensor"] as? String == "DXCM1A")
+        #expect(payload["trendRate"] == nil)
+    }
+
+    @Test func versionSevenLoopFieldsAreTheStoredColumnsOnly() {
+        let fields = HealthIngestTherapy.loopFields(
+            glucoseMgdl: 121,
+            eventualBg: 110,
+            recommendedBolus: 0.5,
+            targetMgdl: 100,
+            thresholdMgdl: 70,
+            carbsRequired: 12,
+            crUsed: 10
+        )
+        #expect(Set(fields.keys) == [
+            "glucoseMgdl",
+            "eventualBg",
+            "recommendedBolus",
+            "targetMgdl",
+            "thresholdMgdl",
+            "carbsRequired",
+            "crUsed"
+        ])
+        #expect(fields["bolusSource"] == nil)
+        #expect(fields["enteredAt"] == nil)
+        #expect(fields["decisionId"] == nil)
+    }
+
+    @Test func carbTimesAreAbsentUntilTheMealIsNoted() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-carb-\(UUID().uuidString)", isDirectory: true)
+        HealthIngestTherapy.useTestDirectory(directory)
+        defer { HealthIngestTherapy.useTestDirectory(nil) }
+        let id = UUID()
+        let missing = HealthIngestTherapy.carbTimes(id: id.uuidString)
+        #expect(missing.enteredAt == nil)
+        #expect(missing.editedAt == nil)
+        let at = Date(timeIntervalSince1970: 1_700_000_100)
+        HealthIngestTherapy.noteCarbEntered(id: id, at: at)
+        #expect(HealthIngestTherapy.carbTimes(id: id.uuidString).enteredAt == at)
+        #expect(HealthIngestTherapy.carbTimes(id: id.uuidString).editedAt == nil)
+    }
+
     private func eventKinds(_ records: [HealthIngestRecord]) throws -> [String] {
         var kinds: [String] = []
         for record in records {

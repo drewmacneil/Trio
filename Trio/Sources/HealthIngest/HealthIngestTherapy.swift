@@ -448,12 +448,48 @@ enum HealthIngestTherapy {
     }
 
     static func bolusLink(eventId: String) -> (source: String, decisionId: String?)? {
+        bolusLink(eventId: eventId, units: 0, programmedUnits: nil, at: .distantPast)
+    }
+
+    /// The link already claimed for `eventId`, or an unclaimed link whose units
+    /// and time match the stored dose. The pump history claim uses programmed
+    /// units only, and it does not run again for a row that already exists, so
+    /// a later read still has to join the dose Trio remembered.
+    static func bolusLink(
+        eventId: String,
+        units: Double,
+        programmedUnits: Double?,
+        at: Date
+    ) -> (source: String, decisionId: String?)? {
         startLoadIfNeeded()
         lock.lock()
         absorbUnsavedLinksLocked()
+        if let link = bolusLinks.first(where: { $0.eventId == eventId }) {
+            let found = (link.source, link.decisionId)
+            lock.unlock()
+            return found
+        }
+        var claimed = false
+        for candidate in unitCandidates(delivered: units, programmed: programmedUnits) {
+            if claimLinkLocked(eventId: eventId, units: candidate, at: at) {
+                claimed = true
+                break
+            }
+        }
         let link = bolusLinks.first { $0.eventId == eventId }
         lock.unlock()
+        if claimed { scheduleFlushLinks() }
         return link.map { ($0.source, $0.decisionId) }
+    }
+
+    private static func unitCandidates(delivered: Double, programmed: Double?) -> [Double] {
+        var values: [Double] = []
+        for candidate in [delivered, programmed].compactMap({ $0 }) {
+            guard candidate.isFinite, candidate > 0 else { continue }
+            if values.contains(where: { abs($0 - candidate) < 0.000_1 }) { continue }
+            values.append(candidate)
+        }
+        return values
     }
 
     /// Folds dose-path links into the in-memory list. Caller holds `lock`. No disk IO.

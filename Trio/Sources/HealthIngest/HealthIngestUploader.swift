@@ -695,9 +695,24 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         return 90
     }
 
-    private struct FlushOutcome {
+    struct FlushOutcome {
         var sentAny: Bool
         var failed: Bool
+        /// Trio rows are still queued and were not sendable on this pass.
+        var priorityRemaining = false
+    }
+
+    /// Shared by the upload pass and tests. A closure that returns true stops the drain.
+    private final class FlushMark {
+        var sentAny: Bool
+        var failed: Bool
+        var blocked: Bool
+
+        init(sentAny: Bool, failed: Bool) {
+            self.sentAny = sentAny
+            self.failed = failed
+            blocked = false
+        }
     }
 
     /// Sends already-ready queue items. Must not await HealthKit or a Core Data reread.
@@ -726,6 +741,60 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             sentAny = true
         }
         return FlushOutcome(sentAny: sentAny, failed: failed)
+    }
+
+    /// Sends ready batches until the Trio lane is empty, a send fails, or the
+    /// next ready batch has no Trio row (the rest are waiting out a backoff).
+    /// Does not stop at the pass's batch budget. A batch may also carry Health
+    /// rows that filled the remainder. Must not await HealthKit or Core Data.
+    func flushPriorityUntilDrained(
+        queue: HealthIngestQueue,
+        sendBatch: ([HealthIngestRecord]) async -> Bool
+    ) async -> FlushOutcome {
+        var sentAny = false
+        var failed = false
+        var priorityRemaining = false
+        while !Task.isCancelled {
+            let depth = await queue.priorityDepth()
+            if depth == 0 { break }
+            let batch = await queue.nextBatch(
+                limit: HealthIngestWire.maxBatchRecords,
+                maxBytes: HealthIngestWire.maxBatchBytes
+            )
+            guard batch.contains(where: { HealthIngestType.isPriorityLane($0.type) }) else {
+                priorityRemaining = true
+                break
+            }
+            if await sendBatch(batch) {
+                failed = true
+                priorityRemaining = await queue.priorityDepth() > 0
+                break
+            }
+            sentAny = true
+            let after = await queue.priorityDepth()
+            if after >= depth {
+                priorityRemaining = after > 0
+                break
+            }
+        }
+        return FlushOutcome(sentAny: sentAny, failed: failed, priorityRemaining: priorityRemaining)
+    }
+
+    /// Records the latest live G7 snapshot, then drains the Trio lane.
+    private func drainPriorityBeforeSlowRead(
+        queue: HealthIngestQueue,
+        origin: URL,
+        token: String,
+        deviceID: String,
+        enqueue: ([HealthIngestRecord]) async -> Void
+    ) async -> FlushOutcome {
+        let events = liveCGMRecords()
+        if !events.isEmpty {
+            await enqueue(events)
+        }
+        return await flushPriorityUntilDrained(queue: queue) { batch in
+            await self.send(batch, origin: origin, token: token, queue: queue, deviceID: deviceID)
+        }
     }
 
     private func collectAndSend() async {
@@ -760,9 +829,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             }
         }
 
+        let mark = FlushMark(sentAny: sentAny, failed: failed)
         if !failed, !Task.isCancelled {
             // Live G7 fields are logging only. This does not read or write the
-            // Core Data rewind cursor.
+            // Core Data rewind cursor. Snapshot before the live window so those
+            // glucose rows can pick up the current trend rate.
             let liveEvents = liveCGMRecords()
             if !liveEvents.isEmpty {
                 await enqueuePage(liveEvents)
@@ -811,24 +882,41 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                     },
                     enqueue: { records in
                         await enqueuePage(records)
+                    },
+                    beforeStoredHistory: { _ in
+                        let outcome = await self.drainPriorityBeforeSlowRead(
+                            queue: queue,
+                            origin: origin,
+                            token: token,
+                            deviceID: prefs.normalizedDeviceID,
+                            enqueue: enqueuePage
+                        )
+                        mark.sentAny = mark.sentAny || outcome.sentAny
+                        if outcome.failed { mark.failed = true }
+                        return outcome.failed || outcome.priorityRemaining
                     }
                 )
                 errors.append(contentsOf: readErrors)
                 setLastDiabetesRead(now)
             }
-            if !Task.isCancelled {
-                let flush = await flushReadyBatches(
+            sentAny = mark.sentAny
+            failed = mark.failed
+            if !failed, !Task.isCancelled {
+                // The historical chunk may have queued more Trio rows. Drain them
+                // before any HealthKit page.
+                let flush = await drainPriorityBeforeSlowRead(
                     queue: queue,
                     origin: origin,
                     token: token,
                     deviceID: prefs.normalizedDeviceID,
-                    maxBatches: budget.flushBatches
+                    enqueue: enqueuePage
                 )
                 sentAny = sentAny || flush.sentAny
                 failed = failed || flush.failed
+                mark.blocked = flush.failed || flush.priorityRemaining
             }
         }
-        if !failed, !Task.isCancelled {
+        if !failed, !mark.blocked, !Task.isCancelled {
             // Health reads stream page by page into their own lane. They pause while that
             // lane is backed up. Trio rows do not count toward this and are not paused by it.
             let healthGate = HealthIngestReadGate.decide(
@@ -977,19 +1065,30 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     /// Reads the live window, then one historical chunk when a Core Data rewind is
     /// in progress, and enqueues each before the next read starts. Returns read errors.
     /// `beginBackfill` runs only from `onHealthKitBackfill`.
+    /// `beforeStoredHistory` runs before a historical or HealthKit-window read,
+    /// after the live window is already enqueued. Return true to skip that read
+    /// and leave the historical cursor where it is.
     func runScheduledDiabetesPass(
         now: Date,
         chunk: TimeInterval,
         read: (HealthIngestDiabetesSchedule.Read) async -> (records: [HealthIngestRecord], errors: [String]),
         onHealthKitBackfill: (Date) -> Void,
-        enqueue: ([HealthIngestRecord]) async -> Void
+        enqueue: ([HealthIngestRecord]) async -> Void,
+        beforeStoredHistory: ((HealthIngestDiabetesSchedule.Read) async -> Bool)? = nil
     ) async -> [String] {
         let plan = takeDiabetesPlan(now: now, chunk: chunk)
         var errors: [String] = []
+        var completed = true
+        var didReadHealthKitBackfill = false
         for (index, spec) in plan.reads.enumerated() {
+            if spec.role != .live, let beforeStoredHistory, await beforeStoredHistory(spec) {
+                completed = false
+                break
+            }
             let batch = await read(spec)
             errors.append(contentsOf: batch.errors)
             if spec.role == .healthKitBackfill {
+                didReadHealthKitBackfill = true
                 onHealthKitBackfill(spec.since)
             }
             await enqueue(batch.records)
@@ -997,7 +1096,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 onHealthKitBackfill(since)
             }
         }
-        commitDiabetesPlan(plan)
+        if completed {
+            commitDiabetesPlan(plan)
+        } else if !didReadHealthKitBackfill, let spec = plan.reads.first(where: { $0.role == .healthKitBackfill }) {
+            restoreBackfillRequest(spec.since)
+        }
         return errors
     }
 
@@ -1027,6 +1130,16 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             plan.diabetesResume = nil
         }
         return plan
+    }
+
+    /// `takeDiabetesPlan` consumes a backfill request. Put it back when that
+    /// Core Data window was not read.
+    private func restoreBackfillRequest(_ since: Date) {
+        stateLock.lock()
+        if backfillSince == nil {
+            backfillSince = since
+        }
+        stateLock.unlock()
     }
 
     private func commitDiabetesPlan(_ plan: HealthIngestDiabetesSchedule.Plan) {
@@ -1282,6 +1395,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
         let rewindingTrio = lockedHistoricalResume() != nil
+        // `lastError` and `trioHistoryPhase` stay set during a Health backfill.
+        // The settings screen shows them with the day counter.
         return HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),

@@ -346,6 +346,11 @@ struct HealthIngestDiabetesAdapter {
         return try context.fetch(request)
     }
 
+    /// `direction` is the stored arrow and is copied to `trend`. `trendRate` is
+    /// not a Core Data column. It is attached only when the live G7 snapshot
+    /// still has that instant, within two seconds. The sensor window covers the
+    /// whole session after one snapshot, so `sensor` can be set when `trendRate`
+    /// is absent. The arrow is not turned into a number.
     static func mapGlucose(_ row: GlucoseStored, source: String) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let mgdl = Int(row.glucose)
@@ -430,7 +435,16 @@ struct HealthIngestDiabetesAdapter {
     private static func mapBolus(_ event: PumpEventStored, sourceID: String, start: Date) -> HealthIngestRecord {
         let bolus = event.bolus
         let smb = bolus?.isSMB ?? false
-        let link = HealthIngestTherapy.bolusLink(eventId: sourceID)
+        // The pump row has no source or decision id. Those stay on the dose Trio
+        // enacted, matched here by units and time when the earlier claim missed.
+        // An external or pump-button bolus has no such dose. An SMB with no link
+        // is still reported as automatic.
+        let link = HealthIngestTherapy.bolusLink(
+            eventId: sourceID,
+            units: bolus?.amount?.doubleValue ?? 0,
+            programmedUnits: bolus?.programmedAmount?.doubleValue,
+            at: start
+        )
         let bolusSource = link?.source ?? ((bolus?.isSMB == true) ? "automatic" : nil)
         let decisionJSON: HealthIngestJSON? = {
             guard let id = link?.decisionId, !id.isEmpty else { return nil }
@@ -482,6 +496,10 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
+    /// `enteredAt` and `editedAt` are not stored on the meal. They are noted
+    /// when this process saves or edits it. `date` is when the meal applies.
+    /// Fat and protein can be present with no times: an import, or a save
+    /// whose note was not kept.
     static func mapCarb(_ row: CarbEntryStored) -> HealthIngestRecord? {
         guard let start = row.date else { return nil }
         let sourceID = row.id?.uuidString ?? "carb-\(Int(start.timeIntervalSince1970))-\(row.carbs)"
@@ -813,6 +831,11 @@ struct HealthIngestDiabetesAdapter {
         ]
         let glucose = row.glucose?.doubleValue
         let eventual = row.eventualBG?.doubleValue
+        // Version 7 put these stored columns at the top level: glucose, eventual
+        // glucose, recommended bolus, target, threshold, carbs required, and
+        // carb ratio. `bolusSource`, `enteredAt`, and `decisionId` were not
+        // among them. `determination` is the object built above, not the
+        // `reason` string.
         // Suggested bolus is the stored `bolus` column (nested `units`). `insulinReq` is not that bolus.
         let recommended = row.bolus?.doubleValue
         let target = row.currentTarget?.doubleValue

@@ -291,6 +291,26 @@ struct HealthIngestStatus: Equatable {
     var trioHistoryPhase: String? = nil
 
     static let resendingTrioHistory = "Resending stored Trio history"
+
+    /// A server or network error stays on screen while a backfill is running.
+    var showsLastError: Bool {
+        guard let lastError else { return false }
+        return !lastError.isEmpty
+    }
+
+    /// The Trio reread line stays on screen while a Health backfill is running.
+    var showsTrioHistoryPhase: Bool {
+        guard let trioHistoryPhase else { return false }
+        return !trioHistoryPhase.isEmpty
+    }
+
+    /// The dot's title. Backfill keeps this title when `lastError` is set;
+    /// the error is its own row.
+    var stateTitle: String {
+        if backfillRunning { return "Backfilling" }
+        if showsLastError { return "Error" }
+        return "Up to date"
+    }
 }
 
 /// Upload preferences live in UserDefaults. The bearer token lives only in the Keychain.

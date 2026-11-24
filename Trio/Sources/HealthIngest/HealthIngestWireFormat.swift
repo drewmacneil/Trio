@@ -57,7 +57,16 @@ enum HealthIngestWire {
     /// 6 resends HealthKit history with each sample's source and device beside
     /// `payload`. The payload is unchanged, so the local receipt hash includes
     /// those fields and an accepted `(type, id)` is queued again.
-    static let mappingVersion = 6
+    /// 7 rewinds the Core Data read so stored loop cycles are sent again with
+    /// top-level glucose, eventual glucose, recommended bolus, target, threshold,
+    /// carbs required, and carb ratio. Those values are already on
+    /// `OrefDetermination`. The receipt hash changes only when the payload does,
+    /// so an unchanged HealthKit sample or treatment is not uploaded again.
+    /// An upgrade from 6 does not clear HealthKit cursors or anchors. A fresh
+    /// install, or an upgrade from before 6, still resets that backfill.
+    /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
+    /// A missing step resets the HealthKit backfill instead of skipping the resend.
+    static let mappingVersion = 7
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed
@@ -146,6 +155,8 @@ enum HealthIngestWireError: Error, Equatable {
 enum HealthIngestType {
     static let glucose = "glucose"
     static let bolus = "bolus"
+    static let bolusDecision = "bolus_decision"
+    static let bolusFailure = "bolus_failure"
     static let tempBasal = "temp_basal"
     static let carbs = "carbs"
     static let override = "override"
@@ -163,6 +174,7 @@ enum HealthIngestType {
     static let activeEnergy = "active_energy"
     static let exerciseMinutes = "exercise_minutes"
     static let deletion = "deletion"
+    static let cgmEvent = "cgm_event"
     static let profileSwitch = "profile_switch"
     static let effectiveProfile = "effective_profile"
     static let loopStat = "loop_stat"
@@ -189,6 +201,8 @@ enum HealthIngestType {
         switch type {
         case glucose: return "Glucose"
         case bolus: return "Bolus"
+        case bolusDecision: return "Bolus decision"
+        case bolusFailure: return "Bolus failure"
         case tempBasal: return "Temp basal"
         case carbs: return "Carbs"
         case override: return "Override"
@@ -206,6 +220,7 @@ enum HealthIngestType {
         case activeEnergy: return "Active energy"
         case exerciseMinutes: return "Exercise minutes"
         case deletion: return "Deletion"
+        case cgmEvent: return "CGM event"
         case profileSwitch: return "Profile switch"
         case effectiveProfile: return "Effective profile"
         case loopStat: return "Loop stat"
@@ -218,7 +233,10 @@ enum HealthIngestType {
     static let all: Set<String> = [
         activeEnergy,
         bolus,
+        bolusDecision,
+        bolusFailure,
         carbs,
+        cgmEvent,
         deletion,
         effectiveProfile,
         exerciseMinutes,

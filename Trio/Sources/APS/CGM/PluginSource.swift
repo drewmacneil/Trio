@@ -166,6 +166,14 @@ extension PluginSource: CGMManagerDelegate {
             }
 
             self.glucoseManager?.reportCGMSensorObservation(self.currentSensorObservation())
+            switch self.currentSensorObservation() {
+            case .reliable:
+                HealthIngestTherapy.noteGlucoseReliability(reliable: true, issue: nil)
+            case let .unreliable(state):
+                HealthIngestTherapy.noteGlucoseReliability(reliable: false, issue: state)
+            case .unavailable:
+                break
+            }
 
             self.publishCGMStatus()
         }
@@ -181,6 +189,17 @@ extension PluginSource: CGMManagerDelegate {
             // currently only display in log the date of the event
             events.forEach { event in
                 debug(.cgm, "CGM event \(event.type) at \(event.date)")
+                let message = event.error?.message ?? event.error?.code ?? event.failureMessage
+                HealthIngestTherapy.storeCGMEvent(
+                    at: event.date,
+                    kind: HealthIngestCGM.kind(
+                        type: event.type.rawValue,
+                        errorCode: event.error?.code,
+                        fatal: event.error?.isFatal ?? false,
+                        failureMessage: event.failureMessage
+                    ),
+                    message: message
+                )
 
                 if event.type == .sensorStart {
                     info(.cgm, "Sensor started")
@@ -311,6 +330,7 @@ extension PluginSource: CGMManagerDelegate {
                 let value = Int(quantity.doubleValue(for: .milligramsPerDeciliter))
 
                 if newGlucoseSample.wasUserEntered {
+                    HealthIngestTherapy.storeCGMEvent(at: newGlucoseSample.date, kind: "calibration", message: nil)
                     // Store the calibration for the sensor as manual glucose
                     return BloodGlucose(
                         id: UUID().uuidString,

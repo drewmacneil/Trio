@@ -4,6 +4,15 @@ import Swinject
 
 protocol BolusCalculationManager {
     func calculateInsulin(input: CalculationInput) async -> CalculationResult
+    func calculateBolus(
+        carbs: Decimal,
+        useFattyMealCorrection: Bool,
+        useSuperBolus: Bool,
+        lastLoopDate: Date,
+        minPredBG: Decimal?,
+        simulatedCOB: Int16?,
+        isBackdated: Bool
+    ) async -> BolusCalculationReport
     func handleBolusCalculation(
         carbs: Decimal,
         useFattyMealCorrection: Bool,
@@ -280,6 +289,14 @@ final class BaseBolusCalculationManager: BolusCalculationManager, Injectable {
         )
     }
 
+    private struct PreparedBolus {
+        var input: CalculationInput
+        var loopCob: Int16
+        var simulatedCob: Int16?
+        var enteredCarbs: Decimal
+        var backdated: Bool
+    }
+
     private func prepareCalculationInput(
         carbs: Decimal,
         useFattyMealCorrection: Bool,
@@ -288,7 +305,7 @@ final class BaseBolusCalculationManager: BolusCalculationManager, Injectable {
         minPredBG: Decimal?,
         simulatedCOB: Int16?,
         isBackdated: Bool
-    ) async throws -> CalculationInput {
+    ) async throws -> PreparedBolus {
         do {
             // Get settings
             let settings = await getSettings()
@@ -344,26 +361,32 @@ final class BaseBolusCalculationManager: BolusCalculationManager, Injectable {
             let effectiveCarbs = isBackdated ? 0 : carbs
             let effectiveCob = isBackdated ? simulatedCOB : bolusVars.cob
 
-            return CalculationInput(
-                carbs: effectiveCarbs,
-                currentBG: glucoseVars.currentBG,
-                deltaBG: glucoseVars.deltaBG,
-                target: bolusVars.target,
-                isf: bolusVars.isf,
-                carbRatio: bolusVars.carbRatio,
-                iob: bolusVars.iob,
-                cob: effectiveCob ?? bolusVars.cob,
-                useFattyMealCorrectionFactor: useFattyMealCorrection,
-                fattyMealFactor: settings.fattyMealFactor,
-                useSuperBolus: useSuperBolus,
-                sweetMealFactor: settings.sweetMealFactor,
-                basal: bolusVars.basal,
-                fraction: settings.fraction,
-                maxBolus: maxBolus,
-                maxIOB: maxIOB,
-                maxCOB: maxCOB,
-                minPredBG: minPredBG ?? bolusVars.minPredBG,
-                lastLoopDate: lastLoopDate
+            return PreparedBolus(
+                input: CalculationInput(
+                    carbs: effectiveCarbs,
+                    currentBG: glucoseVars.currentBG,
+                    deltaBG: glucoseVars.deltaBG,
+                    target: bolusVars.target,
+                    isf: bolusVars.isf,
+                    carbRatio: bolusVars.carbRatio,
+                    iob: bolusVars.iob,
+                    cob: effectiveCob ?? bolusVars.cob,
+                    useFattyMealCorrectionFactor: useFattyMealCorrection,
+                    fattyMealFactor: settings.fattyMealFactor,
+                    useSuperBolus: useSuperBolus,
+                    sweetMealFactor: settings.sweetMealFactor,
+                    basal: bolusVars.basal,
+                    fraction: settings.fraction,
+                    maxBolus: maxBolus,
+                    maxIOB: maxIOB,
+                    maxCOB: maxCOB,
+                    minPredBG: minPredBG ?? bolusVars.minPredBG,
+                    lastLoopDate: lastLoopDate
+                ),
+                loopCob: bolusVars.cob,
+                simulatedCob: simulatedCOB,
+                enteredCarbs: carbs,
+                backdated: isBackdated
             )
         } catch {
             // Return default values in case of error
@@ -476,6 +499,45 @@ final class BaseBolusCalculationManager: BolusCalculationManager, Injectable {
     ///   - minPredBG: Minimum Predicted Glucose determined by Oref
     ///   - simulatedCOB: Optional simulated COB from backdated entries (if available)
     /// - Returns: CalculationResult containing the calculated insulin dose and details
+    func calculateBolus(
+        carbs: Decimal,
+        useFattyMealCorrection: Bool,
+        useSuperBolus: Bool,
+        lastLoopDate: Date,
+        minPredBG: Decimal? = nil,
+        simulatedCOB: Int16? = nil,
+        isBackdated: Bool = false
+    ) async -> BolusCalculationReport {
+        do {
+            let prepared = try await prepareCalculationInput(
+                carbs: carbs,
+                useFattyMealCorrection: useFattyMealCorrection,
+                useSuperBolus: useSuperBolus,
+                lastLoopDate: lastLoopDate,
+                minPredBG: minPredBG,
+                simulatedCOB: simulatedCOB,
+                isBackdated: isBackdated
+            )
+            let result = await calculateInsulin(input: prepared.input)
+            return BolusCalculationReport(
+                input: prepared.input,
+                result: result,
+                loopCob: prepared.loopCob,
+                simulatedCob: prepared.simulatedCob,
+                enteredCarbs: prepared.enteredCarbs,
+                backdated: prepared.backdated
+            )
+        } catch let calculationError {
+            error(.bolus, "Bolus calculation failed, recommending 0 U", error: calculationError)
+            return BolusCalculationReport.zero(
+                lastLoopDate: lastLoopDate,
+                enteredCarbs: carbs,
+                simulatedCob: simulatedCOB,
+                backdated: isBackdated
+            )
+        }
+    }
+
     func handleBolusCalculation(
         carbs: Decimal,
         useFattyMealCorrection: Bool,
@@ -485,34 +547,15 @@ final class BaseBolusCalculationManager: BolusCalculationManager, Injectable {
         simulatedCOB: Int16? = nil,
         isBackdated: Bool = false
     ) async -> CalculationResult {
-        do {
-            let input = try await prepareCalculationInput(
-                carbs: carbs,
-                useFattyMealCorrection: useFattyMealCorrection,
-                useSuperBolus: useSuperBolus,
-                lastLoopDate: lastLoopDate,
-                minPredBG: minPredBG,
-                simulatedCOB: simulatedCOB,
-                isBackdated: isBackdated
-            )
-            let result = await calculateInsulin(input: input)
-            return result
-        } catch let calculationError {
-            error(.bolus, "Bolus calculation failed, recommending 0 U", error: calculationError)
-            // Return safe default values
-            return CalculationResult(
-                insulinCalculated: 0,
-                factoredInsulin: 0,
-                wholeCalc: 0,
-                iobInsulinReduction: 0,
-                superBolusInsulin: 0,
-                targetDifference: 0,
-                targetDifferenceInsulin: 0,
-                fifteenMinutesInsulin: 0,
-                wholeCob: 0,
-                wholeCobInsulin: 0
-            )
-        }
+        await calculateBolus(
+            carbs: carbs,
+            useFattyMealCorrection: useFattyMealCorrection,
+            useSuperBolus: useSuperBolus,
+            lastLoopDate: lastLoopDate,
+            minPredBG: minPredBG,
+            simulatedCOB: simulatedCOB,
+            isBackdated: isBackdated
+        ).result
     }
 }
 
@@ -537,6 +580,65 @@ struct CalculationInput: Sendable {
     let maxCOB: Decimal // Maximum allowed COB to be used for rec. bolus calculation
     let minPredBG: Decimal // Minimum Predicted Glucose determined by Oref
     let lastLoopDate: Date // Date at which loop last completed successfully
+}
+
+/// Calculator inputs plus the COB and carb values the recommendation was built from.
+struct BolusCalculationReport: Sendable {
+    var input: CalculationInput
+    var result: CalculationResult
+    /// COB from the latest loop, before a backdated simulation replaces it.
+    var loopCob: Int16
+    var simulatedCob: Int16?
+    /// Carbs the person typed. The calculator zeros this when the entry is backdated.
+    var enteredCarbs: Decimal
+    var backdated: Bool
+
+    static func zero(
+        lastLoopDate: Date,
+        enteredCarbs: Decimal,
+        simulatedCob: Int16?,
+        backdated: Bool
+    ) -> BolusCalculationReport {
+        BolusCalculationReport(
+            input: CalculationInput(
+                carbs: backdated ? 0 : enteredCarbs,
+                currentBG: 0,
+                deltaBG: 0,
+                target: 0,
+                isf: 0,
+                carbRatio: 0,
+                iob: 0,
+                cob: simulatedCob ?? 0,
+                useFattyMealCorrectionFactor: false,
+                fattyMealFactor: 0,
+                useSuperBolus: false,
+                sweetMealFactor: 0,
+                basal: 0,
+                fraction: 0,
+                maxBolus: 0,
+                maxIOB: 0,
+                maxCOB: 0,
+                minPredBG: 0,
+                lastLoopDate: lastLoopDate
+            ),
+            result: CalculationResult(
+                insulinCalculated: 0,
+                factoredInsulin: 0,
+                wholeCalc: 0,
+                iobInsulinReduction: 0,
+                superBolusInsulin: 0,
+                targetDifference: 0,
+                targetDifferenceInsulin: 0,
+                fifteenMinutesInsulin: 0,
+                wholeCob: 0,
+                wholeCobInsulin: 0
+            ),
+            loopCob: 0,
+            simulatedCob: simulatedCob,
+            enteredCarbs: enteredCarbs,
+            backdated: backdated
+        )
+    }
 }
 
 /// Results of the bolus calculation

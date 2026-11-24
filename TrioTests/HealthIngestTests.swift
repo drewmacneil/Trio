@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import LocalAuthentication
 import Testing
 
 @testable import Trio
@@ -595,8 +596,85 @@ import Testing
         #expect(!limitsText.contains("fails"))
     }
 
+    @Test func mappingUpgradeFromSixRewindsCoreDataAndKeepsHealthKitCursors() async throws {
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([1, 2, 3, 4])
+        disk.saveMappingVersion(6)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await uploader.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+    }
+
+    @Test func mappingUpgradeFromBeforeSixResetsHealthKitCursors() async throws {
+        for stored in [0, 5] {
+            let disk = try makeDisk()
+            disk.saveMappingVersion(stored)
+            disk.saveCursors(["heart_rate": Date(timeIntervalSince1970: 1_700_000_000)])
+            disk.saveAnchors(["heart_rate": Data([9])])
+
+            let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+            await uploader.applyMappingUpgradeIfNeeded()
+
+            #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+            #expect(disk.loadCursors().isEmpty)
+            #expect(HealthIngestMappingUpgrade.plan(storedVersion: stored, currentVersion: 7)?.resetHealthKit == true)
+        }
+    }
+
+    @Test func mappingVersionRegistersTheStepThatReachesIt() {
+        let current = HealthIngestWire.mappingVersion
+        let step = HealthIngestMappingUpgrade.steps[current]
+        #expect(step != nil)
+        let entered = HealthIngestMappingUpgrade.plan(storedVersion: current - 1, currentVersion: current)
+        #expect(entered?.resetHealthKit == step?.resetHealthKit)
+        #expect(entered?.rewindCoreDataDays == step?.rewindCoreDataDays)
+    }
+
+    @Test func mappingUpgradeSkippedVersionsUnionTheStepsOrFullReset() {
+        // 5 → 7 applies version 6's HealthKit reset and version 7's Core Data rewind.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 5, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: true, rewindCoreDataDays: 90))
+        // 6 → 7 is only version 7, so HealthKit cursors stay.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        // Version 8 has no step. Crossing it, from 6 or from 7, is a full reset.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.fullReset)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 7, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.fullReset)
+    }
+
+    @Test func mappingDowngradeLeavesCursorsAndStoredVersionAlone() async throws {
+        let current = HealthIngestWire.mappingVersion
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: current) == nil)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: current, currentVersion: current) == nil)
+
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([1, 2, 3, 4])
+        disk.saveMappingVersion(9)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await uploader.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == 9)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+    }
+
     @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
-        #expect(HealthIngestWire.mappingVersion == 6)
+        #expect(HealthIngestWire.mappingVersion == 7)
         let disk = try makeDisk()
         disk.saveMappingVersion(5)
         #expect(disk.loadMappingVersion() < HealthIngestWire.mappingVersion)
@@ -828,7 +906,7 @@ import Testing
         #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
         #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
         #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
-        #expect(HealthIngestWire.mappingVersion == 6)
+        #expect(HealthIngestWire.mappingVersion == 7)
         #expect(HealthIngestAck.acceptedRowCount([
             HealthIngestAck(type: "hrv", id: "1", status: .accepted),
             HealthIngestAck(type: "hrv", id: "2", status: .duplicate),
@@ -1292,6 +1370,293 @@ import Testing
         }
         #expect(delivered == expectedPriority + expectedRegular)
         #expect(await reloaded.depth() == 0)
+    }
+
+    @Test func automaticSmbUnitsStayOnDevNearestDouble() {
+        let small = Decimal(string: "0.03")!
+        let smallUnits = HealthIngestAutomaticBolus.units(NSDecimalNumber(decimal: small))
+        #expect(smallUnits == small.nearestDouble)
+        #expect(smallUnits > 0)
+        #expect(smallUnits < 0.05)
+
+        let seven = Decimal(string: "0.07")!
+        let sevenUnits = HealthIngestAutomaticBolus.units(NSDecimalNumber(decimal: seven))
+        #expect(sevenUnits == 0.07)
+        #expect(sevenUnits == seven.nearestDouble)
+    }
+
+    @Test func therapyRecordsMatchTheServerContract() throws {
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        let decisionId = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+        let eaten = at.addingTimeInterval(-120)
+        let decision = HealthIngestTherapy.decisionRecord(
+            decisionId: decisionId,
+            at: at,
+            source: "phone",
+            report: therapyReport(simulatedCob: 18, at: at),
+            fat: 10,
+            protein: 20,
+            enteredUnits: 2,
+            external: false,
+            skipped: false,
+            carbEntryId: "22222222-2222-4222-8222-222222222222",
+            carbEntryEatenAt: eaten
+        )
+        #expect(decision.type == HealthIngestType.bolusDecision)
+        #expect(decision.id == decisionId.uuidString)
+        #expect(!decision.id.contains(":"))
+        #expect(decision.start == at)
+        let payload = try wirePayload(decision)
+        #expect(payload["source"] as? String == "phone")
+        #expect(payload["timestamp"] as? String == HealthIngestTime.string(from: at))
+        let inputs = try #require(payload["inputs"] as? [String: Any])
+        #expect(inputs["cobSimulated"] is NSNumber)
+        #expect((inputs["cobSimulated"] as? NSNumber)?.doubleValue == 18)
+        #expect(!(inputs["cobSimulated"] is Bool))
+        #expect((inputs["cob"] as? NSNumber)?.doubleValue == 15)
+        #expect(inputs["bgMgdl"] as? NSNumber != nil)
+        #expect(inputs["fattyMeal"] as? Bool == true)
+        #expect(inputs["superBolusFactor"] == nil)
+        let action = try #require(payload["action"] as? [String: Any])
+        #expect(action["outcome"] as? String == "reduced")
+        #expect(action["external"] as? Bool == false)
+        let text = try wireText(decision)
+        #expect(!text.contains("\"cobSimulated\":true"))
+        #expect(!text.contains("\"cobSimulated\":false"))
+
+        let withoutSimulation = HealthIngestTherapy.decisionRecord(
+            decisionId: decisionId,
+            at: at,
+            source: "watch",
+            report: therapyReport(simulatedCob: nil, at: at),
+            fat: 0,
+            protein: 0,
+            enteredUnits: 0,
+            external: false,
+            skipped: true,
+            carbEntryId: nil,
+            carbEntryEatenAt: nil
+        )
+        let skippedInputs = try #require(try wirePayload(withoutSimulation)["inputs"] as? [String: Any])
+        #expect(skippedInputs["cobSimulated"] == nil)
+        let skippedAction = try #require(try wirePayload(withoutSimulation)["action"] as? [String: Any])
+        #expect(skippedAction["outcome"] as? String == "skipped")
+
+        let tooMuch = HealthIngestTherapy.decisionRecord(
+            decisionId: decisionId,
+            at: at,
+            source: "remote",
+            report: therapyReport(simulatedCob: 2500, at: at),
+            fat: 0,
+            protein: 0,
+            enteredUnits: 1,
+            external: true,
+            skipped: false,
+            carbEntryId: nil,
+            carbEntryEatenAt: nil
+        )
+        let remoteInputs = try #require(try wirePayload(tooMuch)["inputs"] as? [String: Any])
+        #expect(remoteInputs["cobSimulated"] == nil)
+
+        let failure = HealthIngestTherapy.failureRecord(
+            at: at,
+            requestedUnits: 2,
+            source: "watch",
+            reason: "pump_error",
+            message: "example pump busy https://example.invalid/path 11111111-1111-4111-8111-111111111111",
+            decisionId: decisionId
+        )
+        let failurePayload = try wirePayload(failure)
+        #expect(failurePayload["reason"] as? String == "pump_error")
+        #expect(failurePayload["source"] as? String == "watch")
+        #expect(failurePayload["decisionId"] as? String == decisionId.uuidString)
+        let message = try #require(failurePayload["message"] as? String)
+        #expect(!message.contains("http"))
+        #expect(!message.contains("11111111"))
+
+        let cgm = HealthIngestTherapy.cgmRecord(at: at, kind: "warmup_end", message: "example sensor ready")
+        let cgmPayload = try wirePayload(cgm)
+        #expect(cgmPayload["kind"] as? String == "warmup_end")
+        #expect(cgm.id.hasPrefix("cgm-event:"))
+        #expect(!cgm.id.contains("serial"))
+        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "warmup", fatal: false, failureMessage: nil) == "warmup_start")
+        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "expired", fatal: false, failureMessage: nil) == "sensor_expired")
+        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "sensorFailed", fatal: true, failureMessage: nil) == "sensor_failed")
+        #expect(HealthIngestCGM.kind(type: "sensorStart", errorCode: nil, fatal: false, failureMessage: nil) == "sensor_start")
+        #expect(HealthIngestCGM.kind(type: "calibration", errorCode: nil, fatal: false, failureMessage: nil) == "calibration")
+        #expect(HealthIngestCGM.kind(type: "transmitterStart", errorCode: nil, fatal: false, failureMessage: nil) == nil)
+        #expect(HealthIngestCGM.kind(type: "sensorEnd", errorCode: nil, fatal: false, failureMessage: nil) == "other")
+
+        let loop = HealthIngestTherapy.loopFields(
+            glucoseMgdl: 121,
+            eventualBg: 110,
+            recommendedBolus: nil,
+            targetMgdl: 100,
+            thresholdMgdl: 70,
+            carbsRequired: 0,
+            crUsed: 10
+        )
+        #expect(loop["glucoseMgdl"] != nil)
+        // Values are optional, so a nil bolus is stored as `.some(nil)`. Flatten before comparing.
+        #expect(loop["recommendedBolus"] ?? nil == nil)
+        #expect(loop["crUsed"] != nil)
+        #expect(HealthIngestTherapy.loopFields(
+            glucoseMgdl: 5000,
+            eventualBg: nil,
+            recommendedBolus: -1,
+            targetMgdl: 5,
+            thresholdMgdl: nil,
+            carbsRequired: nil,
+            crUsed: nil
+        ).values.allSatisfy { $0 == nil })
+
+        #expect(HealthIngestTherapy.pumpKind(eventType: "PumpAlarm", alarmKind: "occlusion") == "alarm")
+        #expect(HealthIngestTherapy.pumpKind(eventType: "PumpAlarm", alarmKind: "low_insulin") == "alert")
+        #expect(HealthIngestTherapy.usableReservoir(0xDEAD_BEEF) == nil)
+        #expect(HealthIngestTherapy.usableReservoir(80) == 80)
+        #expect(HealthIngestTherapy.bolusOutcome(recommended: 2.5, entered: 2, skipped: false) == "reduced")
+        #expect(HealthIngestTherapy.authenticationFailureReason(LAError(.userCancel)) == "cancelled")
+        #expect(HealthIngestTherapy.authenticationFailureReason(LAError(.authenticationFailed)) == "auth_failed")
+    }
+
+    @Test func therapyQueueDrainsDecisionsAndSkipsAutomaticFailures() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-therapy-\(UUID().uuidString)", isDirectory: true)
+        HealthIngestTherapy.useTestDirectory(directory)
+        defer { HealthIngestTherapy.useTestDirectory(nil) }
+        let at = Date(timeIntervalSince1970: 1_700_000_100)
+        let decisionId = UUID()
+        HealthIngestTherapy.storeDecision(
+            decisionId: decisionId,
+            at: at,
+            source: "phone",
+            report: therapyReport(simulatedCob: 12, at: at),
+            fat: 0,
+            protein: 0,
+            enteredUnits: 1,
+            external: false,
+            skipped: false,
+            carbEntryId: nil,
+            carbEntryEatenAt: nil
+        )
+        HealthIngestTherapy.storeFailure(
+            at: at,
+            requestedUnits: 1,
+            source: "automatic",
+            reason: "pump_error",
+            message: "not a user bolus",
+            decisionId: nil
+        )
+        HealthIngestTherapy.storeCGMEvent(at: at, kind: "sensor_start", message: nil)
+        let carbId = UUID()
+        HealthIngestTherapy.noteCarbEntered(id: carbId, at: at)
+        HealthIngestTherapy.noteCarbEdited(previousID: carbId, newID: carbId, at: at.addingTimeInterval(60))
+        let times = HealthIngestTherapy.carbTimes(id: carbId.uuidString)
+        #expect(times.enteredAt == at)
+        #expect(times.editedAt == at.addingTimeInterval(60))
+        let drained = HealthIngestTherapy.drain(preferences: .initial)
+        #expect(drained.contains { $0.type == HealthIngestType.bolusDecision && $0.id == decisionId.uuidString })
+        #expect(drained.contains { $0.type == HealthIngestType.cgmEvent })
+        #expect(!drained.contains { $0.type == HealthIngestType.bolusFailure })
+        #expect(HealthIngestTherapy.drain(preferences: .initial).isEmpty)
+    }
+
+    @Test func therapyFileLoadDoesNotBlockAndMergesTheRecord() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-load-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            HealthIngestTherapy.beforeDiskRead = nil
+            HealthIngestTherapy.afterLoad = nil
+            HealthIngestTherapy.useTestDirectory(nil)
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let seeded = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        let json = """
+        {"\(seeded)":{"enteredAt":"2026-01-02T03:04:05.000Z"}}
+        """
+        try json.write(to: directory.appendingPathComponent("carb-times.json"), atomically: true, encoding: .utf8)
+        HealthIngestTherapy.useTestDirectory(directory)
+
+        final class LoadFlag: @unchecked Sendable {
+            let lock = NSLock()
+            var value = false
+        }
+        let flag = LoadFlag()
+        HealthIngestTherapy.beforeDiskRead = {
+            Thread.sleep(forTimeInterval: 0.8)
+        }
+        HealthIngestTherapy.afterLoad = {
+            flag.lock.lock()
+            flag.value = true
+            flag.lock.unlock()
+        }
+
+        let fresh = UUID()
+        let entered = Date(timeIntervalSince1970: 1_700_000_100)
+        let started = Date()
+        HealthIngestTherapy.noteCarbEntered(id: fresh, at: entered)
+        #expect(Date().timeIntervalSince(started) < 0.3)
+        #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
+        #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt == nil)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            flag.lock.lock()
+            let done = flag.value
+            flag.lock.unlock()
+            if done { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        flag.lock.lock()
+        let loaded = flag.value
+        flag.lock.unlock()
+        #expect(loaded)
+        #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt != nil)
+        #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
+    }
+
+    private func therapyReport(simulatedCob: Int16?, at: Date) -> BolusCalculationReport {
+        BolusCalculationReport(
+            input: CalculationInput(
+                carbs: 40,
+                currentBG: 121,
+                deltaBG: 8,
+                target: 110,
+                isf: 50,
+                carbRatio: 10,
+                iob: 1.2,
+                cob: simulatedCob ?? 15,
+                useFattyMealCorrectionFactor: true,
+                fattyMealFactor: 1.2,
+                useSuperBolus: false,
+                sweetMealFactor: 0,
+                basal: 0.9,
+                fraction: 0.8,
+                maxBolus: 8,
+                maxIOB: 10,
+                maxCOB: 120,
+                minPredBG: 95,
+                lastLoopDate: at.addingTimeInterval(-90)
+            ),
+            result: CalculationResult(
+                insulinCalculated: 2.5,
+                factoredInsulin: 2.5,
+                wholeCalc: 3.1,
+                iobInsulinReduction: -1.2,
+                superBolusInsulin: 0,
+                targetDifference: 11,
+                targetDifferenceInsulin: 0.2,
+                fifteenMinutesInsulin: 0.1,
+                wholeCob: 55,
+                wholeCobInsulin: 4
+            ),
+            loopCob: 15,
+            simulatedCob: simulatedCob,
+            enteredCarbs: 40,
+            backdated: false
+        )
     }
 
     private func queued(id: String, type: String, hash: String) -> HealthIngestQueuedRecord {

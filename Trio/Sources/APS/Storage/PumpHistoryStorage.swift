@@ -15,7 +15,9 @@ protocol PumpHistoryStorage {
     /// Returns the ids of purged events that were already uploaded to NS,
     /// so the caller can delete the now-withdrawn treatments remotely.
     @discardableResult func storePumpEvents(_ events: [NewPumpEvent], replacePendingEvents: Bool) async throws -> [String]
-    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async
+    /// The pump-event id of the stored external dose. Callers attach a bolus link after this returns.
+    @discardableResult
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async -> String
     func getPumpHistoryNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
     func getPumpHistoryNotYetUploadedToHealth() async throws -> [PumpHistoryEvent]
     func getPumpHistoryNotYetUploadedToTidepool() async throws -> [PumpHistoryEvent]
@@ -157,6 +159,13 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
                     newBolusEntry.isExternal = dose.manuallyEntered
                     newBolusEntry.isProgrammedByPumpUI = dose.wasProgrammedByPumpUI
                     newBolusEntry.isSMB = dose.automatic ?? true
+                    HealthIngestTherapy.claimBolusLink(
+                        eventId: newPumpEvent.id ?? "",
+                        units: newBolusEntry.programmedAmount?.doubleValue
+                            ?? newBolusEntry.amount?.doubleValue
+                            ?? 0,
+                        at: newPumpEvent.timestamp ?? event.date
+                    )
 
                 case .tempBasal:
                     guard let dose = event.dose else {
@@ -177,9 +186,10 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
 
                 case .pumpAlarm:
                     newPumpEvent.note = event.title
+                    Self.noteHealthIngestPumpEvent(newPumpEvent, source: event)
 
                 default:
-                    break
+                    Self.noteHealthIngestPumpEvent(newPumpEvent, source: event)
                 }
 
                 // same-batch dedup
@@ -301,11 +311,12 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
         }
     }
 
-    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async {
+    @discardableResult
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async -> String {
         let context = makeContext()
         context.name = "storeExternalInsulinEvent"
         context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
-        await context.perform {
+        return await context.perform {
             // create pump event
             let newPumpEvent = PumpEventStored(context: context)
             let identifier = UUID().uuidString
@@ -329,13 +340,14 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
             newBolusEntry.isSMB = false // the dose is manually administered
 
             do {
-                guard context.hasChanges else { return }
+                guard context.hasChanges else { return identifier }
                 try context.save()
                 debug(.storage, "Saved external insulin \(amount) U")
                 self.updateSubject.send(())
             } catch {
                 warning(.storage, "Saving external insulin failed", error: error)
             }
+            return identifier
         }
     }
 
@@ -679,6 +691,41 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
 }
 
 extension BasePumpHistoryStorage {
+    fileprivate static func noteHealthIngestPumpEvent(_ stored: PumpEventStored, source: NewPumpEvent) {
+        HealthIngestTherapy.notePumpEvent(
+            id: stored.id,
+            eventType: stored.type ?? "",
+            at: stored.timestamp ?? source.date,
+            alarmKind: Self.alarmKind(source.alarmType),
+            alarmMessage: Self.alarmMessage(source)
+        )
+    }
+
+    fileprivate static func alarmKind(_ alarm: PumpAlarmType?) -> String? {
+        switch alarm {
+        case .autoOff: return "auto_off"
+        case .lowInsulin: return "low_insulin"
+        case .lowPower: return "low_power"
+        case .noDelivery: return "no_delivery"
+        case .noInsulin: return "no_insulin"
+        case .noPower: return "no_power"
+        case .occlusion: return "occlusion"
+        case .other: return "other"
+        case nil: return nil
+        }
+    }
+
+    fileprivate static func alarmMessage(_ event: NewPumpEvent) -> String? {
+        switch event.alarmType {
+        case let .other(details):
+            return event.title.isEmpty ? details : event.title
+        case nil:
+            return event.type == .alarm ? event.title : nil
+        default:
+            return event.type == .alarm ? event.title : nil
+        }
+    }
+
     /// Fallback upsert key for events without a dose identifier.
     struct TimestampAndType: Hashable {
         let timestamp: Date

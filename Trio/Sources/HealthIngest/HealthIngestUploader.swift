@@ -4,6 +4,55 @@ import HealthKit
 import Swinject
 import UIKit
 
+/// What a mapping-version bump re-sends.
+///
+/// Going from stored version N to current version M applies every registered step
+/// from N+1 through M. HealthKit is reset if any of those steps resets it, and the
+/// Core Data rewind is the longest any of them asks for. A step that is not
+/// registered falls back to a full reset, so a version bump with no rule cannot
+/// leave HealthKit cursors in place while the new fields stay unsent.
+/// A downgrade (stored version already at or above the running build) changes nothing:
+/// cursors, anchors, and the stored version stay as they are.
+enum HealthIngestMappingUpgrade {
+    struct Step: Equatable {
+        var resetHealthKit: Bool
+        var rewindCoreDataDays: Int
+    }
+
+    struct Plan: Equatable {
+        var resetHealthKit: Bool
+        var rewindCoreDataDays: Int
+    }
+
+    /// The version being entered, and what that step needs re-sent.
+    /// Versions 1 through 6 are the historical full reset. Version 7 only rewinds
+    /// Core Data, so a version-6 HealthKit backfill keeps its cursors and anchors.
+    static let steps: [Int: Step] = [
+        1: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        2: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        3: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        4: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        5: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        6: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        7: Step(resetHealthKit: false, rewindCoreDataDays: 90)
+    ]
+
+    /// Used when the range N+1...M contains a version with no step.
+    static let fullReset = Plan(resetHealthKit: true, rewindCoreDataDays: 90)
+
+    static func plan(storedVersion: Int, currentVersion: Int) -> Plan? {
+        guard storedVersion < currentVersion else { return nil }
+        var resetHealthKit = false
+        var rewindDays = 0
+        for version in (storedVersion + 1)...currentVersion {
+            guard let step = steps[version] else { return fullReset }
+            resetHealthKit = resetHealthKit || step.resetHealthKit
+            rewindDays = max(rewindDays, step.rewindCoreDataDays)
+        }
+        return Plan(resetHealthKit: resetHealthKit, rewindCoreDataDays: rewindDays)
+    }
+}
+
 /// Uploads Trio and HealthKit data to a private ingest server. The loop never waits on this.
 /// Work runs on a utility task, batches, and backs off. The queue is on disk.
 final class HealthIngestUploader: ObservableObject, Injectable {
@@ -257,18 +306,30 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
     }
 
-    private func applyMappingUpgradeIfNeeded() async {
-        guard let queue = try? prepare(), let health, let disk else { return }
-        guard disk.loadMappingVersion() < HealthIngestWire.mappingVersion else { return }
-        await queue.forgetRejectedReceipts()
-        await queue.clearRejections()
-        await queue.dropTypes(HealthIngestType.contractResendTypes)
-        health.resetBackfillCursors()
-        HealthIngestLoopCapture.requeueStoredProfiles()
+    func applyMappingUpgradeIfNeeded() async {
+        if disk == nil || health == nil {
+            guard (try? prepare()) != nil else { return }
+        }
+        guard let disk, let health else { return }
+        let stored = disk.loadMappingVersion()
+        guard let plan = HealthIngestMappingUpgrade.plan(
+            storedVersion: stored,
+            currentVersion: HealthIngestWire.mappingVersion
+        ) else { return }
+        if plan.resetHealthKit {
+            let queue = self.queue ?? HealthIngestQueue(disk: disk)
+            await queue.forgetRejectedReceipts()
+            await queue.clearRejections()
+            await queue.dropTypes(HealthIngestType.contractResendTypes)
+            health.resetBackfillCursors()
+            HealthIngestLoopCapture.requeueStoredProfiles()
+        }
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
-        rewindCoreDataRead(days: 90)
-        let depth = await queue.depth()
-        let priorityDepth = await queue.priorityDepth()
+        if plan.rewindCoreDataDays > 0 {
+            rewindCoreDataRead(days: plan.rewindCoreDataDays)
+        }
+        let depth = await self.queue?.depth() ?? 0
+        let priorityDepth = await self.queue?.priorityDepth() ?? 0
         publishSnapshot(depth: depth, priorityDepth: priorityDepth)
     }
 
@@ -557,6 +618,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                     extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
                 }
                 extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
+                extra.append(contentsOf: HealthIngestTherapy.drain(preferences: prefs))
                 if since.backfill {
                     health.beginBackfill(since: since.date, preferences: prefs)
                 }

@@ -489,6 +489,7 @@ extension Treatments {
             }
             .onDisappear {
                 state.isActive = false
+                state.abandonBolusRecommendation()
                 state.addButtonPressed = false
 
                 // Cancel all Combine subscriptions and unregister State from broadcaster

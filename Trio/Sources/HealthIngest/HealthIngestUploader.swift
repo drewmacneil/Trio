@@ -53,6 +53,141 @@ enum HealthIngestMappingUpgrade {
     }
 }
 
+/// Which Core Data windows one pass reads, in order.
+///
+/// A HealthKit backfill still uses one cursor and is the only read that starts
+/// `beginBackfill`. A Core Data rewind keeps a separate cursor: every pass reads
+/// the live window first, then one historical chunk. That chunk never starts a
+/// HealthKit backfill and never moves the backfill window.
+enum HealthIngestDiabetesSchedule {
+    struct Read: Equatable {
+        enum Role: Equatable {
+            case live
+            case historical
+            /// The Core Data window that belongs to an explicit HealthKit backfill.
+            case healthKitBackfill
+        }
+
+        var role: Role
+        var since: Date
+        var until: Date?
+    }
+
+    struct Plan: Equatable {
+        var reads: [Read]
+        /// When true, write `historicalResume` (nil clears a finished rewind).
+        var persistHistorical: Bool
+        var historicalResume: Date?
+        var persistDiabetesResume: Bool
+        var diabetesResume: Date?
+        /// Set when a HealthKit backfill was requested during a Core Data rewind.
+        /// The live window stays the first read. Nil for every other plan.
+        var healthKitBackfillSince: Date?
+    }
+
+    static let liveLookback: TimeInterval = 36 * 3600
+    static let liveOverlap: TimeInterval = 6 * 3600
+    static let maxLookback: TimeInterval = 90 * 24 * 3600
+    static let caughtUpSlack: TimeInterval = 60
+
+    /// The earlier of "the last 36 hours" and "since the last live success",
+    /// not older than 90 days. Trio does not keep treatment history past that.
+    static func liveSince(now: Date, lastLiveSuccess: Date?) -> Date {
+        let regular = now.addingTimeInterval(-liveLookback)
+        let catchUp = lastLiveSuccess?.addingTimeInterval(-liveOverlap) ?? regular
+        let oldest = now.addingTimeInterval(-maxLookback)
+        return max(oldest, min(regular, catchUp))
+    }
+
+    static func windowEnd(from start: Date, chunk: TimeInterval, now: Date) -> Date? {
+        let end = start.addingTimeInterval(chunk)
+        return end < now.addingTimeInterval(-caughtUpSlack) ? end : nil
+    }
+
+    static func plan(
+        now: Date,
+        chunk: TimeInterval,
+        lastLiveSuccess: Date?,
+        backfillRequest: Date?,
+        diabetesResume: Date?,
+        historicalResume: Date?
+    ) -> Plan {
+        if let historical = historicalResume {
+            return historicalPlan(
+                now: now,
+                chunk: chunk,
+                lastLiveSuccess: lastLiveSuccess,
+                historical: historical,
+                backfillRequest: backfillRequest
+            )
+        }
+        if let requested = backfillRequest {
+            let until = windowEnd(from: requested, chunk: chunk, now: now)
+            return Plan(
+                reads: [Read(role: .healthKitBackfill, since: requested, until: until)],
+                persistHistorical: false,
+                historicalResume: nil,
+                persistDiabetesResume: true,
+                diabetesResume: until,
+                healthKitBackfillSince: nil
+            )
+        }
+        if let resume = diabetesResume {
+            let until = windowEnd(from: resume, chunk: chunk, now: now)
+            return Plan(
+                reads: [Read(role: .live, since: resume, until: until)],
+                persistHistorical: false,
+                historicalResume: nil,
+                persistDiabetesResume: true,
+                diabetesResume: until,
+                healthKitBackfillSince: nil
+            )
+        }
+        let since = liveSince(now: now, lastLiveSuccess: lastLiveSuccess)
+        let until = windowEnd(from: since, chunk: chunk, now: now)
+        return Plan(
+            reads: [Read(role: .live, since: since, until: until)],
+            persistHistorical: false,
+            historicalResume: nil,
+            persistDiabetesResume: true,
+            diabetesResume: until,
+            healthKitBackfillSince: nil
+        )
+    }
+
+    private static func historicalPlan(
+        now: Date,
+        chunk: TimeInterval,
+        lastLiveSuccess: Date?,
+        historical: Date,
+        backfillRequest: Date?
+    ) -> Plan {
+        let live = liveSince(now: now, lastLiveSuccess: lastLiveSuccess)
+        var reads = [Read(role: .live, since: live, until: nil)]
+        var next: Date? = historical
+        if historical >= now.addingTimeInterval(-caughtUpSlack) {
+            next = nil
+        } else {
+            let end = historical.addingTimeInterval(chunk)
+            if end >= now.addingTimeInterval(-caughtUpSlack) {
+                reads.append(Read(role: .historical, since: historical, until: nil))
+                next = nil
+            } else {
+                reads.append(Read(role: .historical, since: historical, until: end))
+                next = end
+            }
+        }
+        return Plan(
+            reads: reads,
+            persistHistorical: true,
+            historicalResume: next,
+            persistDiabetesResume: false,
+            diabetesResume: nil,
+            healthKitBackfillSince: backfillRequest
+        )
+    }
+}
+
 /// Uploads Trio and HealthKit data to a private ingest server. The loop never waits on this.
 /// Work runs on a utility task, batches, and backs off. The queue is on disk.
 final class HealthIngestUploader: ObservableObject, Injectable {
@@ -90,7 +225,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     /// HealthKit background delivery starts with the small background budget.
     private var appActive = false
     private var diabetesResume: Date?
+    /// Core Data rewind cursor. Independent of `diabetesResume` and of the HealthKit backfill.
+    private var historicalResume: Date?
     private var lastDiabetesRead: Date?
+    /// Test seam. A Core Data rewind is already on disk; return before the mapping
+    /// version is saved, as if the process was killed between the two writes.
+    var stopAfterPersistingCoreDataRewind = false
     private var backfillDayCount = 0
     private var backfillWindowStart: Date?
     private var backfillRowsSent = 0
@@ -160,6 +300,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         self.preferences = preferences
         self.disk = disk
         health = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk)
+        historicalResume = disk.loadHistoricalResume()
     }
 
     /// Restores backfill progress the way a launch does, then returns the status snapshot
@@ -323,17 +464,47 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             await queue.dropTypes(HealthIngestType.contractResendTypes)
             health.resetBackfillCursors()
             HealthIngestLoopCapture.requeueStoredProfiles()
+            if plan.rewindCoreDataDays > 0 {
+                rewindCoreDataRead(days: plan.rewindCoreDataDays)
+            }
+        } else if plan.rewindCoreDataDays > 0 {
+            // The rewind is on disk before the version. A kill between the two
+            // leaves the old version, so the next launch retries and keeps this cursor.
+            persistCoreDataRewind(days: plan.rewindCoreDataDays)
+            if stopAfterPersistingCoreDataRewind { return }
         }
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
-        if plan.rewindCoreDataDays > 0 {
-            rewindCoreDataRead(days: plan.rewindCoreDataDays)
-        }
         let depth = await self.queue?.depth() ?? 0
         let priorityDepth = await self.queue?.priorityDepth() ?? 0
         publishSnapshot(depth: depth, priorityDepth: priorityDepth)
     }
 
-    /// Next diabetes read starts at the beginning of the window so stored loop cycles are sent again.
+    /// Writes the Core Data rewind cursor. A cursor already on disk is kept, so a
+    /// retry after a kill does not move it. Does not call `beginBackfill` and does
+    /// not write the HealthKit backfill window.
+    private func persistCoreDataRewind(days: Int) {
+        guard let disk else { return }
+        let existing = disk.loadHistoricalResume()
+        let since: Date
+        if let existing {
+            since = existing
+        } else {
+            let bounded = min(max(days, 1), 90)
+            since = Date().addingTimeInterval(-Double(bounded) * 24 * 3600)
+            disk.saveHistoricalResume(since)
+            disk.saveDiabetesResume(nil)
+        }
+        stateLock.lock()
+        historicalResume = since
+        if existing == nil {
+            diabetesResume = nil
+            backfillSince = nil
+        }
+        stateLock.unlock()
+    }
+
+    /// HealthKit-resetting steps only. The next diabetes read starts here and calls
+    /// `beginBackfill`. A Core Data-only step uses `persistCoreDataRewind` instead.
     private func rewindCoreDataRead(days: Int) {
         let bounded = min(max(days, 1), 90)
         let since = Date().addingTimeInterval(-Double(bounded) * 24 * 3600)
@@ -478,6 +649,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         lastSuccess = persisted.lastSuccess
         lastError = persisted.lastError
         diabetesResume = disk.loadDiabetesResume()
+        historicalResume = disk.loadHistoricalResume()
         stateLock.unlock()
         restoreBackfillProgress()
         return queue
@@ -597,33 +769,41 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 throttled: throttled
             )
             if gate.readDiabetes {
-                let since = takeSince()
-                // A long catch-up or backfill is read one window at a time, not as one fetch.
-                let until = windowEnd(from: since.date, chunk: budget.diabetesChunk)
                 let devices = resolverDevices()
-                let diabetes = await adapter.records(
-                    since: since.date,
-                    until: until,
-                    preferences: prefs,
-                    settings: settingsManager,
-                    profiles: profiles,
-                    pumpModel: devices.model,
-                    supportedBasalRates: devices.rates
+                let readErrors = await runScheduledDiabetesPass(
+                    now: now,
+                    chunk: budget.diabetesChunk,
+                    read: { spec in
+                        let diabetes = await adapter.records(
+                            since: spec.since,
+                            until: spec.until,
+                            preferences: prefs,
+                            settings: settingsManager,
+                            profiles: profiles,
+                            pumpModel: devices.model,
+                            supportedBasalRates: devices.rates
+                        )
+                        var batch = diabetes.records
+                        let batchErrors = diabetes.errors
+                        if spec.role != .historical {
+                            if prefs.isOn(.loopCycles) {
+                                batch.append(contentsOf: timeZoneChange(disk: disk))
+                                batch.append(contentsOf: HealthIngestLoopCapture.drainStats())
+                                batch.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
+                            }
+                            batch.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
+                            batch.append(contentsOf: HealthIngestTherapy.drain(preferences: prefs))
+                        }
+                        return (batch, batchErrors)
+                    },
+                    onHealthKitBackfill: { since in
+                        health.beginBackfill(since: since, preferences: prefs)
+                    },
+                    enqueue: { records in
+                        await enqueuePage(records)
+                    }
                 )
-                errors.append(contentsOf: diabetes.errors)
-                var extra: [HealthIngestRecord] = []
-                if prefs.isOn(.loopCycles) {
-                    extra.append(contentsOf: timeZoneChange(disk: disk))
-                    extra.append(contentsOf: HealthIngestLoopCapture.drainStats())
-                    extra.append(contentsOf: HealthIngestLoopCapture.drainProfiles())
-                }
-                extra.append(contentsOf: deletions(live: diabetes.liveIDs, disk: disk))
-                extra.append(contentsOf: HealthIngestTherapy.drain(preferences: prefs))
-                if since.backfill {
-                    health.beginBackfill(since: since.date, preferences: prefs)
-                }
-                await enqueuePage(diabetes.records + extra)
-                setDiabetesResume(until)
+                errors.append(contentsOf: readErrors)
                 setLastDiabetesRead(now)
             }
             if !Task.isCancelled {
@@ -784,30 +964,68 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
     }
 
-    private func takeSince() -> (date: Date, backfill: Bool) {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        if let requested = backfillSince {
-            backfillSince = nil
-            diabetesResume = nil
-            return (requested, true)
+    /// Reads the live window, then one historical chunk when a Core Data rewind is
+    /// in progress, and enqueues each before the next read starts. Returns read errors.
+    /// `beginBackfill` runs only from `onHealthKitBackfill`.
+    func runScheduledDiabetesPass(
+        now: Date,
+        chunk: TimeInterval,
+        read: (HealthIngestDiabetesSchedule.Read) async -> (records: [HealthIngestRecord], errors: [String]),
+        onHealthKitBackfill: (Date) -> Void,
+        enqueue: ([HealthIngestRecord]) async -> Void
+    ) async -> [String] {
+        let plan = takeDiabetesPlan(now: now, chunk: chunk)
+        var errors: [String] = []
+        for (index, spec) in plan.reads.enumerated() {
+            let batch = await read(spec)
+            errors.append(contentsOf: batch.errors)
+            if spec.role == .healthKitBackfill {
+                onHealthKitBackfill(spec.since)
+            }
+            await enqueue(batch.records)
+            if index == 0, spec.role != .healthKitBackfill, let since = plan.healthKitBackfillSince {
+                onHealthKitBackfill(since)
+            }
         }
-        if let resume = diabetesResume {
-            diabetesResume = nil
-            return (resume, false)
-        }
-        // 36 hours covers a normal gap. If the last success is older, catch up from there.
-        // Trio deletes most history after 90 days, so there is nothing useful past that.
-        let regular = Date().addingTimeInterval(-36 * 3600)
-        let catchUp = lastSuccess?.addingTimeInterval(-6 * 3600) ?? regular
-        let oldest = Date().addingTimeInterval(-90 * 24 * 3600)
-        return (max(oldest, min(regular, catchUp)), false)
+        commitDiabetesPlan(plan)
+        return errors
     }
 
-    /// End of the window to read now, or nil when the window reaches the present.
-    private func windowEnd(from start: Date, chunk: TimeInterval) -> Date? {
-        let end = start.addingTimeInterval(chunk)
-        return end < Date().addingTimeInterval(-60) ? end : nil
+    func currentSnapshot() -> HealthIngestStatus {
+        makeSnapshot(depth: 0, priorityDepth: 0)
+    }
+
+    private func takeDiabetesPlan(now: Date, chunk: TimeInterval) -> HealthIngestDiabetesSchedule.Plan {
+        stateLock.lock()
+        let requested = backfillSince
+        let resume = diabetesResume
+        let historical = historicalResume
+        let success = lastSuccess
+        if requested != nil { backfillSince = nil }
+        stateLock.unlock()
+        var plan = HealthIngestDiabetesSchedule.plan(
+            now: now,
+            chunk: chunk,
+            lastLiveSuccess: success,
+            backfillRequest: requested,
+            diabetesResume: resume,
+            historicalResume: historical
+        )
+        // A leftover single cursor would hide the live window for the rest of the rewind.
+        if historical != nil, resume != nil {
+            plan.persistDiabetesResume = true
+            plan.diabetesResume = nil
+        }
+        return plan
+    }
+
+    private func commitDiabetesPlan(_ plan: HealthIngestDiabetesSchedule.Plan) {
+        if plan.persistDiabetesResume {
+            setDiabetesResume(plan.diabetesResume)
+        }
+        if plan.persistHistorical {
+            setHistoricalResume(plan.historicalResume)
+        }
     }
 
     private func lockedDiabetesResume() -> Date? {
@@ -823,11 +1041,24 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         disk?.saveDiabetesResume(date)
     }
 
+    private func setHistoricalResume(_ date: Date?) {
+        stateLock.lock()
+        historicalResume = date
+        stateLock.unlock()
+        disk?.saveHistoricalResume(date)
+    }
+
+    private func lockedHistoricalResume() -> Date? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return historicalResume
+    }
+
     /// NSLock is unavailable directly inside an async function.
     private func lockedActivity() -> (active: Bool, catchingUp: Bool) {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return (appActive, diabetesResume != nil)
+        return (appActive, diabetesResume != nil || historicalResume != nil)
     }
 
     private func lockedLastDiabetesRead() -> Date? {
@@ -1040,6 +1271,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
+        let rewindingTrio = lockedHistoricalResume() != nil
         return HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
@@ -1050,7 +1282,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             backfillRunning: running,
             latestRejectReason: log.latestReason,
             rejectGroups: log.groups(),
-            backfill: running ? backfillProgress(preferences: prefs) : nil
+            backfill: running ? backfillProgress(preferences: prefs) : nil,
+            trioHistoryPhase: rewindingTrio ? HealthIngestStatus.resendingTrioHistory : nil
         )
     }
 

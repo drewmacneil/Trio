@@ -62,8 +62,9 @@ enum HealthIngestWire {
     /// carbs required, and carb ratio. Those values are already on
     /// `OrefDetermination`. The receipt hash changes only when the payload does,
     /// so an unchanged HealthKit sample or treatment is not uploaded again.
-    /// An upgrade from 6 does not clear HealthKit cursors or anchors. A fresh
-    /// install, or an upgrade from before 6, still resets that backfill.
+    /// An upgrade from 6 does not clear HealthKit cursors or anchors, and it does
+    /// not start a HealthKit backfill. Stored Trio rows are reread from their own
+    /// cursor. A fresh install, or an upgrade from before 6, still resets that backfill.
     /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
     /// A missing step resets the HealthKit backfill instead of skipping the resend.
     static let mappingVersion = 7

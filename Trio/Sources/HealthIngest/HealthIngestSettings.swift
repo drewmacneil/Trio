@@ -286,6 +286,11 @@ struct HealthIngestStatus: Equatable {
     var latestRejectReason: String?
     var rejectGroups: [HealthIngestRejectGroup] = []
     var backfill: HealthIngestBackfillProgress?
+    /// Set while stored Trio rows are being reread. This is not a HealthKit backfill,
+    /// so the Health day counter stays off.
+    var trioHistoryPhase: String? = nil
+
+    static let resendingTrioHistory = "Resending stored Trio history"
 }
 
 /// Upload preferences live in UserDefaults. The bearer token lives only in the Keychain.

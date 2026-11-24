@@ -1441,7 +1441,8 @@ import Testing
             crUsed: 10
         )
         #expect(loop["glucoseMgdl"] != nil)
-        #expect(loop["recommendedBolus"] == nil)
+        // Values are optional, so a nil bolus is stored as `.some(nil)`. Flatten before comparing.
+        #expect(loop["recommendedBolus"] ?? nil == nil)
         #expect(loop["crUsed"] != nil)
         #expect(HealthIngestTherapy.loopFields(
             glucoseMgdl: 5000,

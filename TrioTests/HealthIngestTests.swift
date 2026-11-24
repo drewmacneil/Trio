@@ -630,6 +630,49 @@ import Testing
         }
     }
 
+    @Test func mappingVersionRegistersTheStepThatReachesIt() {
+        let current = HealthIngestWire.mappingVersion
+        let step = HealthIngestMappingUpgrade.steps[current]
+        #expect(step != nil)
+        let entered = HealthIngestMappingUpgrade.plan(storedVersion: current - 1, currentVersion: current)
+        #expect(entered?.resetHealthKit == step?.resetHealthKit)
+        #expect(entered?.rewindCoreDataDays == step?.rewindCoreDataDays)
+    }
+
+    @Test func mappingUpgradeSkippedVersionsUnionTheStepsOrFullReset() {
+        // 5 → 7 applies version 6's HealthKit reset and version 7's Core Data rewind.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 5, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: true, rewindCoreDataDays: 90))
+        // 6 → 7 is only version 7, so HealthKit cursors stay.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        // Version 8 has no step. Crossing it, from 6 or from 7, is a full reset.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.fullReset)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 7, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.fullReset)
+    }
+
+    @Test func mappingDowngradeLeavesCursorsAndStoredVersionAlone() async throws {
+        let current = HealthIngestWire.mappingVersion
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: current) == nil)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: current, currentVersion: current) == nil)
+
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([1, 2, 3, 4])
+        disk.saveMappingVersion(9)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await uploader.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == 9)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+    }
+
     @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
         #expect(HealthIngestWire.mappingVersion == 7)
         let disk = try makeDisk()
@@ -1516,6 +1559,62 @@ import Testing
         #expect(drained.contains { $0.type == HealthIngestType.cgmEvent })
         #expect(!drained.contains { $0.type == HealthIngestType.bolusFailure })
         #expect(HealthIngestTherapy.drain(preferences: .initial).isEmpty)
+    }
+
+    @Test func therapyFileLoadDoesNotBlockAndMergesTheRecord() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-load-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer {
+            HealthIngestTherapy.beforeDiskRead = nil
+            HealthIngestTherapy.afterLoad = nil
+            HealthIngestTherapy.useTestDirectory(nil)
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        let seeded = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        let json = """
+        {"\(seeded)":{"enteredAt":"2026-01-02T03:04:05.000Z"}}
+        """
+        try json.write(to: directory.appendingPathComponent("carb-times.json"), atomically: true, encoding: .utf8)
+        HealthIngestTherapy.useTestDirectory(directory)
+
+        final class LoadFlag: @unchecked Sendable {
+            let lock = NSLock()
+            var value = false
+        }
+        let flag = LoadFlag()
+        HealthIngestTherapy.beforeDiskRead = {
+            Thread.sleep(forTimeInterval: 0.8)
+        }
+        HealthIngestTherapy.afterLoad = {
+            flag.lock.lock()
+            flag.value = true
+            flag.lock.unlock()
+        }
+
+        let fresh = UUID()
+        let entered = Date(timeIntervalSince1970: 1_700_000_100)
+        let started = Date()
+        HealthIngestTherapy.noteCarbEntered(id: fresh, at: entered)
+        #expect(Date().timeIntervalSince(started) < 0.3)
+        #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
+        #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt == nil)
+
+        let deadline = Date().addingTimeInterval(3)
+        while Date() < deadline {
+            flag.lock.lock()
+            let done = flag.value
+            flag.lock.unlock()
+            if done { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        flag.lock.lock()
+        let loaded = flag.value
+        flag.lock.unlock()
+        #expect(loaded)
+        #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt != nil)
+        #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
     }
 
     private func therapyReport(simulatedCob: Int16?, at: Date) -> BolusCalculationReport {

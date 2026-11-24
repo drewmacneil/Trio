@@ -42,13 +42,10 @@ final class BolusIntentRequest: BaseIntentsRequest {
         } else {
             bolusQuantity = apsManager.roundBolus(amount: Decimal(bolusAmount))
             let loggedAt = Date()
-            HealthIngestTherapy.rememberBolusLink(
-                decisionId: nil,
-                source: "phone",
-                units: NSDecimalNumber(decimal: bolusQuantity).doubleValue,
-                at: loggedAt
-            )
-            await pumpHistoryStorage.storeExternalInsulinEvent(amount: bolusQuantity, timestamp: loggedAt)
+            let eventId = await pumpHistoryStorage.storeExternalInsulinEvent(amount: bolusQuantity, timestamp: loggedAt)
+            let units = NSDecimalNumber(decimal: bolusQuantity).doubleValue
+            HealthIngestTherapy.rememberBolusLink(decisionId: nil, source: "phone", units: units, at: loggedAt)
+            HealthIngestTherapy.claimBolusLink(eventId: eventId, units: units, at: loggedAt)
             // perform determine basal sync
             try await apsManager.determineBasalSync()
 

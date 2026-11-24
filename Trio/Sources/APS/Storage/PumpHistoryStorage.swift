@@ -15,7 +15,9 @@ protocol PumpHistoryStorage {
     /// Returns the ids of purged events that were already uploaded to NS,
     /// so the caller can delete the now-withdrawn treatments remotely.
     @discardableResult func storePumpEvents(_ events: [NewPumpEvent], replacePendingEvents: Bool) async throws -> [String]
-    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async
+    /// The pump-event id of the stored external dose. Callers attach a bolus link after this returns.
+    @discardableResult
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async -> String
     func getPumpHistoryNotYetUploadedToNightscout() async throws -> [NightscoutTreatment]
     func getPumpHistoryNotYetUploadedToHealth() async throws -> [PumpHistoryEvent]
     func getPumpHistoryNotYetUploadedToTidepool() async throws -> [PumpHistoryEvent]
@@ -309,11 +311,12 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
         }
     }
 
-    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async {
+    @discardableResult
+    func storeExternalInsulinEvent(amount: Decimal, timestamp: Date) async -> String {
         let context = makeContext()
         context.name = "storeExternalInsulinEvent"
         context.mergePolicy = NSMergeByPropertyStoreTrumpMergePolicy
-        await context.perform {
+        return await context.perform {
             // create pump event
             let newPumpEvent = PumpEventStored(context: context)
             let identifier = UUID().uuidString
@@ -335,20 +338,16 @@ final class BasePumpHistoryStorage: PumpHistoryStorage, Injectable {
             newBolusEntry.programmedAmount = amount as NSDecimalNumber
             newBolusEntry.isExternal = true // we are creating an external dose
             newBolusEntry.isSMB = false // the dose is manually administered
-            HealthIngestTherapy.claimBolusLink(
-                eventId: identifier,
-                units: NSDecimalNumber(decimal: amount).doubleValue,
-                at: newPumpEvent.timestamp ?? timestamp
-            )
 
             do {
-                guard context.hasChanges else { return }
+                guard context.hasChanges else { return identifier }
                 try context.save()
                 debug(.storage, "Saved external insulin \(amount) U")
                 self.updateSubject.send(())
             } catch {
                 warning(.storage, "Saving external insulin failed", error: error)
             }
+            return identifier
         }
     }
 

@@ -64,6 +64,8 @@ enum HealthIngestWire {
     /// so an unchanged HealthKit sample or treatment is not uploaded again.
     /// An upgrade from 6 does not clear HealthKit cursors or anchors. A fresh
     /// install, or an upgrade from before 6, still resets that backfill.
+    /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
+    /// A missing step resets the HealthKit backfill instead of skipping the resend.
     static let mappingVersion = 7
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {

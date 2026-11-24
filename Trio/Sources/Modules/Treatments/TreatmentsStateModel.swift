@@ -727,16 +727,18 @@ extension Treatments {
                     // Dev reads `amount` here, after authentication, not at the cap above.
                     let loggedAmount = amount
                     // store external dose to pump history
-                    await pumpHistoryStorage.storeExternalInsulinEvent(amount: loggedAmount, timestamp: date)
+                    let eventId = await pumpHistoryStorage.storeExternalInsulinEvent(amount: loggedAmount, timestamp: date)
                     info(.bolus, "External insulin of \(amount) U logged")
                     let decisionId = shownBolus?.decisionId
                     closeBolusRecommendation(enteredUnits: loggedAmount, external: true, skipped: false)
+                    let units = NSDecimalNumber(decimal: loggedAmount).doubleValue
                     HealthIngestTherapy.rememberBolusLink(
                         decisionId: decisionId,
                         source: "phone",
-                        units: NSDecimalNumber(decimal: loggedAmount).doubleValue,
+                        units: units,
                         at: date
                     )
+                    HealthIngestTherapy.claimBolusLink(eventId: eventId, units: units, at: date)
                     // perform determine basal sync
                     try await apsManager.determineBasalSync()
                 }

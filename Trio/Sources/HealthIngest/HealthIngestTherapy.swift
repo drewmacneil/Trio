@@ -8,10 +8,13 @@ enum HealthIngestTherapy {
     static let watchRecommendationLifetime: TimeInterval = 10 * 60
 
     private static let lock = NSLock()
-    /// Disk writes for bolus links. The dose path only appends in memory.
+    /// Therapy JSON reads and writes. Callers never sync onto this queue and never read the files themselves.
     private static let fileQueue = DispatchQueue(label: "health-ingest.therapy.files", qos: .utility)
     private static var directoryOverride: URL?
     private static var loaded = false
+    private static var loadStarted = false
+    /// Bumped when the test directory changes so an in-flight load cannot install into the new directory.
+    private static var epoch = 0
     private static var pending: [HealthIngestRecord] = []
     /// Records accepted on the caller thread and not yet folded into `pending`.
     private static var stagedRecords: [HealthIngestRecord] = []
@@ -24,6 +27,19 @@ enum HealthIngestTherapy {
     private static var watchPending: WatchPending?
     private static var bolusAttempt: BolusAttempt?
     private static var sensorWasWarmup = false
+    /// Claims that arrived before the matching link was in memory. Applied when the link is remembered or the files finish loading.
+    private static var pendingClaims: [PendingClaim] = []
+
+    /// Test-only. Runs on the file queue, before the therapy files are read. Nil in the app.
+    static var beforeDiskRead: (() -> Void)?
+    /// Test-only. Runs on the file queue after a load has merged into memory. Nil in the app.
+    static var afterLoad: (() -> Void)?
+
+    private struct PendingClaim {
+        var eventId: String
+        var units: Double
+        var at: Date
+    }
 
     private struct CarbStamp: Codable {
         var enteredAt: Date?
@@ -69,11 +85,13 @@ enum HealthIngestTherapy {
     }
 
     /// Points the JSON files at a scratch directory. Pass nil to use Application Support again.
+    /// Does not wait for the file queue. An in-flight read or write from the previous directory is dropped.
     static func useTestDirectory(_ url: URL?) {
-        fileQueue.sync {}
         lock.lock()
+        epoch += 1
         directoryOverride = url
         loaded = false
+        loadStarted = false
         pending = []
         stagedRecords = []
         carbStamps = [:]
@@ -84,6 +102,9 @@ enum HealthIngestTherapy {
         watchPending = nil
         bolusAttempt = nil
         sensorWasWarmup = false
+        pendingClaims = []
+        beforeDiskRead = nil
+        afterLoad = nil
         lock.unlock()
     }
 
@@ -392,8 +413,9 @@ enum HealthIngestTherapy {
 
     // MARK: - Links onto bolus rows
 
-    /// Records a link for a later bolus row. Appends in memory and returns. Does not throw or touch disk.
+    /// Records a link for a later bolus row. Appends in memory and returns. Does not throw, and does not read or write a file.
     static func rememberBolusLink(decisionId: UUID?, source: String, units: Double, at: Date) {
+        startLoadIfNeeded()
         let link = BolusLink(
             decisionId: decisionId?.uuidString,
             source: source,
@@ -403,40 +425,29 @@ enum HealthIngestTherapy {
         )
         lock.lock()
         unsavedLinks.append(link)
+        absorbUnsavedLinksLocked()
+        applyPendingClaimsLocked(keepUnmatched: true)
         lock.unlock()
-        fileQueue.async {
-            Self.persistBolusLinks()
-        }
+        scheduleFlushLinks()
     }
 
     static func claimBolusLink(eventId: String, units: Double, at: Date) {
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         absorbUnsavedLinksLocked()
-        guard !bolusLinks.contains(where: { $0.eventId == eventId }) else {
+        if claimLinkLocked(eventId: eventId, units: units, at: at) {
             lock.unlock()
+            scheduleFlushLinks()
             return
         }
-        let matches = bolusLinks.indices.filter { index in
-            let link = bolusLinks[index]
-            return link.eventId == nil
-                && abs(link.units - units) < 0.051
-                && abs(link.at.timeIntervalSince(at)) < 10 * 60
+        if !loaded, pendingClaims.count < 50 {
+            pendingClaims.append(PendingClaim(eventId: eventId, units: units, at: at))
         }
-        guard let best = matches.min(by: {
-            abs(bolusLinks[$0].at.timeIntervalSince(at)) < abs(bolusLinks[$1].at.timeIntervalSince(at))
-        }) else {
-            lock.unlock()
-            return
-        }
-        bolusLinks[best].eventId = eventId
-        let snapshot = bolusLinks
         lock.unlock()
-        scheduleWrite(snapshot, name: "bolus-links.json")
     }
 
     static func bolusLink(eventId: String) -> (source: String, decisionId: String?)? {
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         absorbUnsavedLinksLocked()
         let link = bolusLinks.first { $0.eventId == eventId }
@@ -454,44 +465,64 @@ enum HealthIngestTherapy {
         }
     }
 
-    private static func persistBolusLinks() {
-        prepareMemory()
-        lock.lock()
-        absorbUnsavedLinksLocked()
-        let snapshot = bolusLinks
-        lock.unlock()
-        writeToDisk(snapshot, name: "bolus-links.json")
+    /// Caller holds `lock`. Returns true when this event id is already claimed or a link was claimed.
+    private static func claimLinkLocked(eventId: String, units: Double, at: Date) -> Bool {
+        if bolusLinks.contains(where: { $0.eventId == eventId }) { return true }
+        let matches = bolusLinks.indices.filter { index in
+            let link = bolusLinks[index]
+            return link.eventId == nil
+                && abs(link.units - units) < 0.051
+                && abs(link.at.timeIntervalSince(at)) < 10 * 60
+        }
+        guard let best = matches.min(by: {
+            abs(bolusLinks[$0].at.timeIntervalSince(at)) < abs(bolusLinks[$1].at.timeIntervalSince(at))
+        }) else { return false }
+        bolusLinks[best].eventId = eventId
+        return true
+    }
+
+    /// Caller holds `lock`. No disk IO. Unmatched claims are kept only while the files are still loading,
+    /// so a link remembered a moment later can still be claimed. Once the load has merged, an unmatched claim is dropped.
+    private static func applyPendingClaimsLocked(keepUnmatched: Bool) {
+        guard !pendingClaims.isEmpty else { return }
+        let claims = pendingClaims
+        pendingClaims.removeAll()
+        for claim in claims {
+            if !claimLinkLocked(eventId: claim.eventId, units: claim.units, at: claim.at),
+               keepUnmatched, pendingClaims.count < 50
+            {
+                pendingClaims.append(claim)
+            }
+        }
     }
 
     // MARK: - Carbs
 
     static func noteCarbEntered(id: UUID?, at: Date) {
         guard let id else { return }
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         var stamp = carbStamps[id.uuidString] ?? CarbStamp(enteredAt: nil, editedAt: nil)
         if stamp.enteredAt == nil { stamp.enteredAt = at }
         carbStamps[id.uuidString] = stamp
         trimCarbStampsLocked()
-        let snapshot = carbStamps
         lock.unlock()
-        scheduleWrite(snapshot, name: "carb-times.json")
+        scheduleFlushCarbs()
     }
 
     static func noteCarbEdited(previousID: UUID?, newID: UUID?, at: Date) {
         guard let newID else { return }
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         let previous = previousID.flatMap { carbStamps[$0.uuidString] }
         carbStamps[newID.uuidString] = CarbStamp(enteredAt: previous?.enteredAt, editedAt: at)
         trimCarbStampsLocked()
-        let snapshot = carbStamps
         lock.unlock()
-        scheduleWrite(snapshot, name: "carb-times.json")
+        scheduleFlushCarbs()
     }
 
     static func carbTimes(id: String) -> (enteredAt: Date?, editedAt: Date?) {
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         let stamp = carbStamps[id]
         lock.unlock()
@@ -513,7 +544,7 @@ enum HealthIngestTherapy {
 
     static func notePumpEvent(id: String?, eventType: String, at: Date, alarmKind: String?, alarmMessage: String?) {
         guard let id, !id.isEmpty else { return }
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         let snapshot = pumpSnapshot
         let recent = snapshot.map { abs($0.at.timeIntervalSince(at)) < 30 * 60 } ?? false
@@ -545,13 +576,12 @@ enum HealthIngestTherapy {
                 pumpNotes.removeValue(forKey: key)
             }
         }
-        let saved = pumpNotes
         lock.unlock()
-        scheduleWrite(saved, name: "pump-notes.json")
+        scheduleFlushPumps()
     }
 
     static func pumpExtras(eventId: String, eventType: String, note: String?) -> [String: HealthIngestJSON?] {
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         let stored = pumpNotes[eventId]
         lock.unlock()
@@ -665,7 +695,7 @@ enum HealthIngestTherapy {
 
     static func drain(preferences: HealthIngestPreferences) -> [HealthIngestRecord] {
         expireWatchRecommendations()
-        prepareMemory()
+        startLoadIfNeeded()
         lock.lock()
         foldStagedRecordsLocked()
         var leaving: [HealthIngestRecord] = []
@@ -687,10 +717,9 @@ enum HealthIngestTherapy {
             }
         }
         pending = staying
-        let snapshot = leaving.isEmpty ? nil : pending
         lock.unlock()
-        if let snapshot {
-            scheduleWrite(snapshot, name: "therapy-queue.json")
+        if !leaving.isEmpty {
+            scheduleFlushQueue()
         }
         return leaving
     }
@@ -715,12 +744,11 @@ enum HealthIngestTherapy {
     // MARK: - Storage
 
     private static func enqueue(_ record: HealthIngestRecord) {
+        startLoadIfNeeded()
         lock.lock()
         stagedRecords.append(record)
         lock.unlock()
-        fileQueue.async {
-            Self.persistQueue()
-        }
+        scheduleFlushQueue()
     }
 
     private static func foldStagedRecordsLocked() {
@@ -737,13 +765,182 @@ enum HealthIngestTherapy {
         }
     }
 
-    private static func persistQueue() {
-        prepareMemory()
+    private static func startLoadIfNeeded() {
         lock.lock()
-        foldStagedRecordsLocked()
-        let snapshot = pending
+        let start = !loadStarted
+        if start { loadStarted = true }
+        let token = epoch
         lock.unlock()
-        writeToDisk(snapshot, name: "therapy-queue.json")
+        guard start else { return }
+        fileQueue.async {
+            performLoad(token: token)
+        }
+    }
+
+    private static func performLoad(token: Int) {
+        let hook: (() -> Void)? = {
+            lock.lock()
+            defer { lock.unlock() }
+            guard token == epoch else { return nil }
+            return beforeDiskRead
+        }()
+        hook?()
+
+        lock.lock()
+        guard token == epoch else {
+            lock.unlock()
+            return
+        }
+        let directory = directoryOverride
+        lock.unlock()
+
+        let diskPending = read(directory, [HealthIngestRecord].self, name: "therapy-queue.json") ?? []
+        let diskCarbs = read(directory, [String: CarbStamp].self, name: "carb-times.json") ?? [:]
+        let diskLinks = read(directory, [BolusLink].self, name: "bolus-links.json") ?? []
+        let diskPumps = read(directory, [String: PumpNote].self, name: "pump-notes.json") ?? [:]
+
+        lock.lock()
+        guard token == epoch else {
+            lock.unlock()
+            return
+        }
+        mergeLoadedLocked(
+            diskPending: diskPending,
+            diskCarbs: diskCarbs,
+            diskLinks: diskLinks,
+            diskPumps: diskPumps
+        )
+        loaded = true
+        let pendingSnapshot = pending
+        let carbSnapshot = carbStamps
+        let linkSnapshot = bolusLinks
+        let pumpSnapshotNotes = pumpNotes
+        let writeDirectory = directoryOverride
+        let done = afterLoad
+        lock.unlock()
+
+        write(writeDirectory, pendingSnapshot, name: "therapy-queue.json")
+        write(writeDirectory, carbSnapshot, name: "carb-times.json")
+        write(writeDirectory, linkSnapshot, name: "bolus-links.json")
+        write(writeDirectory, pumpSnapshotNotes, name: "pump-notes.json")
+        done?()
+    }
+
+    /// Caller holds `lock`. Disk is the base. Keys already written in memory win.
+    private static func mergeLoadedLocked(
+        diskPending: [HealthIngestRecord],
+        diskCarbs: [String: CarbStamp],
+        diskLinks: [BolusLink],
+        diskPumps: [String: PumpNote]
+    ) {
+        var memoryKeys = Set(pending.map { "\($0.type)|\($0.id)" })
+        memoryKeys.formUnion(stagedRecords.map { "\($0.type)|\($0.id)" })
+        var merged = diskPending.filter { !memoryKeys.contains("\($0.type)|\($0.id)") }
+        merged.append(contentsOf: pending)
+        pending = merged
+        foldStagedRecordsLocked()
+
+        for (key, diskStamp) in diskCarbs {
+            if var current = carbStamps[key] {
+                if current.enteredAt == nil { current.enteredAt = diskStamp.enteredAt }
+                if current.editedAt == nil { current.editedAt = diskStamp.editedAt }
+                carbStamps[key] = current
+            } else {
+                carbStamps[key] = diskStamp
+            }
+        }
+        trimCarbStampsLocked()
+
+        for (key, note) in diskPumps where pumpNotes[key] == nil {
+            pumpNotes[key] = note
+        }
+
+        let known = Set((bolusLinks + unsavedLinks).map { linkIdentity($0) })
+        for link in diskLinks where !known.contains(linkIdentity(link)) {
+            bolusLinks.append(link)
+        }
+        absorbUnsavedLinksLocked()
+        applyPendingClaimsLocked(keepUnmatched: false)
+        if bolusLinks.count > 200 {
+            bolusLinks.removeFirst(bolusLinks.count - 200)
+        }
+    }
+
+    private static func linkIdentity(_ link: BolusLink) -> String {
+        "\(link.source)|\(link.units)|\(link.at.timeIntervalSince1970)|\(link.decisionId ?? "")"
+    }
+
+    private static func scheduleFlushQueue() {
+        scheduleFlush({ pending }, name: "therapy-queue.json", fold: { foldStagedRecordsLocked() })
+    }
+
+    private static func scheduleFlushCarbs() {
+        scheduleFlush({ carbStamps }, name: "carb-times.json", fold: {})
+    }
+
+    private static func scheduleFlushLinks() {
+        scheduleFlush({ bolusLinks }, name: "bolus-links.json", fold: { absorbUnsavedLinksLocked() })
+    }
+
+    private static func scheduleFlushPumps() {
+        scheduleFlush({ pumpNotes }, name: "pump-notes.json", fold: {})
+    }
+
+    /// Writes a snapshot taken on the file queue, after the load has merged. A flush that runs before the load returns without writing; the load writes the merged files.
+    private static func scheduleFlush<T: Encodable>(
+        _ snapshot: @escaping () -> T,
+        name: String,
+        fold: @escaping () -> Void
+    ) {
+        lock.lock()
+        let token = epoch
+        lock.unlock()
+        fileQueue.async {
+            lock.lock()
+            guard token == epoch, loaded else {
+                lock.unlock()
+                return
+            }
+            fold()
+            let directory = directoryOverride
+            let value = snapshot()
+            lock.unlock()
+            write(directory, value, name: name)
+        }
+    }
+
+    private static func read<T: Decodable>(_ directory: URL?, _ type: T.Type, name: String) -> T? {
+        guard let folder = resolvedDirectory(directory) else { return nil }
+        let url = folder.appendingPathComponent(name)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return try? HealthIngestWire.makeDecoder().decode(type, from: data)
+    }
+
+    private static func write(_ directory: URL?, _ value: some Encodable, name: String) {
+        guard let folder = resolvedDirectory(directory, create: true) else { return }
+        let url = folder.appendingPathComponent(name)
+        guard let data = try? HealthIngestWire.makeEncoder().encode(value) else { return }
+        try? data.write(to: url, options: .atomic)
+    }
+
+    private static func resolvedDirectory(_ directory: URL?, create: Bool = false) -> URL? {
+        let folder: URL?
+        if let directory {
+            folder = directory
+        } else {
+            guard let base = try? FileManager.default.url(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask,
+                appropriateFor: nil,
+                create: true
+            ) else { return nil }
+            folder = base.appendingPathComponent("HealthIngest", isDirectory: true)
+        }
+        guard let folder else { return nil }
+        if create {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        return folder
     }
 
     private static func trimCarbStampsLocked() {
@@ -753,64 +950,6 @@ enum HealthIngestTherapy {
                 carbStamps.removeValue(forKey: key)
             }
         }
-    }
-
-    /// Reads disk outside `lock`, then installs the snapshot. Does not hold `lock` during file IO.
-    private static func prepareMemory() {
-        lock.lock()
-        let needsLoad = !loaded
-        lock.unlock()
-        guard needsLoad else { return }
-        let diskPending = load([HealthIngestRecord].self, name: "therapy-queue.json") ?? []
-        let diskCarbs = load([String: CarbStamp].self, name: "carb-times.json") ?? [:]
-        let diskLinks = load([BolusLink].self, name: "bolus-links.json") ?? []
-        let diskPumps = load([String: PumpNote].self, name: "pump-notes.json") ?? [:]
-        lock.lock()
-        if !loaded {
-            pending = diskPending
-            carbStamps = diskCarbs
-            bolusLinks = diskLinks
-            pumpNotes = diskPumps
-            loaded = true
-        }
-        lock.unlock()
-    }
-
-    private static func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
-        guard let url = file(name), let data = try? Data(contentsOf: url) else { return nil }
-        return try? HealthIngestWire.makeDecoder().decode(type, from: data)
-    }
-
-    private static func scheduleWrite(_ value: some Encodable, name: String) {
-        fileQueue.async {
-            writeToDisk(value, name: name)
-        }
-    }
-
-    private static func writeToDisk(_ value: some Encodable, name: String) {
-        guard let url = file(name), let data = try? HealthIngestWire.makeEncoder().encode(value) else { return }
-        try? data.write(to: url, options: .atomic)
-    }
-
-    private static func file(_ name: String) -> URL? {
-        guard let directory = folder() else { return nil }
-        return directory.appendingPathComponent(name)
-    }
-
-    private static func folder() -> URL? {
-        if let directoryOverride {
-            try? FileManager.default.createDirectory(at: directoryOverride, withIntermediateDirectories: true)
-            return directoryOverride
-        }
-        guard let base = try? FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        ) else { return nil }
-        let directory = base.appendingPathComponent("HealthIngest", isDirectory: true)
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        return directory
     }
 
     private static func finite(_ value: Double?) -> HealthIngestJSON? {

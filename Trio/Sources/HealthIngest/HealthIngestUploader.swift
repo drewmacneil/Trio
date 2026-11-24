@@ -4,23 +4,52 @@ import HealthKit
 import Swinject
 import UIKit
 
-/// What a mapping-version bump does to HealthKit history.
+/// What a mapping-version bump re-sends.
+///
+/// Going from stored version N to current version M applies every registered step
+/// from N+1 through M. HealthKit is reset if any of those steps resets it, and the
+/// Core Data rewind is the longest any of them asks for. A step that is not
+/// registered falls back to a full reset, so a version bump with no rule cannot
+/// leave HealthKit cursors in place while the new fields stay unsent.
+/// A downgrade (stored version already at or above the running build) changes nothing:
+/// cursors, anchors, and the stored version stay as they are.
 enum HealthIngestMappingUpgrade {
-    /// Version 6 already sends HealthKit source fields. A later bump must not
-    /// clear cursors or anchors, or a backfill in progress starts over.
-    static let healthKitPreservedFrom = 6
+    struct Step: Equatable {
+        var resetHealthKit: Bool
+        var rewindCoreDataDays: Int
+    }
 
     struct Plan: Equatable {
         var resetHealthKit: Bool
         var rewindCoreDataDays: Int
     }
 
+    /// The version being entered, and what that step needs re-sent.
+    /// Versions 1 through 6 are the historical full reset. Version 7 only rewinds
+    /// Core Data, so a version-6 HealthKit backfill keeps its cursors and anchors.
+    static let steps: [Int: Step] = [
+        1: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        2: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        3: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        4: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        5: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        6: Step(resetHealthKit: true, rewindCoreDataDays: 90),
+        7: Step(resetHealthKit: false, rewindCoreDataDays: 90)
+    ]
+
+    /// Used when the range N+1...M contains a version with no step.
+    static let fullReset = Plan(resetHealthKit: true, rewindCoreDataDays: 90)
+
     static func plan(storedVersion: Int, currentVersion: Int) -> Plan? {
         guard storedVersion < currentVersion else { return nil }
-        return Plan(
-            resetHealthKit: storedVersion < healthKitPreservedFrom,
-            rewindCoreDataDays: 90
-        )
+        var resetHealthKit = false
+        var rewindDays = 0
+        for version in (storedVersion + 1)...currentVersion {
+            guard let step = steps[version] else { return fullReset }
+            resetHealthKit = resetHealthKit || step.resetHealthKit
+            rewindDays = max(rewindDays, step.rewindCoreDataDays)
+        }
+        return Plan(resetHealthKit: resetHealthKit, rewindCoreDataDays: rewindDays)
     }
 }
 
@@ -296,7 +325,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             HealthIngestLoopCapture.requeueStoredProfiles()
         }
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
-        rewindCoreDataRead(days: plan.rewindCoreDataDays)
+        if plan.rewindCoreDataDays > 0 {
+            rewindCoreDataRead(days: plan.rewindCoreDataDays)
+        }
         let depth = await self.queue?.depth() ?? 0
         let priorityDepth = await self.queue?.priorityDepth() ?? 0
         publishSnapshot(depth: depth, priorityDepth: priorityDepth)

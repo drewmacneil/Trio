@@ -1760,18 +1760,36 @@ import Testing
         try json.write(to: directory.appendingPathComponent("carb-times.json"), atomically: true, encoding: .utf8)
         HealthIngestTherapy.useTestDirectory(directory)
 
-        final class LoadFlag: @unchecked Sendable {
-            let lock = NSLock()
-            var value = false
+        final class LoadSignal: @unchecked Sendable {
+            private let condition = NSCondition()
+            private var loaded = false
+
+            func mark() {
+                condition.lock()
+                loaded = true
+                condition.broadcast()
+                condition.unlock()
+            }
+
+            func wait(seconds: TimeInterval) -> Bool {
+                condition.lock()
+                defer { condition.unlock() }
+                let deadline = Date().addingTimeInterval(seconds)
+                while !loaded {
+                    if !condition.wait(until: deadline) {
+                        break
+                    }
+                }
+                return loaded
+            }
         }
-        let flag = LoadFlag()
+        let signal = LoadSignal()
+        // Holds the file queue so the caller must return before the read finishes.
         HealthIngestTherapy.beforeDiskRead = {
             Thread.sleep(forTimeInterval: 0.8)
         }
         HealthIngestTherapy.afterLoad = {
-            flag.lock.lock()
-            flag.value = true
-            flag.lock.unlock()
+            signal.mark()
         }
 
         let fresh = UUID()
@@ -1782,18 +1800,10 @@ import Testing
         #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
         #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt == nil)
 
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            flag.lock.lock()
-            let done = flag.value
-            flag.lock.unlock()
-            if done { break }
-            Thread.sleep(forTimeInterval: 0.02)
-        }
-        flag.lock.lock()
-        let loaded = flag.value
-        flag.lock.unlock()
-        #expect(loaded)
+        // The read is a utility-QoS block, and the hook above stalls it. A busy
+        // CI simulator can leave that block unscheduled for well past a few
+        // seconds, so wait on afterLoad with room for that delay.
+        #expect(signal.wait(seconds: 30))
         #expect(HealthIngestTherapy.carbTimes(id: seeded).enteredAt != nil)
         #expect(HealthIngestTherapy.carbTimes(id: fresh.uuidString).enteredAt == entered)
     }

@@ -4,6 +4,26 @@ import HealthKit
 import Swinject
 import UIKit
 
+/// What a mapping-version bump does to HealthKit history.
+enum HealthIngestMappingUpgrade {
+    /// Version 6 already sends HealthKit source fields. A later bump must not
+    /// clear cursors or anchors, or a backfill in progress starts over.
+    static let healthKitPreservedFrom = 6
+
+    struct Plan: Equatable {
+        var resetHealthKit: Bool
+        var rewindCoreDataDays: Int
+    }
+
+    static func plan(storedVersion: Int, currentVersion: Int) -> Plan? {
+        guard storedVersion < currentVersion else { return nil }
+        return Plan(
+            resetHealthKit: storedVersion < healthKitPreservedFrom,
+            rewindCoreDataDays: 90
+        )
+    }
+}
+
 /// Uploads Trio and HealthKit data to a private ingest server. The loop never waits on this.
 /// Work runs on a utility task, batches, and backs off. The queue is on disk.
 final class HealthIngestUploader: ObservableObject, Injectable {
@@ -257,18 +277,28 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
     }
 
-    private func applyMappingUpgradeIfNeeded() async {
-        guard let queue = try? prepare(), let health, let disk else { return }
-        guard disk.loadMappingVersion() < HealthIngestWire.mappingVersion else { return }
-        await queue.forgetRejectedReceipts()
-        await queue.clearRejections()
-        await queue.dropTypes(HealthIngestType.contractResendTypes)
-        health.resetBackfillCursors()
-        HealthIngestLoopCapture.requeueStoredProfiles()
+    func applyMappingUpgradeIfNeeded() async {
+        if disk == nil || health == nil {
+            guard (try? prepare()) != nil else { return }
+        }
+        guard let disk, let health else { return }
+        let stored = disk.loadMappingVersion()
+        guard let plan = HealthIngestMappingUpgrade.plan(
+            storedVersion: stored,
+            currentVersion: HealthIngestWire.mappingVersion
+        ) else { return }
+        if plan.resetHealthKit {
+            let queue = self.queue ?? HealthIngestQueue(disk: disk)
+            await queue.forgetRejectedReceipts()
+            await queue.clearRejections()
+            await queue.dropTypes(HealthIngestType.contractResendTypes)
+            health.resetBackfillCursors()
+            HealthIngestLoopCapture.requeueStoredProfiles()
+        }
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
-        rewindCoreDataRead(days: 90)
-        let depth = await queue.depth()
-        let priorityDepth = await queue.priorityDepth()
+        rewindCoreDataRead(days: plan.rewindCoreDataDays)
+        let depth = await self.queue?.depth() ?? 0
+        let priorityDepth = await self.queue?.priorityDepth() ?? 0
         publishSnapshot(depth: depth, priorityDepth: priorityDepth)
     }
 

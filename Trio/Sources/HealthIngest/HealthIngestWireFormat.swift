@@ -62,7 +62,8 @@ enum HealthIngestWire {
     /// carbs required, and carb ratio. Those values are already on
     /// `OrefDetermination`. The receipt hash changes only when the payload does,
     /// so an unchanged HealthKit sample or treatment is not uploaded again.
-    /// The upgrade still resets HealthKit cursors and requeues effective profiles.
+    /// An upgrade from 6 does not clear HealthKit cursors or anchors. A fresh
+    /// install, or an upgrade from before 6, still resets that backfill.
     static let mappingVersion = 7
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {

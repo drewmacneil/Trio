@@ -596,6 +596,40 @@ import Testing
         #expect(!limitsText.contains("fails"))
     }
 
+    @Test func mappingUpgradeFromSixRewindsCoreDataAndKeepsHealthKitCursors() async throws {
+        let disk = try makeDisk()
+        let cursor = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = Data([1, 2, 3, 4])
+        disk.saveMappingVersion(6)
+        disk.saveCursors(["heart_rate": cursor])
+        disk.saveAnchors(["heart_rate": anchor])
+
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        await uploader.applyMappingUpgradeIfNeeded()
+
+        #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+        #expect(disk.loadCursors()["heart_rate"] == cursor)
+        #expect(disk.loadAnchors()["heart_rate"] == anchor)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+    }
+
+    @Test func mappingUpgradeFromBeforeSixResetsHealthKitCursors() async throws {
+        for stored in [0, 5] {
+            let disk = try makeDisk()
+            disk.saveMappingVersion(stored)
+            disk.saveCursors(["heart_rate": Date(timeIntervalSince1970: 1_700_000_000)])
+            disk.saveAnchors(["heart_rate": Data([9])])
+
+            let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+            await uploader.applyMappingUpgradeIfNeeded()
+
+            #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+            #expect(disk.loadCursors().isEmpty)
+            #expect(HealthIngestMappingUpgrade.plan(storedVersion: stored, currentVersion: 7)?.resetHealthKit == true)
+        }
+    }
+
     @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
         #expect(HealthIngestWire.mappingVersion == 7)
         let disk = try makeDisk()

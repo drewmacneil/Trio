@@ -69,7 +69,11 @@ enum HealthIngestWire {
     /// `trend` as well as `direction`. It does not clear HealthKit cursors or
     /// anchors and does not start a HealthKit backfill. `trendRate` and `sensor`
     /// are added only for readings the live G7 manager still has; they are not
-    /// stored on the glucose row.
+    /// stored on the glucose row. `GlucoseStored` has `direction` and no numeric
+    /// rate, so a later mapping version would reread the same payloads and is
+    /// not used for `trendRate`. Meal `enteredAt` / `editedAt` and bolus
+    /// `bolusSource` / `decisionId` are notes taken when Trio saved the row.
+    /// They are not columns a Core Data rewind would newly find.
     /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
     /// A missing step resets the HealthKit backfill instead of skipping the resend.
     static let mappingVersion = 8

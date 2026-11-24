@@ -225,7 +225,8 @@ struct HealthIngestSettingsForm: View {
                         .font(.footnote)
                         .foregroundColor(.secondary)
                 }
-            } else if let phase = status.trioHistoryPhase {
+            }
+            if status.showsTrioHistoryPhase, let phase = status.trioHistoryPhase {
                 Text(phase)
                     .font(.footnote)
                     .foregroundColor(.secondary)
@@ -370,18 +371,14 @@ struct HealthIngestSettingsForm: View {
                 ProgressView()
             }
         }
-        if !status.backfillRunning, let error = status.lastError, !error.isEmpty, stateTitle == "Error" {
+        if status.showsLastError, let error = status.lastError {
             Text(error)
                 .font(.footnote)
                 .foregroundColor(.red)
         }
     }
 
-    private var stateTitle: String {
-        if status.backfillRunning { return "Backfilling" }
-        if let error = status.lastError, !error.isEmpty { return "Error" }
-        return "Up to date"
-    }
+    private var stateTitle: String { status.stateTitle }
 
     private var stateColor: Color {
         switch stateTitle {

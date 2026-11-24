@@ -65,9 +65,14 @@ enum HealthIngestWire {
     /// An upgrade from 6 does not clear HealthKit cursors or anchors, and it does
     /// not start a HealthKit backfill. Stored Trio rows are reread from their own
     /// cursor. A fresh install, or an upgrade from before 6, still resets that backfill.
+    /// 8 writes that same Core Data cursor so stored glucose is sent again with
+    /// `trend` as well as `direction`. It does not clear HealthKit cursors or
+    /// anchors and does not start a HealthKit backfill. `trendRate` and `sensor`
+    /// are added only for readings the live G7 manager still has; they are not
+    /// stored on the glucose row.
     /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
     /// A missing step resets the HealthKit backfill instead of skipping the resend.
-    static let mappingVersion = 7
+    static let mappingVersion = 8
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed

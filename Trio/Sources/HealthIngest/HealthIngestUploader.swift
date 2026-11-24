@@ -1,6 +1,8 @@
 import Combine
 import Foundation
+import G7SensorKit
 import HealthKit
+import LoopKitUI
 import Swinject
 import UIKit
 
@@ -25,8 +27,9 @@ enum HealthIngestMappingUpgrade {
     }
 
     /// The version being entered, and what that step needs re-sent.
-    /// Versions 1 through 6 are the historical full reset. Version 7 only rewinds
-    /// Core Data, so a version-6 HealthKit backfill keeps its cursors and anchors.
+    /// Versions 1 through 6 are the historical full reset. Versions 7 and 8 only
+    /// rewind Core Data: `persistCoreDataRewind` writes the historical resume and
+    /// does not call `beginBackfill`. Version 8 resends glucose with `trend`.
     static let steps: [Int: Step] = [
         1: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         2: Step(resetHealthKit: true, rewindCoreDataDays: 90),
@@ -34,7 +37,8 @@ enum HealthIngestMappingUpgrade {
         4: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         5: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         6: Step(resetHealthKit: true, rewindCoreDataDays: 90),
-        7: Step(resetHealthKit: false, rewindCoreDataDays: 90)
+        7: Step(resetHealthKit: false, rewindCoreDataDays: 90),
+        8: Step(resetHealthKit: false, rewindCoreDataDays: 90)
     ]
 
     /// Used when the range N+1...M contains a version with no step.
@@ -757,6 +761,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         }
 
         if !failed, !Task.isCancelled {
+            // Live G7 fields are logging only. This does not read or write the
+            // Core Data rewind cursor.
+            let liveEvents = liveCGMRecords()
+            if !liveEvents.isEmpty {
+                await enqueuePage(liveEvents)
+            }
             let now = Date()
             let throttled = budget.minDiabetesInterval > 0
                 && (lockedLastDiabetesRead().map { now.timeIntervalSince($0) < budget.minDiabetesInterval } ?? false)
@@ -1291,6 +1301,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return backfillRunning
+    }
+
+    /// Reads the current G7 manager, if this process has one. Pairing codes,
+    /// shared keys, and Share credentials are not copied.
+    private func liveCGMRecords() -> [HealthIngestRecord] {
+        guard let glucose = container.resolve(FetchGlucoseManager.self),
+              let manager = glucose.cgmManager as? G7CGMManager
+        else { return [] }
+        return HealthIngestLiveCGM.observe(HealthIngestLiveCGM.snapshot(from: manager))
     }
 
     private func resolverDevices() -> (model: String?, rates: [Double]) {

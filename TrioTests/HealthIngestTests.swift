@@ -819,10 +819,15 @@ import Testing
         // 6 → 7 is only version 7, so HealthKit cursors stay.
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
             HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
-        // Version 8 has no step. Crossing it, from 6 or from 7, is a full reset.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
-            HealthIngestMappingUpgrade.fullReset)
+        // 7 → 8 resends glucose with trend and does not reset HealthKit.
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 7, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        // Version 9 has no step. Crossing it is a full reset.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 9) ==
+            HealthIngestMappingUpgrade.fullReset)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 8, currentVersion: 9) ==
             HealthIngestMappingUpgrade.fullReset)
     }
 
@@ -847,7 +852,7 @@ import Testing
     }
 
     @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
-        #expect(HealthIngestWire.mappingVersion == 7)
+        #expect(HealthIngestWire.mappingVersion == 8)
         let disk = try makeDisk()
         disk.saveMappingVersion(5)
         #expect(disk.loadMappingVersion() < HealthIngestWire.mappingVersion)
@@ -1079,7 +1084,7 @@ import Testing
         #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
         #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
         #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
-        #expect(HealthIngestWire.mappingVersion == 7)
+        #expect(HealthIngestWire.mappingVersion == 8)
         #expect(HealthIngestAck.acceptedRowCount([
             HealthIngestAck(type: "hrv", id: "1", status: .accepted),
             HealthIngestAck(type: "hrv", id: "2", status: .duplicate),
@@ -1659,6 +1664,9 @@ import Testing
         #expect(HealthIngestCGM.kind(type: "calibration", errorCode: nil, fatal: false, failureMessage: nil) == "calibration")
         #expect(HealthIngestCGM.kind(type: "transmitterStart", errorCode: nil, fatal: false, failureMessage: nil) == nil)
         #expect(HealthIngestCGM.kind(type: "sensorEnd", errorCode: nil, fatal: false, failureMessage: nil) == "other")
+        #expect(HealthIngestCGM.issueKind(code: "temporarySensorIssue", fatal: false) == "temporary_issue")
+        #expect(HealthIngestCGM.issueKind(code: "sessionEnded", fatal: false) == "sensor_expired")
+        #expect(HealthIngestCGM.issueKind(code: "sensorFailed", fatal: true) == "sensor_failed")
 
         let loop = HealthIngestTherapy.loopFields(
             glucoseMgdl: 121,
@@ -1846,6 +1854,149 @@ import Testing
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)
         return try HealthIngestDisk(directory: directory)
+    }
+
+    @Test func glucosePayloadKeepsDirectionAndAddsTrendRateAndSensor() throws {
+        let payload = try wirePayload(HealthIngestRecord(
+            type: HealthIngestType.glucose,
+            id: "cgm:test:1",
+            start: Date(timeIntervalSince1970: 1_700_000_000),
+            end: nil,
+            tz: "UTC",
+            payload: HealthIngestDiabetesAdapter.glucosePayload(
+                mgdl: 110,
+                direction: "FortyFiveUp",
+                manual: false,
+                smoothedMgdl: nil,
+                trendRate: 1.25,
+                sensor: "DXCM1A"
+            )
+        ))
+        #expect(payload["direction"] as? String == "FortyFiveUp")
+        #expect(payload["trend"] as? String == "FortyFiveUp")
+        #expect((payload["trendRate"] as? NSNumber)?.doubleValue == 1.25)
+        #expect(payload["sensor"] as? String == "DXCM1A")
+
+        let wild = HealthIngestDiabetesAdapter.glucosePayload(
+            mgdl: 110,
+            direction: "Flat",
+            manual: false,
+            smoothedMgdl: nil,
+            trendRate: 40,
+            sensor: "1234"
+        )
+        let wildPayload = try wirePayload(HealthIngestRecord(
+            type: HealthIngestType.glucose,
+            id: "cgm:test:2",
+            start: Date(timeIntervalSince1970: 1_700_000_000),
+            end: nil,
+            tz: "UTC",
+            payload: wild
+        ))
+        #expect(wildPayload["trend"] as? String == "Flat")
+        #expect(wildPayload["trendRate"] == nil)
+        #expect(wildPayload["sensor"] == nil)
+        #expect(HealthIngestLiveCGM.acceptedSensor("1234") == nil)
+        #expect(HealthIngestLiveCGM.acceptedSensor("DXCM1A") == "DXCM1A")
+    }
+
+    @Test func liveG7SnapshotRecordsSessionTrendAndCalibrationWithoutSecrets() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("health-ingest-cgm-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        HealthIngestTherapy.useTestDirectory(directory)
+        defer {
+            HealthIngestTherapy.useTestDirectory(nil)
+            HealthIngestLiveCGM.discardCachedStore()
+        }
+
+        let activated = Date(timeIntervalSince1970: 1_700_000_000)
+        let reading = activated.addingTimeInterval(3_600)
+        var snapshot = HealthIngestCGMSnapshot(
+            sensor: "DXCM1A",
+            activatedAt: activated,
+            readingAt: reading,
+            trendRateMgdlPerMin: -0.4,
+            algorithmState: "warmup",
+            glucoseIsReliable: false,
+            suspectedSessionEndAt: nil,
+            calibration: nil,
+            previous: HealthIngestCGMSnapshot.EndedSensor(
+                sensor: "DXCM0Z",
+                activatedAt: activated.addingTimeInterval(-86_400),
+                endedAt: activated,
+                endReason: "replaced",
+                failureMessage: nil
+            )
+        )
+        let first = HealthIngestLiveCGM.observe(snapshot)
+        let kinds = try eventKinds(first)
+        #expect(kinds.contains("sensor_start"))
+        #expect(kinds.contains("sensor_replaced"))
+        #expect(kinds.contains("warmup_start"))
+        let replaced = try #require(first.first { record in
+            ((try? wirePayload(record))?["kind"] as? String) == "sensor_replaced"
+        })
+        let replacedPayload = try wirePayload(replaced)
+        #expect(replacedPayload["endReason"] as? String == "replaced")
+        #expect(replacedPayload["sensor"] as? String == "DXCM0Z")
+        #expect(HealthIngestLiveCGM.observe(snapshot).isEmpty)
+
+        snapshot.glucoseIsReliable = true
+        snapshot.algorithmState = "ok"
+        snapshot.readingAt = reading.addingTimeInterval(300)
+        snapshot.suspectedSessionEndAt = reading.addingTimeInterval(600)
+        snapshot.calibration = HealthIngestCGMSnapshot.Calibration(
+            meterMgdl: 142,
+            enteredAt: reading.addingTimeInterval(120),
+            outcome: "accepted"
+        )
+        let next = HealthIngestLiveCGM.observe(snapshot)
+        let nextKinds = try eventKinds(next)
+        #expect(nextKinds.contains("warmup_end"))
+        #expect(nextKinds.contains("signal_loss"))
+        #expect(nextKinds.contains("calibration"))
+        let calibration = try #require(next.first { record in
+            ((try? wirePayload(record))?["kind"] as? String) == "calibration"
+        })
+        let calibrationPayload = try wirePayload(calibration)
+        #expect((calibrationPayload["meterMgdl"] as? NSNumber)?.doubleValue == 142)
+        #expect(calibrationPayload["outcome"] as? String == "accepted")
+        #expect(calibrationPayload["sensorMgdl"] == nil)
+
+        let note = HealthIngestLiveCGM.annotation(at: reading)
+        #expect(note?.trendRate == -0.4)
+        #expect(note?.sensor == "DXCM1A")
+        let before = HealthIngestLiveCGM.annotation(at: activated.addingTimeInterval(-3_600))
+        #expect(before?.sensor == "DXCM0Z")
+        #expect(before?.trendRate == nil)
+
+        let wire = try wireText(HealthIngestRecord(
+            type: HealthIngestType.cgmEvent,
+            id: first[0].id,
+            start: first[0].start,
+            end: nil,
+            tz: first[0].tz,
+            payload: first[0].payload
+        ))
+        #expect(!wire.contains("pairing"))
+        #expect(!wire.contains("sharedKey"))
+        #expect(!wire.contains("password"))
+
+        HealthIngestLiveCGM.discardCachedStore()
+        snapshot.suspectedSessionEndAt = reading.addingTimeInterval(600)
+        #expect(HealthIngestLiveCGM.observe(snapshot).isEmpty)
+        #expect(HealthIngestLiveCGM.endReason(recorded: "replaced", failureMessage: "sensorFailed") == "failed")
+    }
+
+    private func eventKinds(_ records: [HealthIngestRecord]) throws -> [String] {
+        var kinds: [String] = []
+        for record in records {
+            if let kind = try wirePayload(record)["kind"] as? String {
+                kinds.append(kind)
+            }
+        }
+        return kinds
     }
 
     private func makeRecord(

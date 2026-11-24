@@ -103,6 +103,7 @@ enum HealthIngestTherapy {
         bolusAttempt = nil
         sensorWasWarmup = false
         pendingClaims = []
+        HealthIngestLiveCGM.discardCachedStore()
         beforeDiskRead = nil
         afterLoad = nil
         lock.unlock()
@@ -624,11 +625,29 @@ enum HealthIngestTherapy {
 
     // MARK: - CGM
 
-    static func cgmRecord(at: Date, kind: String, message: String?) -> HealthIngestRecord {
+    static func cgmRecord(
+        at: Date,
+        kind: String,
+        message: String?,
+        sensor: String? = nil,
+        activatedAt: Date? = nil,
+        endReason: String? = nil,
+        meterMgdl: Double? = nil,
+        sensorMgdl: Double? = nil,
+        outcome: String? = nil,
+        algorithmState: String? = nil
+    ) -> HealthIngestRecord {
         let payload = HealthIngestJSON.object([
             "timestamp": .string(HealthIngestTime.string(from: at)),
             "kind": .string(kind),
-            "message": sanitizedMessage(message).map { .string($0) }
+            "message": sanitizedMessage(message).map { .string($0) },
+            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) },
+            "activatedAt": activatedAt.map { .string(HealthIngestTime.string(from: $0)) },
+            "endReason": HealthIngestLiveCGM.acceptedEndReason(endReason).map { .string($0) },
+            "meterMgdl": meterMgdl.flatMap { inclusive($0, 0, 2000) },
+            "sensorMgdl": sensorMgdl.flatMap { inclusive($0, 0, 2000) },
+            "outcome": HealthIngestLiveCGM.acceptedOutcome(outcome).map { .string($0) },
+            "algorithmState": HealthIngestLiveCGM.acceptedText(algorithmState, max: 64).map { .string($0) }
         ])
         return HealthIngestRecord(
             type: HealthIngestType.cgmEvent,
@@ -640,17 +659,32 @@ enum HealthIngestTherapy {
         )
     }
 
-    static func storeCGMEvent(at: Date, kind: String?, message: String?) {
+    static func storeCGMEvent(at: Date, kind: String?, message: String?, sensor: String? = nil) {
         guard let kind else { return }
+        // The upload pass already recorded this instant from the live manager.
+        // A later plugin event would replace that row with one that has less on it.
+        if HealthIngestLiveCGM.alreadyRecorded(kind: kind, at: at) { return }
         if kind == "warmup_start" {
             lock.lock()
             sensorWasWarmup = true
             lock.unlock()
         }
-        enqueue(cgmRecord(at: at, kind: kind, message: message))
+        enqueue(cgmRecord(
+            at: at,
+            kind: kind,
+            message: message,
+            sensor: sensor ?? HealthIngestLiveCGM.currentSensor()
+        ))
     }
 
-    /// A reliable reading after warmup becomes `warmup_end`. Other states arrive as plugin events.
+    /// A reliable reading after warmup becomes `warmup_end`.
+    ///
+    /// An unreliable reading does not enqueue here. G7 delivers that state as a
+    /// plugin event only when it changes, and a sensor that was already running
+    /// never emits `sensorStart` again, so those hooks alone left the server
+    /// with no `cgm_event` rows. The upload pass reads the live manager and
+    /// enqueues the session, the algorithm state, calibration, and signal loss
+    /// on the upload queue, past the 80-record therapy cap.
     static func noteGlucoseReliability(reliable: Bool, issue: String?) {
         if !reliable {
             if HealthIngestCGM.issueKind(code: issue, fatal: false) == "warmup_start" {
@@ -923,6 +957,10 @@ enum HealthIngestTherapy {
         try? data.write(to: url, options: .atomic)
     }
 
+    static func ingestDirectory(create: Bool = false) -> URL? {
+        resolvedDirectory(directoryOverride, create: create)
+    }
+
     private static func resolvedDirectory(_ directory: URL?, create: Bool = false) -> URL? {
         let folder: URL?
         if let directory {
@@ -1001,7 +1039,9 @@ enum HealthIngestCGM {
     static func issueKind(code: String?, fatal: Bool) -> String {
         let code = (code ?? "").lowercased()
         if code.contains("warmup") { return "warmup_start" }
-        if code.contains("expir") { return "sensor_expired" }
+        if code.contains("signal") { return "signal_loss" }
+        if code.contains("temporary") || code.contains("excessnoise") { return "temporary_issue" }
+        if code.contains("expir") || code.contains("sessionended") { return "sensor_expired" }
         if fatal || code.contains("fail") { return "sensor_failed" }
         return "other"
     }

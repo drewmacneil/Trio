@@ -479,7 +479,6 @@ extension Treatments {
 
             // Update state properties with calculation results on main thread
             await MainActor.run {
-                guard self.isActive else { return }
                 targetDifference = result.targetDifference
                 targetDifferenceInsulin = result.targetDifferenceInsulin
                 wholeCob = result.wholeCob
@@ -717,11 +716,6 @@ extension Treatments {
             await MainActor.run {
                 self.amount = min(self.amount, self.maxBolus * 3)
             }
-            let loggedAmount = amount
-            let decisionId = await MainActor.run { shownBolus?.decisionId }
-            await MainActor.run {
-                self.closeBolusRecommendation(enteredUnits: loggedAmount, external: true, skipped: false)
-            }
 
             do {
                 let authenticated = try await unlockmanager.unlock()
@@ -730,22 +724,27 @@ extension Treatments {
                     await MainActor.run {
                         self.isAwaitingDeterminationResult = true
                     }
+                    // Dev reads `amount` here, after authentication, not at the cap above.
+                    let loggedAmount = amount
+                    // store external dose to pump history
+                    await pumpHistoryStorage.storeExternalInsulinEvent(amount: loggedAmount, timestamp: date)
+                    info(.bolus, "External insulin of \(amount) U logged")
+                    let decisionId = shownBolus?.decisionId
+                    closeBolusRecommendation(enteredUnits: loggedAmount, external: true, skipped: false)
                     HealthIngestTherapy.rememberBolusLink(
                         decisionId: decisionId,
                         source: "phone",
                         units: NSDecimalNumber(decimal: loggedAmount).doubleValue,
                         at: date
                     )
-                    // store external dose to pump history
-                    await pumpHistoryStorage.storeExternalInsulinEvent(amount: loggedAmount, timestamp: date)
-                    info(.bolus, "External insulin of \(loggedAmount) U logged")
                     // perform determine basal sync
                     try await apsManager.determineBasalSync()
                 }
             } catch {
                 warning(.bolus, "Authentication for external insulin failed", error: error)
+                let decisionId = shownBolus?.decisionId
                 HealthIngestTherapy.storeFailure(
-                    requestedUnits: NSDecimalNumber(decimal: loggedAmount).doubleValue,
+                    requestedUnits: NSDecimalNumber(decimal: amount).doubleValue,
                     source: "phone",
                     reason: HealthIngestTherapy.authenticationFailureReason(error),
                     message: parseAuthenticationError(from: error),

@@ -13,6 +13,8 @@ enum HealthIngestTherapy {
     private static var directoryOverride: URL?
     private static var loaded = false
     private static var pending: [HealthIngestRecord] = []
+    /// Records accepted on the caller thread and not yet folded into `pending`.
+    private static var stagedRecords: [HealthIngestRecord] = []
     private static var carbStamps: [String: CarbStamp] = [:]
     private static var bolusLinks: [BolusLink] = []
     /// Links remembered on the dose path and not yet folded into `bolusLinks`.
@@ -68,10 +70,12 @@ enum HealthIngestTherapy {
 
     /// Points the JSON files at a scratch directory. Pass nil to use Application Support again.
     static func useTestDirectory(_ url: URL?) {
+        fileQueue.sync {}
         lock.lock()
         directoryOverride = url
         loaded = false
         pending = []
+        stagedRecords = []
         carbStamps = [:]
         bolusLinks = []
         unsavedLinks = []
@@ -388,7 +392,7 @@ enum HealthIngestTherapy {
 
     // MARK: - Links onto bolus rows
 
-    /// Records a link for a later bolus row. Returns before any file IO. Does not throw.
+    /// Records a link for a later bolus row. Appends in memory and returns. Does not throw or touch disk.
     static func rememberBolusLink(decisionId: UUID?, source: String, units: Double, at: Date) {
         let link = BolusLink(
             decisionId: decisionId?.uuidString,
@@ -406,6 +410,7 @@ enum HealthIngestTherapy {
     }
 
     static func claimBolusLink(eventId: String, units: Double, at: Date) {
+        prepareMemory()
         lock.lock()
         absorbUnsavedLinksLocked()
         guard !bolusLinks.contains(where: { $0.eventId == eventId }) else {
@@ -425,11 +430,13 @@ enum HealthIngestTherapy {
             return
         }
         bolusLinks[best].eventId = eventId
-        saveLocked(bolusLinks, name: "bolus-links.json")
+        let snapshot = bolusLinks
         lock.unlock()
+        scheduleWrite(snapshot, name: "bolus-links.json")
     }
 
     static func bolusLink(eventId: String) -> (source: String, decisionId: String?)? {
+        prepareMemory()
         lock.lock()
         absorbUnsavedLinksLocked()
         let link = bolusLinks.first { $0.eventId == eventId }
@@ -437,9 +444,8 @@ enum HealthIngestTherapy {
         return link.map { ($0.source, $0.decisionId) }
     }
 
-    /// Folds dose-path links into the saved list. Caller holds `lock`.
+    /// Folds dose-path links into the in-memory list. Caller holds `lock`. No disk IO.
     private static func absorbUnsavedLinksLocked() {
-        loadLocked()
         guard !unsavedLinks.isEmpty else { return }
         bolusLinks.append(contentsOf: unsavedLinks)
         unsavedLinks.removeAll()
@@ -449,40 +455,44 @@ enum HealthIngestTherapy {
     }
 
     private static func persistBolusLinks() {
+        prepareMemory()
         lock.lock()
         absorbUnsavedLinksLocked()
-        saveLocked(bolusLinks, name: "bolus-links.json")
+        let snapshot = bolusLinks
         lock.unlock()
+        writeToDisk(snapshot, name: "bolus-links.json")
     }
 
     // MARK: - Carbs
 
     static func noteCarbEntered(id: UUID?, at: Date) {
         guard let id else { return }
+        prepareMemory()
         lock.lock()
-        loadLocked()
         var stamp = carbStamps[id.uuidString] ?? CarbStamp(enteredAt: nil, editedAt: nil)
         if stamp.enteredAt == nil { stamp.enteredAt = at }
         carbStamps[id.uuidString] = stamp
         trimCarbStampsLocked()
-        saveLocked(carbStamps, name: "carb-times.json")
+        let snapshot = carbStamps
         lock.unlock()
+        scheduleWrite(snapshot, name: "carb-times.json")
     }
 
     static func noteCarbEdited(previousID: UUID?, newID: UUID?, at: Date) {
         guard let newID else { return }
+        prepareMemory()
         lock.lock()
-        loadLocked()
         let previous = previousID.flatMap { carbStamps[$0.uuidString] }
         carbStamps[newID.uuidString] = CarbStamp(enteredAt: previous?.enteredAt, editedAt: at)
         trimCarbStampsLocked()
-        saveLocked(carbStamps, name: "carb-times.json")
+        let snapshot = carbStamps
         lock.unlock()
+        scheduleWrite(snapshot, name: "carb-times.json")
     }
 
     static func carbTimes(id: String) -> (enteredAt: Date?, editedAt: Date?) {
+        prepareMemory()
         lock.lock()
-        loadLocked()
         let stamp = carbStamps[id]
         lock.unlock()
         return (stamp?.enteredAt, stamp?.editedAt)
@@ -503,8 +513,8 @@ enum HealthIngestTherapy {
 
     static func notePumpEvent(id: String?, eventType: String, at: Date, alarmKind: String?, alarmMessage: String?) {
         guard let id, !id.isEmpty else { return }
+        prepareMemory()
         lock.lock()
-        loadLocked()
         let snapshot = pumpSnapshot
         let recent = snapshot.map { abs($0.at.timeIntervalSince(at)) < 30 * 60 } ?? false
         var note = PumpNote(
@@ -535,13 +545,14 @@ enum HealthIngestTherapy {
                 pumpNotes.removeValue(forKey: key)
             }
         }
-        saveLocked(pumpNotes, name: "pump-notes.json")
+        let saved = pumpNotes
         lock.unlock()
+        scheduleWrite(saved, name: "pump-notes.json")
     }
 
     static func pumpExtras(eventId: String, eventType: String, note: String?) -> [String: HealthIngestJSON?] {
+        prepareMemory()
         lock.lock()
-        loadLocked()
         let stored = pumpNotes[eventId]
         lock.unlock()
         var fields: [String: HealthIngestJSON?] = [:]
@@ -654,8 +665,9 @@ enum HealthIngestTherapy {
 
     static func drain(preferences: HealthIngestPreferences) -> [HealthIngestRecord] {
         expireWatchRecommendations()
+        prepareMemory()
         lock.lock()
-        loadLocked()
+        foldStagedRecordsLocked()
         var leaving: [HealthIngestRecord] = []
         var staying: [HealthIngestRecord] = []
         for record in pending {
@@ -675,10 +687,11 @@ enum HealthIngestTherapy {
             }
         }
         pending = staying
-        if !leaving.isEmpty {
-            saveLocked(pending, name: "therapy-queue.json")
-        }
+        let snapshot = leaving.isEmpty ? nil : pending
         lock.unlock()
+        if let snapshot {
+            scheduleWrite(snapshot, name: "therapy-queue.json")
+        }
         return leaving
     }
 
@@ -703,17 +716,34 @@ enum HealthIngestTherapy {
 
     private static func enqueue(_ record: HealthIngestRecord) {
         lock.lock()
-        loadLocked()
-        if let index = pending.firstIndex(where: { $0.id == record.id && $0.type == record.type }) {
-            pending[index] = record
-        } else {
-            pending.append(record)
+        stagedRecords.append(record)
+        lock.unlock()
+        fileQueue.async {
+            Self.persistQueue()
         }
+    }
+
+    private static func foldStagedRecordsLocked() {
+        for record in stagedRecords {
+            if let index = pending.firstIndex(where: { $0.id == record.id && $0.type == record.type }) {
+                pending[index] = record
+            } else {
+                pending.append(record)
+            }
+        }
+        stagedRecords.removeAll()
         if pending.count > 80 {
             pending.removeFirst(pending.count - 80)
         }
-        saveLocked(pending, name: "therapy-queue.json")
+    }
+
+    private static func persistQueue() {
+        prepareMemory()
+        lock.lock()
+        foldStagedRecordsLocked()
+        let snapshot = pending
         lock.unlock()
+        writeToDisk(snapshot, name: "therapy-queue.json")
     }
 
     private static func trimCarbStampsLocked() {
@@ -725,13 +755,25 @@ enum HealthIngestTherapy {
         }
     }
 
-    private static func loadLocked() {
-        guard !loaded else { return }
-        loaded = true
-        pending = load([HealthIngestRecord].self, name: "therapy-queue.json") ?? []
-        carbStamps = load([String: CarbStamp].self, name: "carb-times.json") ?? [:]
-        bolusLinks = load([BolusLink].self, name: "bolus-links.json") ?? []
-        pumpNotes = load([String: PumpNote].self, name: "pump-notes.json") ?? [:]
+    /// Reads disk outside `lock`, then installs the snapshot. Does not hold `lock` during file IO.
+    private static func prepareMemory() {
+        lock.lock()
+        let needsLoad = !loaded
+        lock.unlock()
+        guard needsLoad else { return }
+        let diskPending = load([HealthIngestRecord].self, name: "therapy-queue.json") ?? []
+        let diskCarbs = load([String: CarbStamp].self, name: "carb-times.json") ?? [:]
+        let diskLinks = load([BolusLink].self, name: "bolus-links.json") ?? []
+        let diskPumps = load([String: PumpNote].self, name: "pump-notes.json") ?? [:]
+        lock.lock()
+        if !loaded {
+            pending = diskPending
+            carbStamps = diskCarbs
+            bolusLinks = diskLinks
+            pumpNotes = diskPumps
+            loaded = true
+        }
+        lock.unlock()
     }
 
     private static func load<T: Decodable>(_ type: T.Type, name: String) -> T? {
@@ -739,7 +781,13 @@ enum HealthIngestTherapy {
         return try? HealthIngestWire.makeDecoder().decode(type, from: data)
     }
 
-    private static func saveLocked(_ value: some Encodable, name: String) {
+    private static func scheduleWrite(_ value: some Encodable, name: String) {
+        fileQueue.async {
+            writeToDisk(value, name: name)
+        }
+    }
+
+    private static func writeToDisk(_ value: some Encodable, name: String) {
         guard let url = file(name), let data = try? HealthIngestWire.makeEncoder().encode(value) else { return }
         try? data.write(to: url, options: .atomic)
     }

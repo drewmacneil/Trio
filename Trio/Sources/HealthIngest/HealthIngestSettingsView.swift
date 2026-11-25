@@ -216,7 +216,9 @@ struct HealthIngestSettingsForm: View {
             stateRow
             if status.backfillRunning, let progress = status.backfill {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(progress.phase)
+                    if status.showsBackfillPhase {
+                        Text(progress.phase)
+                    }
                     Text("Day \(progress.day) of \(progress.days)")
                         .font(.footnote)
                         .foregroundColor(.secondary)
@@ -367,14 +369,9 @@ struct HealthIngestSettingsForm: View {
                 .frame(width: 10, height: 10)
             Text(stateTitle)
             Spacer()
-            if status.backfillRunning {
+            if status.showsStatusSpinner {
                 ProgressView()
             }
-        }
-        if status.isPausedUntilUnlock {
-            Text(HealthIngestStatus.pausedUntilUnlock)
-                .font(.footnote)
-                .foregroundColor(.orange)
         }
         if status.showsLastError, let error = status.lastError {
             Text(error)
@@ -388,8 +385,9 @@ struct HealthIngestSettingsForm: View {
     private var stateColor: Color {
         switch stateTitle {
         case "Backfilling": return .blue
-        case "Paused": return .orange
-        case "Error": return .red
+        case HealthIngestStatus.pausedUntilUnlock: return .orange
+        case "Error", HealthIngestStatus.tokenRejectedTitle, HealthIngestStatus.deviceIdRejectedTitle:
+            return .red
         default: return .green
         }
     }

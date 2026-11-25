@@ -18,7 +18,9 @@ enum HealthIngestSettingsVersion {
     static func object(_ input: Input) -> HealthIngestJSON {
         let preferences = input.preferences
         let mode = dynamicIsfMode(preferences)
+        let incomplete = schedulesArePlaceholder(input.profile)
         return .object([
+            "incomplete": incomplete ? .bool(true) : nil,
             "trioVersion": input.trioVersion.map { .string($0) },
             "activeProfileName": input.activeProfileName.map { .string($0) },
             "units": .object([
@@ -35,10 +37,10 @@ enum HealthIngestSettingsVersion {
                 "maxIOB": .string("U"),
                 "maxCOB": .string("g")
             ]),
-            "basalSchedule": schedule(input.profile?.basal ?? [], unit: "U/hr"),
-            "carbRatioSchedule": schedule(input.profile?.carbRatio ?? [], unit: "g/U"),
-            "isfSchedule": schedule(input.profile?.sensitivity ?? [], unit: "mg/dL/U"),
-            "targetSchedule": targetSchedule(input.profile?.target ?? []),
+            "basalSchedule": incomplete ? nil : schedule(input.profile?.basal ?? [], unit: "U/hr"),
+            "carbRatioSchedule": incomplete ? nil : schedule(input.profile?.carbRatio ?? [], unit: "g/U"),
+            "isfSchedule": incomplete ? nil : schedule(input.profile?.sensitivity ?? [], unit: "mg/dL/U"),
+            "targetSchedule": incomplete ? nil : targetSchedule(input.profile?.target ?? []),
             "diaHours": number(input.diaHours),
             "insulinCurve": .string(preferences.curve.rawValue),
             "useCustomPeakTime": .bool(preferences.useCustomPeakTime),
@@ -100,9 +102,19 @@ enum HealthIngestSettingsVersion {
                     "maxBolus": number(input.maxBolus),
                     "maxBasal": number(input.maxBasal)
                 ]),
-                "profile": rawProfile(input.profile)
+                "profile": incomplete ? .object([:]) : rawProfile(input.profile)
             ])
         ])
+    }
+
+    /// A missing profile, or the single 0 U/hr basal with no CR, ISF, or target, is not a saved schedule.
+    static func schedulesArePlaceholder(_ profile: TrioTherapyProfile?) -> Bool {
+        guard let profile else { return true }
+        let othersEmpty = profile.carbRatio.isEmpty && profile.sensitivity.isEmpty && profile.target.isEmpty
+        guard othersEmpty else { return false }
+        if profile.basal.isEmpty { return true }
+        guard profile.basal.count == 1, profile.basal[0].seconds == 0 else { return false }
+        return double(profile.basal[0].value) == 0
     }
 
     /// `off` when dynamic ISF is disabled, otherwise `sigmoid` or `log`.

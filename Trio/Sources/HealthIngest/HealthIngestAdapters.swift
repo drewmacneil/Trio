@@ -472,8 +472,7 @@ struct HealthIngestDiabetesAdapter {
             "units": .decimal(bolus?.amount),
             "programmedUnits": .decimal(bolus?.programmedAmount),
             // `amount` is the pump history value, including a partial or cancelled delivery.
-            // `deliveredUnits` stays absent here so older readers keep seeing it only when a
-            // writer sent it. The bundle's actualDeliveredUnits is this pump figure.
+            "deliveredUnits": .decimal(bolus?.amount),
             "actualDeliveredUnits": .decimal(bolus?.amount),
             "scheduledUnits": .decimal(bolus?.programmedAmount),
             "actualSource": (bolus?.amount != nil) ? .string("pump") : nil,
@@ -502,7 +501,10 @@ struct HealthIngestDiabetesAdapter {
         let rate: HealthIngestJSON? = temp?.rate.flatMap { HealthIngestPayload.finiteNumber($0.doubleValue) }
         let durationMinutes: HealthIngestJSON? = temp.map { .number(Double($0.duration)) }
         let automatic: HealthIngestJSON? = scheduled ? nil : .bool(true)
-        let deliveredUnits: HealthIngestJSON? = .decimal(temp?.deliveredUnits)
+        let deliveredUnits: HealthIngestJSON? = HealthIngestTempDelivery.pumpUnits(
+            rate: temp?.rate?.doubleValue,
+            delivered: temp?.deliveredUnits?.doubleValue
+        ).map { .number($0) }
         let insulinType: HealthIngestJSON? = event.insulinType.flatMap { $0.isEmpty ? nil : .string($0) }
         let payload = HealthIngestJSON.object([
             "rate": rate,
@@ -920,5 +922,14 @@ struct HealthIngestDiabetesAdapter {
             tz: HealthIngestTime.zoneIdentifier,
             payload: payload
         )
+    }
+}
+
+/// A stored temp-basal total of 0 at a positive rate is a missing pump report.
+enum HealthIngestTempDelivery {
+    static func pumpUnits(rate: Double?, delivered: Double?) -> Double? {
+        guard let delivered, delivered.isFinite else { return nil }
+        if delivered == 0, let rate, rate.isFinite, rate > 0 { return nil }
+        return delivered
     }
 }

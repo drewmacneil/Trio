@@ -968,6 +968,10 @@ import Testing
         let target = (parsed?["targetSchedule"] as? [[String: Any]])?.first
         #expect(target?["low"] as? Double == 100)
         #expect(target?["high"] as? Double == 100)
+        #expect(parsed?["incomplete"] == nil)
+        #expect(HealthIngestTempDelivery.pumpUnits(rate: 0.6, delivered: 0) == nil)
+        #expect(HealthIngestTempDelivery.pumpUnits(rate: 0, delivered: 0) == 0)
+        #expect(HealthIngestTempDelivery.pumpUnits(rate: 1.2, delivered: 0.4) == 0.4)
         let dynamic = parsed?["dynamicIsf"] as? [String: Any]
         #expect(dynamic?["mode"] as? String == "sigmoid")
         let raw = parsed?["raw"] as? [String: Any]
@@ -979,6 +983,51 @@ import Testing
         #expect(rawBasal?["rate"] as? Double == 0.9)
         #expect(rawBasal?["minutes"] as? Double == 0)
         #expect(HealthIngestSettingsVersion.dynamicIsfMode(Preferences()) == "off")
+
+        let placeholder = TrioTherapyProfile(
+            name: "empty",
+            basal: [TherapyScheduleEntry(seconds: 0, value: 0)],
+            carbRatio: [],
+            sensitivity: [],
+            target: []
+        )
+        let missing = HealthIngestSettingsVersion.object(
+            HealthIngestSettingsVersion.Input(
+                preferences: Preferences(),
+                profile: placeholder,
+                activeProfileName: "empty",
+                diaHours: 6,
+                maxBolus: 10,
+                maxBasal: 3,
+                trioVersion: nil
+            )
+        )
+        let missingJSON = HealthIngestCanonicalJSON.string(missing)
+        let missingObject = try? JSONSerialization.jsonObject(with: Data(missingJSON.utf8)) as? [String: Any]
+        #expect(missingObject?["incomplete"] as? Bool == true)
+        #expect(missingObject?["basalSchedule"] == nil)
+        #expect(missingObject?["carbRatioSchedule"] == nil)
+        #expect(missingObject?["isfSchedule"] == nil)
+        #expect(missingObject?["targetSchedule"] == nil)
+    }
+
+    @Test func calibrationEventCarriesMeterSensorAndOutcome() throws {
+        let at = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = HealthIngestTherapy.cgmRecord(
+            at: at,
+            kind: "calibration",
+            message: nil,
+            sensor: "DXCM1A",
+            meterMgdl: 110,
+            sensorMgdl: 108,
+            outcome: "accepted"
+        )
+        let payload = try wirePayload(record)
+        #expect(payload["kind"] as? String == "calibration")
+        #expect((payload["meterMgdl"] as? NSNumber)?.doubleValue == 110)
+        #expect((payload["sensorMgdl"] as? NSNumber)?.doubleValue == 108)
+        #expect(payload["outcome"] as? String == "accepted")
+        #expect(payload["sensor"] as? String == "DXCM1A")
     }
 
     @Test func settingsSnapshotIdMatchesTheServerCanonicalHash() {

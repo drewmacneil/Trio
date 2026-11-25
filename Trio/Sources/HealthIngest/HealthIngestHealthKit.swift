@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import UIKit
 
 enum HealthIngestSleep {
     /// Server stages. Apple's finer values collapse onto this set.
@@ -15,6 +16,36 @@ enum HealthIngestSleep {
         case .inBed: return "inBed"
         default: return "asleep"
         }
+    }
+}
+
+/// Reads HealthKit samples for the uploader. Tests substitute a scripted implementation.
+protocol HealthIngestHealthKitQuerying: AnyObject {
+    func samples(
+        type: HKSampleType,
+        predicate: NSPredicate,
+        limit: Int,
+        timeout: TimeInterval
+    ) async throws -> [HKSample]
+
+    func anchored(
+        type: HKSampleType,
+        predicate: NSPredicate?,
+        anchor: HKQueryAnchor?,
+        limit: Int,
+        timeout: TimeInterval
+    ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?)
+}
+
+enum HealthIngestProtectedData {
+    /// `HKErrorDatabaseInaccessible`. The app's own `HKError` enum hides HealthKit's type,
+    /// so the code is named here. Apple assigns it 6.
+    static let databaseInaccessibleCode = 6
+
+    /// The device is locked, so this page was not read.
+    static func isDatabaseInaccessible(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == HKErrorDomain && nsError.code == databaseInaccessibleCode
     }
 }
 
@@ -41,15 +72,25 @@ final class HealthIngestHealthKitReader {
 
     private let store: HKHealthStore
     private let disk: HealthIngestDisk
+    private let queries: HealthIngestHealthKitQuerying
     private let lock = NSLock()
     private var observers: [HKObserverQuery] = []
     private var anchors: [String: HKQueryAnchor] = [:]
     private var cursors: [String: Date] = [:]
     private var loaded = false
+    /// Nil follows the device lock. Tests set this so a locked read can be simulated.
+    var protectedDataOverride: Bool?
 
-    init(store: HKHealthStore, disk: HealthIngestDisk) {
+    init(store: HKHealthStore, disk: HealthIngestDisk, queries: HealthIngestHealthKitQuerying? = nil) {
         self.store = store
         self.disk = disk
+        self.queries = queries ?? HealthIngestHealthStoreQueries(store: store)
+    }
+
+    /// False while the iPhone is locked. HealthKit then returns `errorDatabaseInaccessible`.
+    private func deviceCanReadProtectedData() async -> Bool {
+        if let protectedDataOverride { return protectedDataOverride }
+        return await MainActor.run { UIApplication.shared.isProtectedDataAvailable }
     }
 
     func requestAuthorization() async {
@@ -126,7 +167,8 @@ final class HealthIngestHealthKitReader {
 
     /// Anchored reads, `pageLimit` samples per query and at most `maxPagesPerKind` queries per
     /// type per call. Remaining samples are picked up by the next call because the anchor only
-    /// advances past samples that were handed to `sink`. Returns user-visible errors.
+    /// advances past samples that were handed to `sink`. A failed or locked read does not
+    /// move the anchor. Returns user-visible errors.
     func incremental(
         preferences: HealthIngestPreferences,
         pageLimit: Int,
@@ -134,17 +176,25 @@ final class HealthIngestHealthKitReader {
         sink: PageSink
     ) async -> [String] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
+        if await deviceCanReadProtectedData() == false {
+            return [HealthIngestStatus.pausedUntilUnlock]
+        }
         loadIfNeeded()
         var errors: [String] = []
         for kind in Self.readTypes() where preferences.isOn(kind.category) {
             if Task.isCancelled { break }
-            errors.append(contentsOf: await anchoredPages(kind: kind, limit: pageLimit, maxPages: maxPagesPerKind, sink: sink))
+            let pageErrors = await anchoredPages(kind: kind, limit: pageLimit, maxPages: maxPagesPerKind, sink: sink)
+            errors.append(contentsOf: pageErrors)
+            if pageErrors.contains(where: HealthIngestStatus.isPausedUntilUnlock) {
+                return errors
+            }
         }
         return errors
     }
 
     /// Backfill reads round-robin across types, one `pageLimit` page at a time, `maxPages` pages
     /// in total per call. The cursor for a type only advances after its page went to `sink`.
+    /// A failed or locked read leaves that cursor where it is, so the same window is retried.
     func backfill(
         preferences: HealthIngestPreferences,
         pageLimit: Int,
@@ -152,6 +202,9 @@ final class HealthIngestHealthKitReader {
         sink: PageSink
     ) async -> [String] {
         guard HKHealthStore.isHealthDataAvailable() else { return [] }
+        if await deviceCanReadProtectedData() == false {
+            return [HealthIngestStatus.pausedUntilUnlock]
+        }
         loadIfNeeded()
         var errors: [String] = []
         var skipped: Set<String> = []
@@ -166,6 +219,9 @@ final class HealthIngestHealthKitReader {
                 pages += 1
                 if let message = await backfillOnePage(kind: kind, limit: pageLimit, sink: sink) {
                     errors.append(message)
+                    if HealthIngestStatus.isPausedUntilUnlock(message) {
+                        return errors
+                    }
                     skipped.insert(kind.recordType)
                 }
             }
@@ -182,13 +238,19 @@ final class HealthIngestHealthKitReader {
                 ? HKQuery.predicateForSamples(withStart: Date().addingTimeInterval(-24 * 3600), end: nil, options: .strictStartDate)
                 : nil
             do {
-                let page = try await anchoredQuery(
+                let page = try await queries.anchored(
                     type: kind.sampleType,
                     predicate: predicate,
                     anchor: existing,
                     limit: limit,
                     timeout: Self.timeout(for: kind.recordType)
                 )
+                // The phone may have locked while the query was in flight. An empty success
+                // in that state must not be treated as "caught up", and a new anchor must
+                // not be saved: either one would skip the samples we could not read.
+                if await deviceCanReadProtectedData() == false {
+                    return [HealthIngestStatus.pausedUntilUnlock]
+                }
                 let count = page.samples.count
                 let records = autoreleasepool { page.samples.compactMap { Self.map($0, kind: kind) } }
                 if !records.isEmpty { await sink(records) }
@@ -199,6 +261,9 @@ final class HealthIngestHealthKitReader {
             } catch {
                 if error is CancellationError || Task.isCancelled { return [] }
                 warning(.healthKit, "Health Ingest \(kind.recordType) query failed", error: error)
+                if HealthIngestProtectedData.isDatabaseInaccessible(error) {
+                    return [HealthIngestStatus.pausedUntilUnlock]
+                }
                 return [Self.failureText(recordType: kind.recordType, error: error)]
             }
         }
@@ -210,12 +275,17 @@ final class HealthIngestHealthKitReader {
         guard let cursor = cursor(for: kind.recordType) else { return nil }
         let predicate = HKQuery.predicateForSamples(withStart: cursor, end: nil, options: .strictStartDate)
         do {
-            let samples = try await sampleQuery(
+            let samples = try await queries.samples(
                 type: kind.sampleType,
                 predicate: predicate,
                 limit: limit,
                 timeout: Self.timeout(for: kind.recordType)
             )
+            // Same rule as the anchored path: do not finish or advance this cursor unless
+            // the page was actually readable. An empty result while locked used to clear it.
+            if await deviceCanReadProtectedData() == false {
+                return HealthIngestStatus.pausedUntilUnlock
+            }
             guard let last = samples.last else {
                 setCursor(nil, for: kind.recordType)
                 persist()
@@ -235,6 +305,9 @@ final class HealthIngestHealthKitReader {
         } catch {
             if error is CancellationError || Task.isCancelled { return nil }
             warning(.healthKit, "Health Ingest \(kind.recordType) backfill failed", error: error)
+            if HealthIngestProtectedData.isDatabaseInaccessible(error) {
+                return HealthIngestStatus.pausedUntilUnlock
+            }
             return Self.failureText(recordType: kind.recordType, error: error)
         }
     }
@@ -249,68 +322,6 @@ final class HealthIngestHealthKitReader {
         lock.lock()
         cursors[recordType] = date
         lock.unlock()
-    }
-
-    private func anchoredQuery(
-        type: HKSampleType,
-        predicate: NSPredicate?,
-        anchor: HKQueryAnchor?,
-        limit: Int,
-        timeout: TimeInterval
-    ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
-        let gate = HealthKitQueryGate<(samples: [HKSample], anchor: HKQueryAnchor?)>(store: store)
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                gate.setContinuation(continuation)
-                let query = HKAnchoredObjectQuery(
-                    type: type,
-                    predicate: predicate,
-                    anchor: anchor,
-                    limit: max(limit, 1)
-                ) { _, samples, _, newAnchor, error in
-                    if let error {
-                        gate.finish(.failure(error))
-                    } else {
-                        gate.finish(.success((samples ?? [], newAnchor)))
-                    }
-                }
-                gate.attach(query)
-                gate.startTimeout(seconds: timeout)
-            }
-        } onCancel: {
-            gate.cancel()
-        }
-    }
-
-    private func sampleQuery(
-        type: HKSampleType,
-        predicate: NSPredicate,
-        limit: Int,
-        timeout: TimeInterval
-    ) async throws -> [HKSample] {
-        let gate = HealthKitQueryGate<[HKSample]>(store: store)
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                gate.setContinuation(continuation)
-                let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
-                let query = HKSampleQuery(
-                    sampleType: type,
-                    predicate: predicate,
-                    limit: limit,
-                    sortDescriptors: [sort]
-                ) { _, samples, error in
-                    if let error {
-                        gate.finish(.failure(error))
-                    } else {
-                        gate.finish(.success(samples ?? []))
-                    }
-                }
-                gate.attach(query)
-                gate.startTimeout(seconds: timeout)
-            }
-        } onCancel: {
-            gate.cancel()
-        }
     }
 
     func oldestPendingCursor(preferences: HealthIngestPreferences) -> Date? {
@@ -537,6 +548,78 @@ final class HealthIngestHealthKitReader {
             // HKWorkoutActivityType.dance is raw value 14. It is deprecated, and older workouts still use it.
             if type.rawValue == 14 { return "dance" }
             return "hkWorkoutActivityType.\(type.rawValue)"
+        }
+    }
+}
+
+/// The production HealthKit queries. A locked-device error is delivered as a thrown error
+/// and the new anchor from that callback is ignored, so the reader can leave its cursor alone.
+private final class HealthIngestHealthStoreQueries: HealthIngestHealthKitQuerying {
+    private let store: HKHealthStore
+
+    init(store: HKHealthStore) {
+        self.store = store
+    }
+
+    func anchored(
+        type: HKSampleType,
+        predicate: NSPredicate?,
+        anchor: HKQueryAnchor?,
+        limit: Int,
+        timeout: TimeInterval
+    ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
+        let gate = HealthKitQueryGate<(samples: [HKSample], anchor: HKQueryAnchor?)>(store: store)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.setContinuation(continuation)
+                let query = HKAnchoredObjectQuery(
+                    type: type,
+                    predicate: predicate,
+                    anchor: anchor,
+                    limit: max(limit, 1)
+                ) { _, samples, _, newAnchor, error in
+                    if let error {
+                        gate.finish(.failure(error))
+                    } else {
+                        gate.finish(.success((samples ?? [], newAnchor)))
+                    }
+                }
+                gate.attach(query)
+                gate.startTimeout(seconds: timeout)
+            }
+        } onCancel: {
+            gate.cancel()
+        }
+    }
+
+    func samples(
+        type: HKSampleType,
+        predicate: NSPredicate,
+        limit: Int,
+        timeout: TimeInterval
+    ) async throws -> [HKSample] {
+        let gate = HealthKitQueryGate<[HKSample]>(store: store)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                gate.setContinuation(continuation)
+                let sort = NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)
+                let query = HKSampleQuery(
+                    sampleType: type,
+                    predicate: predicate,
+                    limit: limit,
+                    sortDescriptors: [sort]
+                ) { _, samples, error in
+                    if let error {
+                        gate.finish(.failure(error))
+                    } else {
+                        gate.finish(.success(samples ?? []))
+                    }
+                }
+                gate.attach(query)
+                gate.startTimeout(seconds: timeout)
+            }
+        } onCancel: {
+            gate.cancel()
         }
     }
 }

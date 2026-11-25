@@ -555,6 +555,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 self?.poke()
             }
             .store(in: &lifecycle)
+        // HealthKit reads fail while the phone is locked. Retry as soon as the data is readable
+        // instead of waiting out the idle delay.
+        Foundation.NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)
+            .sink { [weak self] _ in self?.poke() }
+            .store(in: &lifecycle)
         Task { @MainActor [weak self] in
             self?.setActive(UIApplication.shared.applicationState == .active)
         }
@@ -916,6 +921,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 mark.blocked = flush.failed || flush.priorityRemaining
             }
         }
+        var attemptedHealthRead = false
+        var healthReadMessages: [String] = []
         if !failed, !mark.blocked, !Task.isCancelled {
             // Health reads stream page by page into their own lane. They pause while that
             // lane is backed up. Trio rows do not count toward this and are not paused by it.
@@ -926,8 +933,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 throttled: false
             )
             if healthGate.readHealthKit {
+                attemptedHealthRead = true
                 if health.hasPendingBackfill(preferences: prefs) {
-                    errors.append(
+                    healthReadMessages.append(
                         contentsOf: await health.backfill(
                             preferences: prefs,
                             pageLimit: budget.hkPageLimit,
@@ -936,8 +944,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                         )
                     )
                 }
-                if !Task.isCancelled {
-                    errors.append(
+                let locked = healthReadMessages.contains(where: HealthIngestStatus.isPausedUntilUnlock)
+                if !Task.isCancelled, !locked {
+                    healthReadMessages.append(
                         contentsOf: await health.incremental(
                             preferences: prefs,
                             pageLimit: budget.hkPageLimit,
@@ -959,6 +968,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 failed = failed || flush.failed
             }
         }
+        applyHealthReadResult(attempted: attemptedHealthRead, messages: healthReadMessages)
         if let message = errors.first {
             setLastError(message)
         }
@@ -1199,6 +1209,24 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private func setLastError(_ message: String?) {
         stateLock.lock()
         lastError = message
+        stateLock.unlock()
+    }
+
+    /// A locked-device HealthKit failure is the pause line, not a red error.
+    /// A later read that is not locked clears that line. Other errors stay.
+    func applyHealthReadResult(attempted: Bool, messages: [String]) {
+        let real = messages.filter { !HealthIngestStatus.isPausedUntilUnlock($0) }
+        let paused = messages.contains(where: HealthIngestStatus.isPausedUntilUnlock)
+        stateLock.lock()
+        if let message = real.first {
+            lastError = message
+        } else if paused {
+            if lastError == nil || HealthIngestStatus.isPausedUntilUnlock(lastError) {
+                lastError = HealthIngestStatus.pausedUntilUnlock
+            }
+        } else if attempted, HealthIngestStatus.isPausedUntilUnlock(lastError) {
+            lastError = nil
+        }
         stateLock.unlock()
     }
 

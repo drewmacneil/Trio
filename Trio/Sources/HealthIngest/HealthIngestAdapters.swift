@@ -378,7 +378,8 @@ struct HealthIngestDiabetesAdapter {
                 value.doubleValue == 0 ? nil : value.doubleValue
             },
             trendRate: live?.trendRate,
-            sensor: live?.sensor
+            sensor: live?.sensor,
+            source: source
         )
         return record(
             type: HealthIngestType.glucose,
@@ -398,7 +399,8 @@ struct HealthIngestDiabetesAdapter {
         manual: Bool,
         smoothedMgdl: Double?,
         trendRate: Double?,
-        sensor: String?
+        sensor: String?,
+        source: String? = nil
     ) -> HealthIngestJSON {
         let trend = HealthIngestLiveCGM.acceptedText(direction, max: 32)
         let rate = trendRate.flatMap { value -> HealthIngestJSON? in
@@ -415,7 +417,8 @@ struct HealthIngestDiabetesAdapter {
             "smoothedMgdl": smoothedMgdl.flatMap { value in
                 value == 0 ? nil : HealthIngestPayload.finiteNumber(value)
             },
-            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) }
+            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) },
+            "source": HealthIngestLiveCGM.acceptedText(source, max: 64).map { .string($0) }
         ])
     }
 

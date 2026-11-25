@@ -671,7 +671,9 @@ enum HealthIngestTherapy {
         meterMgdl: Double? = nil,
         sensorMgdl: Double? = nil,
         outcome: String? = nil,
-        algorithmState: String? = nil
+        algorithmState: String? = nil,
+        warmupEndedAt: Date? = nil,
+        endedAt: Date? = nil
     ) -> HealthIngestRecord {
         let payload = HealthIngestJSON.object([
             "timestamp": .string(HealthIngestTime.string(from: at)),
@@ -679,6 +681,8 @@ enum HealthIngestTherapy {
             "message": sanitizedMessage(message).map { .string($0) },
             "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) },
             "activatedAt": activatedAt.map { .string(HealthIngestTime.string(from: $0)) },
+            "warmupEndedAt": warmupEndedAt.map { .string(HealthIngestTime.string(from: $0)) },
+            "endedAt": endedAt.map { .string(HealthIngestTime.string(from: $0)) },
             "endReason": HealthIngestLiveCGM.acceptedEndReason(endReason).map { .string($0) },
             "meterMgdl": meterMgdl.flatMap { inclusive($0, 0, 2000) },
             "sensorMgdl": sensorMgdl.flatMap { inclusive($0, 0, 2000) },
@@ -695,7 +699,14 @@ enum HealthIngestTherapy {
         )
     }
 
-    static func storeCGMEvent(at: Date, kind: String?, message: String?, sensor: String? = nil) {
+    static func storeCGMEvent(
+        at: Date,
+        kind: String?,
+        message: String?,
+        sensor: String? = nil,
+        warmupEndedAt: Date? = nil,
+        endedAt: Date? = nil
+    ) {
         guard let kind else { return }
         // The upload pass already recorded this instant from the live manager.
         // A later plugin event would replace that row with one that has less on it.
@@ -709,7 +720,9 @@ enum HealthIngestTherapy {
             at: at,
             kind: kind,
             message: message,
-            sensor: sensor ?? HealthIngestLiveCGM.currentSensor()
+            sensor: sensor ?? HealthIngestLiveCGM.currentSensor(),
+            warmupEndedAt: warmupEndedAt,
+            endedAt: endedAt
         ))
     }
 
@@ -735,7 +748,8 @@ enum HealthIngestTherapy {
         sensorWasWarmup = false
         lock.unlock()
         if ending {
-            storeCGMEvent(at: Date(), kind: "warmup_end", message: nil)
+            let at = Date()
+            storeCGMEvent(at: at, kind: "warmup_end", message: nil, warmupEndedAt: at)
         }
     }
 

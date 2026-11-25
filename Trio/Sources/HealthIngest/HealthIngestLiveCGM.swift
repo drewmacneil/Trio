@@ -11,6 +11,8 @@ struct HealthIngestCGMSnapshot: Equatable {
     var algorithmState: String?
     var glucoseIsReliable: Bool
     var suspectedSessionEndAt: Date?
+    /// Glucose on the live reading when the snapshot was taken, mg/dL.
+    var sensorGlucoseMgdl: Double? = nil
     var calibration: Calibration?
     var previous: EndedSensor?
 
@@ -80,6 +82,7 @@ enum HealthIngestLiveCGM {
             algorithmState: reading.map { $0.algorithmState.description },
             glucoseIsReliable: reading?.hasReliableGlucose == true,
             suspectedSessionEndAt: state.suspectedSessionEndAt,
+            sensorGlucoseMgdl: reading?.glucose.map { Double($0) },
             calibration: state.calibration.map { record in
                 HealthIngestCGMSnapshot.Calibration(
                     meterMgdl: Double(record.glucose),
@@ -237,7 +240,8 @@ enum HealthIngestLiveCGM {
                     message: previous.failureMessage,
                     sensor: previous.sensor,
                     activatedAt: previous.activatedAt,
-                    endReason: previous.endReason
+                    endReason: previous.endReason,
+                    endedAt: previous.endedAt
                 )
             ))
         }
@@ -274,7 +278,8 @@ enum HealthIngestLiveCGM {
                         at: at,
                         kind: "warmup_end",
                         message: nil,
-                        sensor: snapshot.sensor
+                        sensor: snapshot.sensor,
+                        warmupEndedAt: at
                     )
                 ))
                 store.sawWarmup = false
@@ -306,6 +311,7 @@ enum HealthIngestLiveCGM {
                     message: nil,
                     sensor: snapshot.sensor,
                     meterMgdl: calibration.meterMgdl,
+                    sensorMgdl: snapshot.sensorGlucoseMgdl,
                     outcome: calibration.outcome
                 )
                 // Outcome changes keep the same id and must be sent again.

@@ -371,6 +371,11 @@ struct HealthIngestSettingsForm: View {
                 ProgressView()
             }
         }
+        if status.isPausedUntilUnlock {
+            Text(HealthIngestStatus.pausedUntilUnlock)
+                .font(.footnote)
+                .foregroundColor(.orange)
+        }
         if status.showsLastError, let error = status.lastError {
             Text(error)
                 .font(.footnote)
@@ -383,6 +388,7 @@ struct HealthIngestSettingsForm: View {
     private var stateColor: Color {
         switch stateTitle {
         case "Backfilling": return .blue
+        case "Paused": return .orange
         case "Error": return .red
         default: return .green
         }

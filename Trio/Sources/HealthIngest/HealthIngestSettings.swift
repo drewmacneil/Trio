@@ -292,10 +292,23 @@ struct HealthIngestStatus: Equatable {
 
     static let resendingTrioHistory = "Resending stored Trio history"
 
+    /// Shown instead of a red error while HealthKit cannot read because the iPhone is locked.
+    static let pausedUntilUnlock = "Paused until iPhone is unlocked"
+
+    /// The locked-device line. Older builds stored `heart_rate: Protected health data is inaccessible`.
+    static func isPausedUntilUnlock(_ message: String?) -> Bool {
+        guard let message, !message.isEmpty else { return false }
+        if message == pausedUntilUnlock { return true }
+        return message.hasSuffix("Protected health data is inaccessible")
+    }
+
+    var isPausedUntilUnlock: Bool { Self.isPausedUntilUnlock(lastError) }
+
     /// A server or network error stays on screen while a backfill is running.
+    /// A locked iPhone is `isPausedUntilUnlock`, not this row.
     var showsLastError: Bool {
-        guard let lastError else { return false }
-        return !lastError.isEmpty
+        guard let lastError, !lastError.isEmpty else { return false }
+        return !isPausedUntilUnlock
     }
 
     /// The Trio reread line stays on screen while a Health backfill is running.
@@ -305,9 +318,11 @@ struct HealthIngestStatus: Equatable {
     }
 
     /// The dot's title. Backfill keeps this title when `lastError` is set;
-    /// the error is its own row.
+    /// the error is its own row. A locked iPhone stays on this title during a
+    /// backfill and shows the pause line instead of a red error.
     var stateTitle: String {
         if backfillRunning { return "Backfilling" }
+        if isPausedUntilUnlock { return "Paused" }
         if showsLastError { return "Error" }
         return "Up to date"
     }

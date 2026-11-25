@@ -1860,6 +1860,19 @@ import Testing
         )
     }
 
+    private func heartOnlyPreferences() -> HealthIngestPreferences {
+        var categories: [String: Bool] = [:]
+        for category in HealthIngestCategory.allCases {
+            categories[category.rawValue] = category == .heart
+        }
+        return HealthIngestPreferences(
+            enabled: true,
+            baseURL: "",
+            deviceID: HealthIngestWire.defaultDeviceID,
+            categories: categories
+        )
+    }
+
     private func makeDisk() throws -> HealthIngestDisk {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("health-ingest-\(UUID().uuidString)", isDirectory: true)
@@ -2026,6 +2039,160 @@ import Testing
         #expect(idle.showsLastError)
         #expect(!idle.showsTrioHistoryPhase)
         #expect(HealthIngestStatus().stateTitle == "Up to date")
+    }
+
+    @Test func lockedReadKeepsTheCursorAndRetriesTheSameWindow() async throws {
+        let disk = try makeDisk()
+        let queries = ScriptedHealthKitQueries()
+        let reader = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk, queries: queries)
+        reader.protectedDataOverride = true
+        let preferences = heartOnlyPreferences()
+        let since = Date(timeIntervalSince1970: 1_700_000_000)
+        reader.beginBackfill(since: since, preferences: preferences)
+        let cursor = disk.loadCursors()[HealthIngestType.heartRate]
+        let heart = try #require(HKQuantityType.quantityType(forIdentifier: .heartRate))
+        let sampleStart = since.addingTimeInterval(120)
+        queries.heartSample = HKQuantitySample(
+            type: heart,
+            quantity: HKQuantity(unit: HKUnit.count().unitDivided(by: .minute()), doubleValue: 72),
+            start: sampleStart,
+            end: sampleStart
+        )
+        queries.failHeartSamples = true
+
+        let failed = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 4, sink: { _ in
+            Issue.record("A failed HealthKit page is not uploaded")
+        })
+        #expect(failed == [HealthIngestStatus.pausedUntilUnlock])
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == cursor)
+        #expect(queries.sampleFormats.count == 1)
+
+        queries.failHeartSamples = false
+        var sunk = 0
+        let retried = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 1, sink: { records in
+            sunk += records.count
+        })
+        #expect(retried.isEmpty)
+        #expect(queries.sampleFormats.count == 2)
+        #expect(queries.sampleFormats[0] == queries.sampleFormats[1])
+        #expect(sunk == 1)
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == nil)
+
+        queries.failHeartAnchored = true
+        let incrementalFailed = await reader.incremental(
+            preferences: preferences,
+            pageLimit: 50,
+            maxPagesPerKind: 1,
+            sink: { _ in Issue.record("A failed anchored read is not uploaded") }
+        )
+        #expect(incrementalFailed == [HealthIngestStatus.pausedUntilUnlock])
+        #expect(queries.heartAnchors.count == 1)
+        #expect(queries.heartAnchors[0] == nil)
+        #expect(disk.loadAnchors()[HealthIngestType.heartRate] == nil)
+
+        queries.failHeartAnchored = false
+        let incrementalRetried = await reader.incremental(
+            preferences: preferences,
+            pageLimit: 50,
+            maxPagesPerKind: 1,
+            sink: { _ in }
+        )
+        #expect(incrementalRetried.isEmpty)
+        #expect(queries.heartAnchors.count >= 2)
+        if queries.heartAnchors.count >= 2 {
+            #expect(queries.heartAnchors[1] == nil)
+        }
+        #expect(disk.loadAnchors()[HealthIngestType.heartRate] != nil)
+
+        _ = await reader.incremental(preferences: preferences, pageLimit: 50, maxPagesPerKind: 1, sink: { _ in })
+        #expect(queries.heartAnchors.last != nil)
+    }
+
+    @Test func emptyReadWhileLockedDoesNotFinishTheCursor() async throws {
+        let disk = try makeDisk()
+        let queries = ScriptedHealthKitQueries()
+        let reader = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk, queries: queries)
+        queries.reader = reader
+        reader.protectedDataOverride = true
+        let preferences = heartOnlyPreferences()
+        let since = Date(timeIntervalSince1970: 1_700_000_000)
+        reader.beginBackfill(since: since, preferences: preferences)
+        let cursor = disk.loadCursors()[HealthIngestType.heartRate]
+        queries.lockDuringSample = true
+
+        let emptied = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 1, sink: { _ in
+            Issue.record("An empty locked page is not uploaded")
+        })
+        #expect(emptied == [HealthIngestStatus.pausedUntilUnlock])
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == cursor)
+
+        queries.lockDuringSample = false
+        queries.forbidQueries = true
+        let skipped = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 1, sink: { _ in })
+        #expect(skipped == [HealthIngestStatus.pausedUntilUnlock])
+        #expect(queries.sampleCalls == 1)
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == cursor)
+    }
+
+    @Test func lockedPhoneShowsPausedInsteadOfAnError() {
+        let progress = HealthIngestBackfillProgress(
+            days: 90,
+            day: 24,
+            rowsSent: 155_657,
+            phase: "Reading Health samples",
+            fraction: 0.26
+        )
+        let running = HealthIngestStatus(
+            lastError: HealthIngestStatus.pausedUntilUnlock,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(running.stateTitle == "Backfilling")
+        #expect(running.isPausedUntilUnlock)
+        #expect(!running.showsLastError)
+
+        let idle = HealthIngestStatus(lastError: HealthIngestStatus.pausedUntilUnlock)
+        #expect(idle.stateTitle == "Paused")
+        #expect(!idle.showsLastError)
+
+        let legacy = HealthIngestStatus(lastError: "heart_rate: Protected health data is inaccessible")
+        #expect(legacy.isPausedUntilUnlock)
+        #expect(legacy.stateTitle == "Paused")
+        #expect(!legacy.showsLastError)
+
+        let server = HealthIngestStatus(lastError: "Could not reach the server.")
+        #expect(!server.isPausedUntilUnlock)
+        #expect(server.showsLastError)
+        #expect(server.stateTitle == "Error")
+    }
+
+    @Test func lockedPauseClearsAfterTheNextReadSucceeds() throws {
+        let disk = try makeDisk()
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        uploader.applyHealthReadResult(
+            attempted: true,
+            messages: ["heart_rate: Protected health data is inaccessible"]
+        )
+        let paused = uploader.currentSnapshot()
+        #expect(paused.lastError == HealthIngestStatus.pausedUntilUnlock)
+        #expect(paused.isPausedUntilUnlock)
+        #expect(!paused.showsLastError)
+        #expect(paused.stateTitle == "Paused")
+
+        uploader.applyHealthReadResult(attempted: true, messages: [])
+        let cleared = uploader.currentSnapshot()
+        #expect(cleared.lastError == nil)
+        #expect(!cleared.isPausedUntilUnlock)
+        #expect(cleared.stateTitle == "Up to date")
+
+        uploader.applyHealthReadResult(attempted: true, messages: ["workout timed out"])
+        uploader.applyHealthReadResult(attempted: true, messages: [])
+        #expect(uploader.currentSnapshot().lastError == "workout timed out")
+        #expect(uploader.currentSnapshot().showsLastError)
+
+        uploader.applyHealthReadResult(attempted: true, messages: [HealthIngestStatus.pausedUntilUnlock])
+        #expect(uploader.currentSnapshot().lastError == "workout timed out")
+        #expect(uploader.currentSnapshot().stateTitle == "Error")
     }
 
     @Test func priorityLaneDrainsBeforeAnotherHistoricalRead() async throws {
@@ -2342,6 +2509,64 @@ import Testing
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let records = try #require(json["records"] as? [[String: Any]])
         return try #require(records.first?["payload"] as? [String: Any])
+    }
+}
+
+private final class ScriptedHealthKitQueries: HealthIngestHealthKitQuerying, @unchecked Sendable {
+    var failHeartSamples = false
+    var failHeartAnchored = false
+    var lockDuringSample = false
+    var forbidQueries = false
+    var sampleCalls = 0
+    var sampleFormats: [String] = []
+    var heartAnchors: [HKQueryAnchor?] = []
+    var heartSample: HKQuantitySample?
+    weak var reader: HealthIngestHealthKitReader?
+
+    private static let locked = NSError(
+        domain: HKErrorDomain,
+        code: HealthIngestProtectedData.databaseInaccessibleCode,
+        userInfo: [NSLocalizedDescriptionKey: "Protected health data is inaccessible"]
+    )
+
+    func samples(
+        type: HKSampleType,
+        predicate: NSPredicate,
+        limit _: Int,
+        timeout _: TimeInterval
+    ) async throws -> [HKSample] {
+        sampleCalls += 1
+        if forbidQueries {
+            Issue.record("HealthKit was queried while the phone was locked")
+        }
+        guard type.identifier == HKQuantityType.quantityType(forIdentifier: .heartRate)?.identifier else {
+            return []
+        }
+        sampleFormats.append(predicate.predicateFormat)
+        if lockDuringSample {
+            reader?.protectedDataOverride = false
+            return []
+        }
+        if failHeartSamples { throw Self.locked }
+        return heartSample.map { [$0] } ?? []
+    }
+
+    func anchored(
+        type: HKSampleType,
+        predicate _: NSPredicate?,
+        anchor: HKQueryAnchor?,
+        limit _: Int,
+        timeout _: TimeInterval
+    ) async throws -> (samples: [HKSample], anchor: HKQueryAnchor?) {
+        if forbidQueries {
+            Issue.record("HealthKit was queried while the phone was locked")
+        }
+        guard type.identifier == HKQuantityType.quantityType(forIdentifier: .heartRate)?.identifier else {
+            return ([], nil)
+        }
+        heartAnchors.append(anchor)
+        if failHeartAnchored { throw Self.locked }
+        return (heartSample.map { [$0] } ?? [], HKQueryAnchor(fromValue: 4))
     }
 }
 

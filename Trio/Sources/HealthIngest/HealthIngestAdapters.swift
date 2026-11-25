@@ -79,11 +79,13 @@ struct HealthIngestDiabetesAdapter {
                 try await profileSnapshot(profiles: profiles)
             }
             await collect(into: &result, label: "settings") {
-                try await settingsSnapshot(
+                let stored = try? await profiles.fetchProfiles()
+                return try await settingsSnapshot(
                     settings: settings,
                     units: units,
                     pumpModel: pumpModel,
-                    supportedBasalRates: supportedBasalRates
+                    supportedBasalRates: supportedBasalRates,
+                    profiles: stored
                 )
             }
             await collect(into: &result, label: "profile switches") {
@@ -270,7 +272,8 @@ struct HealthIngestDiabetesAdapter {
         settings: SettingsManager,
         units: String,
         pumpModel: String?,
-        supportedBasalRates: [Double]
+        supportedBasalRates: [Double],
+        profiles: StoredTherapyProfiles?
     ) async throws -> [HealthIngestRecord] {
         let pump = settings.pumpSettings
         var pumpFields: [String: HealthIngestJSON?] = [
@@ -284,11 +287,23 @@ struct HealthIngestDiabetesAdapter {
         if !supportedBasalRates.isEmpty {
             pumpFields["supportedBasalRates"] = .array(supportedBasalRates.map { .number($0) })
         }
+        let version = HealthIngestSettingsVersion.object(
+            HealthIngestSettingsVersion.Input(
+                preferences: settings.preferences,
+                profile: profiles?.activeProfileValues,
+                activeProfileName: profiles?.activeProfileName ?? profiles?.activeProfileValues?.name,
+                diaHours: Self.double(pump.insulinActionCurve),
+                maxBolus: Self.double(pump.maxBolus),
+                maxBasal: Self.double(pump.maxBasal),
+                trioVersion: HealthIngestBuild.gitSha
+            )
+        )
         let payload = HealthIngestJSON.object([
             "values": .object([
                 "preferences": HealthIngestWire.jsonValue(settings.preferences),
                 "pumpSettings": .object(pumpFields),
-                "trioSettings": HealthIngestWire.jsonValue(settings.settings)
+                "trioSettings": HealthIngestWire.jsonValue(settings.settings),
+                "version": version
             ])
         ])
         return [Self.addressed(type: HealthIngestType.settingsSnapshot, prefix: HealthIngestWire.settingsIDPrefix, payload: payload)]
@@ -363,7 +378,8 @@ struct HealthIngestDiabetesAdapter {
                 value.doubleValue == 0 ? nil : value.doubleValue
             },
             trendRate: live?.trendRate,
-            sensor: live?.sensor
+            sensor: live?.sensor,
+            source: source
         )
         return record(
             type: HealthIngestType.glucose,
@@ -383,7 +399,8 @@ struct HealthIngestDiabetesAdapter {
         manual: Bool,
         smoothedMgdl: Double?,
         trendRate: Double?,
-        sensor: String?
+        sensor: String?,
+        source: String? = nil
     ) -> HealthIngestJSON {
         let trend = HealthIngestLiveCGM.acceptedText(direction, max: 32)
         let rate = trendRate.flatMap { value -> HealthIngestJSON? in
@@ -400,7 +417,8 @@ struct HealthIngestDiabetesAdapter {
             "smoothedMgdl": smoothedMgdl.flatMap { value in
                 value == 0 ? nil : HealthIngestPayload.finiteNumber(value)
             },
-            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) }
+            "sensor": HealthIngestLiveCGM.acceptedSensor(sensor).map { .string($0) },
+            "source": HealthIngestLiveCGM.acceptedText(source, max: 64).map { .string($0) }
         ])
     }
 
@@ -453,6 +471,12 @@ struct HealthIngestDiabetesAdapter {
         let payload = HealthIngestJSON.object([
             "units": .decimal(bolus?.amount),
             "programmedUnits": .decimal(bolus?.programmedAmount),
+            // `amount` is the pump history value, including a partial or cancelled delivery.
+            // `deliveredUnits` stays absent here so older readers keep seeing it only when a
+            // writer sent it. The bundle's actualDeliveredUnits is this pump figure.
+            "actualDeliveredUnits": .decimal(bolus?.amount),
+            "scheduledUnits": .decimal(bolus?.programmedAmount),
+            "actualSource": (bolus?.amount != nil) ? .string("pump") : nil,
             "external": (bolus?.isExternal == true) ? .bool(true) : nil,
             "programmedByPumpUI": (bolus?.isProgrammedByPumpUI == true) ? .bool(true) : nil,
             "isMutable": .bool(event.isMutable),

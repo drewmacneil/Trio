@@ -824,35 +824,38 @@ import Testing
             HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
             HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
-        // Version 9 has no step. Crossing it is a full reset.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 9) ==
-            HealthIngestMappingUpgrade.fullReset)
+        // 8 → 9 resends glucose with source and does not reset HealthKit.
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 8, currentVersion: 9) ==
+            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        // Version 10 has no step. Crossing it is a full reset.
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 10) ==
+            HealthIngestMappingUpgrade.fullReset)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: 10) ==
             HealthIngestMappingUpgrade.fullReset)
     }
 
     @Test func mappingDowngradeLeavesCursorsAndStoredVersionAlone() async throws {
         let current = HealthIngestWire.mappingVersion
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: current) == nil)
+        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 10, currentVersion: current) == nil)
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: current, currentVersion: current) == nil)
 
         let disk = try makeDisk()
         let cursor = Date(timeIntervalSince1970: 1_700_000_000)
         let anchor = Data([1, 2, 3, 4])
-        disk.saveMappingVersion(9)
+        disk.saveMappingVersion(10)
         disk.saveCursors(["heart_rate": cursor])
         disk.saveAnchors(["heart_rate": anchor])
 
         let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
         await uploader.applyMappingUpgradeIfNeeded()
 
-        #expect(disk.loadMappingVersion() == 9)
+        #expect(disk.loadMappingVersion() == 10)
         #expect(disk.loadCursors()["heart_rate"] == cursor)
         #expect(disk.loadAnchors()["heart_rate"] == anchor)
     }
 
     @Test func mappingVersionSixResendsHealthKitHistoryWithTheSameIds() async throws {
-        #expect(HealthIngestWire.mappingVersion == 8)
+        #expect(HealthIngestWire.mappingVersion == 9)
         let disk = try makeDisk()
         disk.saveMappingVersion(5)
         #expect(disk.loadMappingVersion() < HealthIngestWire.mappingVersion)
@@ -916,6 +919,66 @@ import Testing
         #expect(restored.first?.deviceName == nil)
         #expect(restored.first?.deviceModel == "Watch")
         #expect(restored.first?.deviceManufacturer == nil)
+    }
+
+    @Test func settingsVersionReadsStoredProfileAndOrefPreferences() {
+        var preferences = Preferences()
+        preferences.maxIOB = 8
+        preferences.useNewFormula = true
+        preferences.sigmoid = true
+        preferences.adjustmentFactorSigmoid = 0.4
+        preferences.enableSMBAlways = true
+        preferences.maxSMBBasalMinutes = 30
+        preferences.threshold_setting = 70
+        preferences.curve = .rapidActing
+        preferences.useCustomPeakTime = false
+        preferences.insulinPeakTime = 75
+        let profile = TrioTherapyProfile(
+            name: "weekday",
+            basal: [TherapyScheduleEntry(seconds: 0, value: 0.9)],
+            carbRatio: [TherapyScheduleEntry(seconds: 6 * 3600 + 30 * 60, value: 10)],
+            sensitivity: [TherapyScheduleEntry(seconds: 0, value: 50)],
+            target: [TherapyTargetEntry(seconds: 0, low: 100, high: 120)]
+        )
+        let version = HealthIngestSettingsVersion.object(
+            HealthIngestSettingsVersion.Input(
+                preferences: preferences,
+                profile: profile,
+                activeProfileName: "weekday",
+                diaHours: 6,
+                maxBolus: 10,
+                maxBasal: 3,
+                trioVersion: "abc1234"
+            )
+        )
+        let object = HealthIngestCanonicalJSON.string(version)
+        let parsed = try? JSONSerialization.jsonObject(with: Data(object.utf8)) as? [String: Any]
+        #expect(parsed?["trioVersion"] as? String == "abc1234")
+        #expect(parsed?["insulinCurve"] as? String == "rapid-acting")
+        #expect(parsed?["diaHours"] as? Double == 6)
+        #expect(parsed?["maxIOB"] as? Double == 8)
+        #expect(parsed?["thresholdMgdl"] as? Double == 70)
+        let basal = (parsed?["basalSchedule"] as? [[String: Any]])?.first
+        #expect(basal?["startMinuteOfDay"] as? Double == 0)
+        #expect(basal?["value"] as? Double == 0.9)
+        #expect(basal?["unit"] as? String == "U/hr")
+        let ratio = (parsed?["carbRatioSchedule"] as? [[String: Any]])?.first
+        #expect(ratio?["startMinuteOfDay"] as? Double == 390)
+        #expect(ratio?["unit"] as? String == "g/U")
+        let target = (parsed?["targetSchedule"] as? [[String: Any]])?.first
+        #expect(target?["low"] as? Double == 100)
+        #expect(target?["high"] as? Double == 100)
+        let dynamic = parsed?["dynamicIsf"] as? [String: Any]
+        #expect(dynamic?["mode"] as? String == "sigmoid")
+        let raw = parsed?["raw"] as? [String: Any]
+        let rawPreferences = raw?["preferences"] as? [String: Any]
+        #expect(rawPreferences?["max_iob"] as? Double == 8)
+        #expect(rawPreferences?["curve"] as? String == "rapid-acting")
+        let rawProfile = raw?["profile"] as? [String: Any]
+        let rawBasal = (rawProfile?["basalprofile"] as? [[String: Any]])?.first
+        #expect(rawBasal?["rate"] as? Double == 0.9)
+        #expect(rawBasal?["minutes"] as? Double == 0)
+        #expect(HealthIngestSettingsVersion.dynamicIsfMode(Preferences()) == "off")
     }
 
     @Test func settingsSnapshotIdMatchesTheServerCanonicalHash() {
@@ -1084,7 +1147,7 @@ import Testing
         #expect(HealthIngestCanonicalJSON.clock(seconds: 9 * 3600 + 30 * 60) == "09:30")
         #expect(HealthIngestCanonicalJSON.clock(start: "9:05:00", seconds: 0) == "09:05")
         #expect(HealthIngestCanonicalJSON.clock(hour: 0) == "00:00")
-        #expect(HealthIngestWire.mappingVersion == 8)
+        #expect(HealthIngestWire.mappingVersion == 9)
         #expect(HealthIngestAck.acceptedRowCount([
             HealthIngestAck(type: "hrv", id: "1", status: .accepted),
             HealthIngestAck(type: "hrv", id: "2", status: .duplicate),
@@ -1892,13 +1955,15 @@ import Testing
                 manual: false,
                 smoothedMgdl: nil,
                 trendRate: 1.25,
-                sensor: "DXCM1A"
+                sensor: "DXCM1A",
+                source: "dexcom"
             )
         ))
         #expect(payload["direction"] as? String == "FortyFiveUp")
         #expect(payload["trend"] as? String == "FortyFiveUp")
         #expect((payload["trendRate"] as? NSNumber)?.doubleValue == 1.25)
         #expect(payload["sensor"] as? String == "DXCM1A")
+        #expect(payload["source"] as? String == "dexcom")
 
         let wild = HealthIngestDiabetesAdapter.glucosePayload(
             mgdl: 110,

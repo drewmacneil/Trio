@@ -74,9 +74,12 @@ enum HealthIngestWire {
     /// not used for `trendRate`. Meal `enteredAt` / `editedAt` and bolus
     /// `bolusSource` / `decisionId` are notes taken when Trio saved the row.
     /// They are not columns a Core Data rewind would newly find.
+    /// 9 rewinds that Core Data cursor again so stored glucose is sent with
+    /// `source` in the payload. The source was already in the record id. It does
+    /// not clear HealthKit cursors or anchors and does not start a HealthKit backfill.
     /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
     /// A missing step resets the HealthKit backfill instead of skipping the resend.
-    static let mappingVersion = 8
+    static let mappingVersion = 9
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
         // CanonicalJSON matches the server's stableJson, so content-addressed

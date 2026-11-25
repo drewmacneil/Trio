@@ -30,6 +30,7 @@ enum HealthIngestMappingUpgrade {
     /// Versions 1 through 6 are the historical full reset. Versions 7 and 8 only
     /// rewind Core Data: `persistCoreDataRewind` writes the historical resume and
     /// does not call `beginBackfill`. Version 8 resends glucose with `trend`.
+    /// Version 9 resends glucose with `source` in the payload.
     static let steps: [Int: Step] = [
         1: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         2: Step(resetHealthKit: true, rewindCoreDataDays: 90),
@@ -38,7 +39,8 @@ enum HealthIngestMappingUpgrade {
         5: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         6: Step(resetHealthKit: true, rewindCoreDataDays: 90),
         7: Step(resetHealthKit: false, rewindCoreDataDays: 90),
-        8: Step(resetHealthKit: false, rewindCoreDataDays: 90)
+        8: Step(resetHealthKit: false, rewindCoreDataDays: 90),
+        9: Step(resetHealthKit: false, rewindCoreDataDays: 90)
     ]
 
     /// Used when the range N+1...M contains a version with no step.

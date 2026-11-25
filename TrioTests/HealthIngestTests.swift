@@ -2030,6 +2030,8 @@ import Testing
         )
         #expect(running.stateTitle == "Backfilling")
         #expect(running.showsLastError)
+        #expect(running.showsStatusSpinner)
+        #expect(running.showsBackfillPhase)
         #expect(running.showsTrioHistoryPhase)
         #expect(running.backfill?.phase == "Reading Health samples")
         #expect(running.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
@@ -2037,6 +2039,8 @@ import Testing
         let idle = HealthIngestStatus(lastError: "Could not reach the server.")
         #expect(idle.stateTitle == "Error")
         #expect(idle.showsLastError)
+        #expect(!idle.showsStatusSpinner)
+        #expect(!idle.showsBackfillPhase)
         #expect(!idle.showsTrioHistoryPhase)
         #expect(HealthIngestStatus().stateTitle == "Up to date")
     }
@@ -2147,17 +2151,20 @@ import Testing
             backfillRunning: true,
             backfill: progress
         )
-        #expect(running.stateTitle == "Backfilling")
+        #expect(running.stateTitle == HealthIngestStatus.pausedUntilUnlock)
         #expect(running.isPausedUntilUnlock)
         #expect(!running.showsLastError)
+        #expect(!running.showsStatusSpinner)
+        #expect(!running.showsBackfillPhase)
+        #expect(running.backfill != nil)
 
         let idle = HealthIngestStatus(lastError: HealthIngestStatus.pausedUntilUnlock)
-        #expect(idle.stateTitle == "Paused")
+        #expect(idle.stateTitle == HealthIngestStatus.pausedUntilUnlock)
         #expect(!idle.showsLastError)
 
         let legacy = HealthIngestStatus(lastError: "heart_rate: Protected health data is inaccessible")
         #expect(legacy.isPausedUntilUnlock)
-        #expect(legacy.stateTitle == "Paused")
+        #expect(legacy.stateTitle == HealthIngestStatus.pausedUntilUnlock)
         #expect(!legacy.showsLastError)
 
         let server = HealthIngestStatus(lastError: "Could not reach the server.")
@@ -2177,7 +2184,7 @@ import Testing
         #expect(paused.lastError == HealthIngestStatus.pausedUntilUnlock)
         #expect(paused.isPausedUntilUnlock)
         #expect(!paused.showsLastError)
-        #expect(paused.stateTitle == "Paused")
+        #expect(paused.stateTitle == HealthIngestStatus.pausedUntilUnlock)
 
         uploader.applyHealthReadResult(attempted: true, messages: [])
         let cleared = uploader.currentSnapshot()
@@ -2193,6 +2200,97 @@ import Testing
         uploader.applyHealthReadResult(attempted: true, messages: [HealthIngestStatus.pausedUntilUnlock])
         #expect(uploader.currentSnapshot().lastError == "workout timed out")
         #expect(uploader.currentSnapshot().stateTitle == "Error")
+    }
+
+    /// One case per row of the status-dot priority. Earlier rows beat later ones.
+    @Test func statusDotFollowsThePriorityTable() {
+        let progress = HealthIngestBackfillProgress(
+            days: 90,
+            day: 24,
+            rowsSent: 155_657,
+            phase: "Reading Health samples",
+            fraction: 0.26
+        )
+
+        let token = HealthIngestStatus(
+            lastError: HealthIngestStatus.tokenRejectedError,
+            queueDepth: 12,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(token.stateTitle == HealthIngestStatus.tokenRejectedTitle)
+        #expect(token.isTokenRejected)
+        #expect(token.showsLastError)
+        #expect(token.lastError == HealthIngestStatus.tokenRejectedError)
+        #expect(!token.showsStatusSpinner)
+        #expect(!token.showsBackfillPhase)
+
+        let device = HealthIngestStatus(
+            lastError: HealthIngestStatus.deviceIdRejectedError,
+            queueDepth: 12,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(device.stateTitle == HealthIngestStatus.deviceIdRejectedTitle)
+        #expect(device.isDeviceIdRejected)
+        #expect(!device.isTokenRejected)
+        #expect(device.showsLastError)
+        #expect(device.lastError == HealthIngestStatus.deviceIdRejectedError)
+        #expect(!device.showsStatusSpinner)
+        #expect(!device.showsBackfillPhase)
+
+        let paused = HealthIngestStatus(
+            lastError: HealthIngestStatus.pausedUntilUnlock,
+            queueDepth: 4,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(paused.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(!paused.showsLastError)
+        #expect(!paused.showsStatusSpinner)
+        #expect(!paused.showsBackfillPhase)
+        #expect(paused.backfill != nil)
+
+        let reading = HealthIngestStatus(
+            queueDepth: 10,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(reading.stateTitle == "Backfilling")
+        #expect(!reading.showsLastError)
+        #expect(reading.showsStatusSpinner)
+        #expect(reading.showsBackfillPhase)
+
+        let stalled = HealthIngestStatus(
+            lastError: "Could not reach the server (code -1009).",
+            queueDepth: 3,
+            backfillRunning: true,
+            backfill: progress
+        )
+        #expect(stalled.stateTitle == "Backfilling")
+        #expect(stalled.showsLastError)
+        #expect(stalled.showsStatusSpinner)
+        #expect(stalled.showsBackfillPhase)
+
+        let failed = HealthIngestStatus(lastError: "workout timed out", queueDepth: 8)
+        #expect(failed.stateTitle == "Error")
+        #expect(failed.showsLastError)
+        #expect(!failed.showsStatusSpinner)
+        #expect(!failed.showsBackfillPhase)
+
+        let uploading = HealthIngestStatus(queueDepth: 120, priorityDepth: 4)
+        #expect(uploading.stateTitle == "Uploading")
+        #expect(!uploading.showsLastError)
+        #expect(!uploading.showsStatusSpinner)
+        #expect(!uploading.showsBackfillPhase)
+        #expect(uploading.healthDepth == 116)
+
+        let caughtUp = HealthIngestStatus()
+        #expect(caughtUp.stateTitle == "Up to date")
+        #expect(caughtUp.queueDepth == 0)
+        #expect(!caughtUp.showsLastError)
+        #expect(!caughtUp.showsStatusSpinner)
+        #expect(!caughtUp.showsBackfillPhase)
     }
 
     @Test func priorityLaneDrainsBeforeAnotherHistoricalRead() async throws {

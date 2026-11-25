@@ -1031,13 +1031,13 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 gzip: compressed != nil
             )
             if code == 403 {
-                setLastError("The server returned 403. The device id must match the token's device id.")
+                setLastError(HealthIngestStatus.deviceIdRejectedError)
                 _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
             if code == 401 {
-                setLastError("The server rejected the token (HTTP 401).")
+                setLastError(HealthIngestStatus.tokenRejectedError)
                 _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true

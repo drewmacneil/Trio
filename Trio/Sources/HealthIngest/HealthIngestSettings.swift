@@ -292,8 +292,16 @@ struct HealthIngestStatus: Equatable {
 
     static let resendingTrioHistory = "Resending stored Trio history"
 
-    /// Shown instead of a red error while HealthKit cannot read because the iPhone is locked.
+    /// Shown on the dot while HealthKit cannot read because the iPhone is locked.
     static let pausedUntilUnlock = "Paused until iPhone is unlocked"
+
+    /// The 401 line `send` stores in `lastError`. The dot title is `tokenRejectedTitle`.
+    static let tokenRejectedError = "The server rejected the token (HTTP 401)."
+    static let tokenRejectedTitle = "Token rejected"
+
+    /// The 403 line `send` stores in `lastError`. The dot title is `deviceIdRejectedTitle`.
+    static let deviceIdRejectedError = "The server returned 403. The device id must match the token's device id."
+    static let deviceIdRejectedTitle = "Device id rejected"
 
     /// The locked-device line. Older builds stored `heart_rate: Protected health data is inaccessible`.
     static func isPausedUntilUnlock(_ message: String?) -> Bool {
@@ -304,8 +312,12 @@ struct HealthIngestStatus: Equatable {
 
     var isPausedUntilUnlock: Bool { Self.isPausedUntilUnlock(lastError) }
 
+    var isTokenRejected: Bool { lastError == Self.tokenRejectedError }
+
+    var isDeviceIdRejected: Bool { lastError == Self.deviceIdRejectedError }
+
     /// A server or network error stays on screen while a backfill is running.
-    /// A locked iPhone is `isPausedUntilUnlock`, not this row.
+    /// A locked iPhone is the dot title, not this row.
     var showsLastError: Bool {
         guard let lastError, !lastError.isEmpty else { return false }
         return !isPausedUntilUnlock
@@ -317,13 +329,30 @@ struct HealthIngestStatus: Equatable {
         return !trioHistoryPhase.isEmpty
     }
 
-    /// The dot's title. Backfill keeps this title when `lastError` is set;
-    /// the error is its own row. A locked iPhone stays on this title during a
-    /// backfill and shows the pause line instead of a red error.
+    /// Pause, a rejected token, or a rejected device id mean the backfill is not reading.
+    private var holdsBackfill: Bool {
+        isTokenRejected || isDeviceIdRejected || isPausedUntilUnlock
+    }
+
+    /// The status-row spinner. Off while the dot is a pause or a token failure.
+    var showsStatusSpinner: Bool {
+        backfillRunning && !holdsBackfill
+    }
+
+    /// "Reading Health samples". The day counter stays up either way.
+    var showsBackfillPhase: Bool {
+        showsStatusSpinner && backfill != nil
+    }
+
+    /// The dot's title. First match wins. A real problem other than 401 or 403
+    /// stays in `showsLastError` and does not take the dot away from a backfill.
     var stateTitle: String {
+        if isTokenRejected { return Self.tokenRejectedTitle }
+        if isDeviceIdRejected { return Self.deviceIdRejectedTitle }
+        if isPausedUntilUnlock { return Self.pausedUntilUnlock }
         if backfillRunning { return "Backfilling" }
-        if isPausedUntilUnlock { return "Paused" }
         if showsLastError { return "Error" }
+        if queueDepth > 0 { return "Uploading" }
         return "Up to date"
     }
 }

@@ -286,11 +286,14 @@ struct HealthIngestStatus: Equatable {
     var latestRejectReason: String?
     var rejectGroups: [HealthIngestRejectGroup] = []
     var backfill: HealthIngestBackfillProgress?
-    /// Set while stored Trio rows are being reread. This is not a HealthKit backfill,
-    /// so the Health day counter stays off.
-    var trioHistoryPhase: String? = nil
+    /// Core Data rewind progress. Shown with the same card as `backfill`.
+    /// Nil once `historicalResume` has been cleared.
+    var rewrite: HealthIngestBackfillProgress? = nil
 
-    static let resendingTrioHistory = "Resending stored Trio history"
+    static let rewritingTitle = "Rewriting"
+    static let rewritingPhase = "Rewriting stored Trio history"
+    /// Appended to the rows-sent line when a rewrite is up and the queue is empty.
+    static let liveUploadsCurrent = "Live uploads are current"
 
     /// Shown on the dot while HealthKit cannot read because the iPhone is locked.
     static let pausedUntilUnlock = "Paused until iPhone is unlocked"
@@ -323,34 +326,53 @@ struct HealthIngestStatus: Equatable {
         return !isPausedUntilUnlock
     }
 
-    /// The Trio reread line stays on screen while a Health backfill is running.
-    var showsTrioHistoryPhase: Bool {
-        guard let trioHistoryPhase else { return false }
-        return !trioHistoryPhase.isEmpty
-    }
-
-    /// Pause, a rejected token, or a rejected device id mean the backfill is not reading.
+    /// Pause, a rejected token, or a rejected device id mean the pass is not reading.
     private var holdsBackfill: Bool {
         isTokenRejected || isDeviceIdRejected || isPausedUntilUnlock
     }
 
-    /// The status-row spinner. Off while the dot is a pause or a token failure.
-    var showsStatusSpinner: Bool {
-        backfillRunning && !holdsBackfill
+    var isRewriting: Bool { rewrite != nil }
+
+    /// HealthKit backfill owns the card while it is running. Otherwise the rewrite does.
+    var progressCard: HealthIngestBackfillProgress? {
+        if backfillRunning { return backfill }
+        return rewrite
     }
 
-    /// "Reading Health samples". The day counter stays up either way.
+    /// The status-row spinner. Off while the dot is a pause or a token failure.
+    var showsStatusSpinner: Bool {
+        (backfillRunning || isRewriting) && !holdsBackfill
+    }
+
+    /// "Reading Health samples" or the rewrite phase. The day counter stays up either way.
     var showsBackfillPhase: Bool {
-        showsStatusSpinner && backfill != nil
+        backfillRunning && showsStatusSpinner && backfill != nil
+    }
+
+    /// Phase line for whichever card is on screen.
+    var showsProgressPhase: Bool {
+        showsStatusSpinner && progressCard != nil
+    }
+
+    /// The single line under the bar. A quiet live note shares that line while a rewrite's queue is empty.
+    var rowsSentLine: String? {
+        guard let progress = progressCard else { return nil }
+        let sent = "\(progress.rowsSent.formatted()) rows sent"
+        if isRewriting, !backfillRunning, queueDepth == 0 {
+            return "\(sent) · \(Self.liveUploadsCurrent)"
+        }
+        return sent
     }
 
     /// The dot's title. First match wins. A real problem other than 401 or 403
-    /// stays in `showsLastError` and does not take the dot away from a backfill.
+    /// stays in `showsLastError` and does not take the dot away from a running pass.
+    /// "Up to date" requires an empty queue and a cleared rewrite cursor.
     var stateTitle: String {
         if isTokenRejected { return Self.tokenRejectedTitle }
         if isDeviceIdRejected { return Self.deviceIdRejectedTitle }
         if isPausedUntilUnlock { return Self.pausedUntilUnlock }
         if backfillRunning { return "Backfilling" }
+        if isRewriting { return Self.rewritingTitle }
         if showsLastError { return "Error" }
         if queueDepth > 0 { return "Uploading" }
         return "Up to date"

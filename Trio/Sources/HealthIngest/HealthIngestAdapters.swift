@@ -29,7 +29,8 @@ struct HealthIngestDiabetesAdapter {
         settings: SettingsManager,
         profiles: TherapyProfileStorage,
         pumpModel: String?,
-        supportedBasalRates: [Double]
+        supportedBasalRates: [Double],
+        liveProfile: TrioTherapyProfile? = nil
     ) async -> HealthIngestReadResult {
         var result = HealthIngestReadResult()
         let units = settings.settings.units.rawValue
@@ -76,7 +77,7 @@ struct HealthIngestDiabetesAdapter {
         }
         if preferences.isOn(.profilesAndSettings) {
             await collect(into: &result, label: "profiles") {
-                try await profileSnapshot(profiles: profiles)
+                try await profileSnapshot(profiles: profiles, live: liveProfile)
             }
             await collect(into: &result, label: "settings") {
                 let stored = try? await profiles.fetchProfiles()
@@ -85,7 +86,8 @@ struct HealthIngestDiabetesAdapter {
                     units: units,
                     pumpModel: pumpModel,
                     supportedBasalRates: supportedBasalRates,
-                    profiles: stored
+                    profiles: stored,
+                    live: liveProfile
                 )
             }
             await collect(into: &result, label: "profile switches") {
@@ -262,9 +264,9 @@ struct HealthIngestDiabetesAdapter {
         }
     }
 
-    private func profileSnapshot(profiles: TherapyProfileStorage) async throws -> [HealthIngestRecord] {
+    private func profileSnapshot(profiles: TherapyProfileStorage, live: TrioTherapyProfile?) async throws -> [HealthIngestRecord] {
         let stored = try await profiles.fetchProfiles()
-        let payload = Self.profilePayload(stored)
+        let payload = Self.profilePayload(stored, live: live)
         return [Self.addressed(type: HealthIngestType.profileSnapshot, prefix: HealthIngestWire.profileIDPrefix, payload: payload)]
     }
 
@@ -273,7 +275,8 @@ struct HealthIngestDiabetesAdapter {
         units: String,
         pumpModel: String?,
         supportedBasalRates: [Double],
-        profiles: StoredTherapyProfiles?
+        profiles: StoredTherapyProfiles?,
+        live: TrioTherapyProfile?
     ) async throws -> [HealthIngestRecord] {
         let pump = settings.pumpSettings
         var pumpFields: [String: HealthIngestJSON?] = [
@@ -287,15 +290,19 @@ struct HealthIngestDiabetesAdapter {
         if !supportedBasalRates.isEmpty {
             pumpFields["supportedBasalRates"] = .array(supportedBasalRates.map { .number($0) })
         }
+        let chosen = HealthIngestLiveProfile.resolved(stored: profiles, live: live)
         let version = HealthIngestSettingsVersion.object(
             HealthIngestSettingsVersion.Input(
                 preferences: settings.preferences,
-                profile: profiles?.activeProfileValues,
-                activeProfileName: profiles?.activeProfileName ?? profiles?.activeProfileValues?.name,
+                profile: chosen.profile,
+                activeProfileName: chosen.name,
                 diaHours: Self.double(pump.insulinActionCurve),
                 maxBolus: Self.double(pump.maxBolus),
                 maxBasal: Self.double(pump.maxBasal),
-                trioVersion: HealthIngestBuild.gitSha
+                pumpModel: pumpModel,
+                supportedBasalRates: supportedBasalRates,
+                trioVersion: HealthIngestAppVersion.releaseAndBuild(),
+                gitSha: HealthIngestBuild.gitSha
             )
         )
         let payload = HealthIngestJSON.object([
@@ -754,12 +761,17 @@ struct HealthIngestDiabetesAdapter {
         )
     }
 
-    private static func profilePayload(_ stored: StoredTherapyProfiles) -> HealthIngestJSON {
+    private static func profilePayload(_ stored: StoredTherapyProfiles, live: TrioTherapyProfile?) -> HealthIngestJSON {
         var profiles: [HealthIngestJSON] = stored.inactiveProfiles.map { profileJSON($0) }
         if let active = stored.activeProfileValues {
             profiles.append(profileJSON(active))
         }
-        let activeName = stored.activeProfileName ?? stored.activeProfileValues?.name ?? TrioTherapyProfile.defaultName
+        let activeName = HealthIngestSettingsVersion.profileName(
+            stored.activeProfileName ?? stored.activeProfileValues?.name
+        )
+        if profiles.isEmpty, let live, !HealthIngestSettingsVersion.schedulesArePlaceholder(live) {
+            profiles.append(profileJSON(live.renamed(activeName)))
+        }
         if profiles.isEmpty {
             profiles.append(.object([
                 "name": .string(activeName),

@@ -869,7 +869,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                             settings: settingsManager,
                             profiles: profiles,
                             pumpModel: devices.model,
-                            supportedBasalRates: devices.rates
+                            supportedBasalRates: devices.rates,
+                            liveProfile: self.liveTherapyProfile()
                         )
                         var batch = diabetes.records
                         let batchErrors = diabetes.errors
@@ -1455,6 +1456,12 @@ final class HealthIngestUploader: ObservableObject, Injectable {
               let manager = glucose.cgmManager as? G7CGMManager
         else { return [] }
         return HealthIngestLiveCGM.observe(HealthIngestLiveCGM.snapshot(from: manager))
+    }
+
+    /// Read-only. These are the files the loop already passes to oref.
+    private func liveTherapyProfile() -> TrioTherapyProfile? {
+        guard let storage = container.resolve(FileStorage.self) else { return nil }
+        return HealthIngestLiveProfile.read(storage)
     }
 
     private func resolverDevices() -> (model: String?, rates: [Double]) {

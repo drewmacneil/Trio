@@ -948,12 +948,17 @@ import Testing
                 diaHours: 6,
                 maxBolus: 10,
                 maxBasal: 3,
-                trioVersion: "abc1234"
+                pumpModel: "Omnipod DASH",
+                supportedBasalRates: [0, 0.05, 30],
+                trioVersion: "1.0.2 (18)",
+                gitSha: "f1d371c"
             )
         )
         let object = HealthIngestCanonicalJSON.string(version)
         let parsed = try? JSONSerialization.jsonObject(with: Data(object.utf8)) as? [String: Any]
-        #expect(parsed?["trioVersion"] as? String == "abc1234")
+        #expect(parsed?["trioVersion"] as? String == "1.0.2 (18)")
+        #expect(parsed?["gitSha"] as? String == "f1d371c")
+        #expect(parsed?["activeProfileName"] as? String == "weekday")
         #expect(parsed?["insulinCurve"] as? String == "rapid-acting")
         #expect(parsed?["diaHours"] as? Double == 6)
         #expect(parsed?["maxIOB"] as? Double == 8)
@@ -975,6 +980,12 @@ import Testing
         let dynamic = parsed?["dynamicIsf"] as? [String: Any]
         #expect(dynamic?["mode"] as? String == "sigmoid")
         let raw = parsed?["raw"] as? [String: Any]
+        let rawPump = raw?["pumpSettings"] as? [String: Any]
+        #expect(rawPump?["pumpModel"] as? String == "Omnipod DASH")
+        #expect(rawPump?["diaHours"] as? Double == 6)
+        #expect(rawPump?["insulin_action_curve"] as? Double == 6)
+        let rates = rawPump?["supportedBasalRates"] as? [Double]
+        #expect(rates == [0, 0.05, 30])
         let rawPreferences = raw?["preferences"] as? [String: Any]
         #expect(rawPreferences?["max_iob"] as? Double == 8)
         #expect(rawPreferences?["curve"] as? String == "rapid-acting")
@@ -1009,6 +1020,42 @@ import Testing
         #expect(missingObject?["carbRatioSchedule"] == nil)
         #expect(missingObject?["isfSchedule"] == nil)
         #expect(missingObject?["targetSchedule"] == nil)
+        #expect(missingObject?["activeProfileName"] as? String == "empty")
+
+        let live = TrioTherapyProfile(
+            name: "ignored",
+            basal: [TherapyScheduleEntry(seconds: 0, value: 0.8)],
+            carbRatio: [TherapyScheduleEntry(seconds: 0, value: 18)],
+            sensitivity: [TherapyScheduleEntry(seconds: 0, value: 45)],
+            target: [TherapyTargetEntry(seconds: 0, low: 100, high: 100)]
+        )
+        let chosen = HealthIngestLiveProfile.resolved(stored: nil, live: live)
+        #expect(chosen.name == "Default")
+        let fromLive = HealthIngestSettingsVersion.object(
+            HealthIngestSettingsVersion.Input(
+                preferences: Preferences(),
+                profile: chosen.profile,
+                activeProfileName: chosen.name,
+                diaHours: 6,
+                maxBolus: 10,
+                maxBasal: 3,
+                trioVersion: "1.0.2 (18)"
+            )
+        )
+        let liveJSON = HealthIngestCanonicalJSON.string(fromLive)
+        let liveObject = try? JSONSerialization.jsonObject(with: Data(liveJSON.utf8)) as? [String: Any]
+        #expect(liveObject?["incomplete"] == nil)
+        #expect(liveObject?["activeProfileName"] as? String == "Default")
+        let liveRatio = (liveObject?["carbRatioSchedule"] as? [[String: Any]])?.first
+        #expect(liveRatio?["value"] as? Double == 18)
+        let liveTarget = (liveObject?["targetSchedule"] as? [[String: Any]])?.first
+        #expect(liveTarget?["value"] as? Double == 100)
+        let liveRaw = (liveObject?["raw"] as? [String: Any])?["profile"] as? [String: Any]
+        #expect(((liveRaw?["carb_ratios"] as? [[String: Any]])?.first)?["ratio"] as? Double == 18)
+        #expect(((liveRaw?["isfProfile"] as? [[String: Any]])?.first)?["sensitivity"] as? Double == 45)
+        #expect(((liveRaw?["bg_targets"] as? [[String: Any]])?.first)?["low"] as? Double == 100)
+        #expect(HealthIngestSettingsVersion.profileName(nil) == "Default")
+        #expect(HealthIngestSettingsVersion.profileName("  ") == "Default")
     }
 
     @Test func calibrationEventCarriesMeterSensorAndOutcome() throws {

@@ -10,7 +10,10 @@ enum HealthIngestSettingsVersion {
         var diaHours: Double?
         var maxBolus: Double?
         var maxBasal: Double?
+        var pumpModel: String? = nil
+        var supportedBasalRates: [Double] = []
         var trioVersion: String?
+        var gitSha: String? = nil
     }
 
     /// Nested under `settings_snapshot.payload.values.version`. No timestamp:
@@ -22,7 +25,11 @@ enum HealthIngestSettingsVersion {
         return .object([
             "incomplete": incomplete ? .bool(true) : nil,
             "trioVersion": input.trioVersion.map { .string($0) },
-            "activeProfileName": input.activeProfileName.map { .string($0) },
+            "gitSha": input.gitSha.flatMap { value in
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : .string(trimmed)
+            },
+            "activeProfileName": .string(Self.profileName(input.activeProfileName)),
             "units": .object([
                 "basal": .string("U/hr"),
                 "carbRatio": .string("g/U"),
@@ -99,12 +106,25 @@ enum HealthIngestSettingsVersion {
                 "preferences": HealthIngestWire.jsonValue(preferences),
                 "pumpSettings": .object([
                     "insulin_action_curve": number(input.diaHours),
+                    "diaHours": number(input.diaHours),
                     "maxBolus": number(input.maxBolus),
-                    "maxBasal": number(input.maxBasal)
+                    "maxBasal": number(input.maxBasal),
+                    "pumpModel": input.pumpModel.flatMap { value in
+                        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return trimmed.isEmpty ? nil : .string(trimmed)
+                    },
+                    "supportedBasalRates": input.supportedBasalRates.isEmpty
+                        ? nil
+                        : .array(input.supportedBasalRates.map { .number($0) })
                 ]),
                 "profile": incomplete ? .object([:]) : rawProfile(input.profile)
             ])
         ])
+    }
+
+    static func profileName(_ name: String?) -> String {
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? TrioTherapyProfile.defaultName : trimmed
     }
 
     /// A missing profile, or the single 0 U/hr basal with no CR, ISF, or target, is not a saved schedule.
@@ -191,5 +211,48 @@ enum HealthIngestSettingsVersion {
     private static func number(_ value: Double?) -> HealthIngestJSON? {
         guard let value, value.isFinite else { return nil }
         return .number(value)
+    }
+}
+
+/// The basal, carb ratio, ISF, and target files the loop is already using.
+/// A stored therapy-profile row can be name-only at launch; these files are the schedules.
+enum HealthIngestLiveProfile {
+    static func read(_ storage: FileStorage) -> TrioTherapyProfile? {
+        let basal = storage.retrieve(OpenAPS.Settings.basalProfile, as: [BasalProfileEntry].self)
+        let carbRatios = storage.retrieve(OpenAPS.Settings.carbRatios, as: CarbRatios.self)
+        let sensitivities = storage.retrieve(OpenAPS.Settings.insulinSensitivities, as: InsulinSensitivities.self)
+        let targets = storage.retrieve(OpenAPS.Settings.bgTargets, as: BGTargets.self)
+        if basal == nil, carbRatios == nil, sensitivities == nil, targets == nil { return nil }
+        return TrioTherapyProfile(
+            name: TrioTherapyProfile.defaultName,
+            basalProfile: basal ?? [],
+            carbRatios: carbRatios ?? CarbRatios(units: .grams, schedule: []),
+            insulinSensitivities: sensitivities ?? InsulinSensitivities(
+                units: .mgdL,
+                userPreferredUnits: .mgdL,
+                sensitivities: []
+            ),
+            bgTargets: targets ?? BGTargets(units: .mgdL, userPreferredUnits: .mgdL, targets: [])
+        )
+    }
+
+    /// Prefer a live schedule that is not the 0 U/hr placeholder. Keep the stored profile name.
+    static func resolved(
+        stored: StoredTherapyProfiles?,
+        live: TrioTherapyProfile?
+    ) -> (profile: TrioTherapyProfile?, name: String) {
+        let name = HealthIngestSettingsVersion.profileName(
+            stored?.activeProfileName ?? stored?.activeProfileValues?.name
+        )
+        if let live, !HealthIngestSettingsVersion.schedulesArePlaceholder(live) {
+            return (live.renamed(name), name)
+        }
+        if let storedProfile = stored?.activeProfileValues,
+           !HealthIngestSettingsVersion.schedulesArePlaceholder(storedProfile)
+        {
+            return (storedProfile.renamed(name), name)
+        }
+        let fallback = live ?? stored?.activeProfileValues
+        return (fallback?.renamed(name), name)
     }
 }

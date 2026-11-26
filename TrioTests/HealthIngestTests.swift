@@ -618,8 +618,8 @@ import Testing
         let snapshot = uploader.currentSnapshot()
         #expect(!snapshot.backfillRunning)
         #expect(snapshot.backfill == nil)
-        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
-        #expect(snapshot.trioHistoryPhase?.contains("Health") != true)
+        expectRewindCard(snapshot)
+        #expect(snapshot.rewrite?.day == 1)
         #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
             HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
     }
@@ -689,7 +689,7 @@ import Testing
         let snapshot = uploader.currentSnapshot()
         #expect(!snapshot.backfillRunning)
         #expect(snapshot.backfill == nil)
-        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        expectRewindCard(snapshot)
     }
 
     @Test func coreDataRewindSurvivesAKillBeforeTheMappingVersionIsSaved() async throws {
@@ -725,7 +725,7 @@ import Testing
         let snapshot = restarted.currentSnapshot()
         #expect(!snapshot.backfillRunning)
         #expect(snapshot.backfill == nil)
-        #expect(snapshot.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        expectRewindCard(snapshot)
     }
 
     @Test func coreDataRewindCompletesAndClears() async throws {
@@ -738,7 +738,7 @@ import Testing
         disk.saveHistoricalResume(start)
 
         let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
-        #expect(uploader.currentSnapshot().trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        expectRewindCard(uploader.currentSnapshot())
         let chunk: TimeInterval = 2 * 24 * 3600
         var passes = 0
         let firstHistorical = HealthIngestDateBox()
@@ -768,7 +768,10 @@ import Testing
         #expect(disk.loadCursors()["heart_rate"] == cursor)
         #expect(disk.loadBackfillProgress()?.active != true)
         let done = uploader.currentSnapshot()
-        #expect(done.trioHistoryPhase == nil)
+        #expect(done.rewrite == nil)
+        #expect(done.stateTitle == "Up to date")
+        #expect(done.rowsSentLine == nil)
+        #expect(disk.loadRewriteRowsSent() == 0)
         #expect(!done.backfillRunning)
         #expect(done.backfill == nil)
 
@@ -2173,7 +2176,7 @@ import Testing
         #expect(HealthIngestLiveCGM.endReason(recorded: "replaced", failureMessage: "sensorFailed") == "failed")
     }
 
-    @Test func backfillKeepsTheServerErrorAndTheTrioResendPhase() {
+    @Test func backfillKeepsTheServerErrorWhileARewriteIsAlsoSet() {
         let progress = HealthIngestBackfillProgress(
             days: 90,
             day: 4,
@@ -2181,29 +2184,85 @@ import Testing
             phase: "Reading Health samples",
             fraction: 0.04
         )
+        let rewrite = HealthIngestBackfillProgress(
+            days: 90,
+            day: 37,
+            rowsSent: 1_234,
+            phase: HealthIngestStatus.rewritingPhase,
+            fraction: 0.4
+        )
         let running = HealthIngestStatus(
             lastError: "Could not reach the server (code -1009).",
             queueDepth: 3_538,
             priorityDepth: 3_538,
             backfillRunning: true,
             backfill: progress,
-            trioHistoryPhase: HealthIngestStatus.resendingTrioHistory
+            rewrite: rewrite
         )
         #expect(running.stateTitle == "Backfilling")
         #expect(running.showsLastError)
         #expect(running.showsStatusSpinner)
         #expect(running.showsBackfillPhase)
-        #expect(running.showsTrioHistoryPhase)
-        #expect(running.backfill?.phase == "Reading Health samples")
-        #expect(running.trioHistoryPhase == HealthIngestStatus.resendingTrioHistory)
+        #expect(running.progressCard?.phase == "Reading Health samples")
+        #expect(running.rowsSentLine == "\(12.formatted()) rows sent")
 
         let idle = HealthIngestStatus(lastError: "Could not reach the server.")
         #expect(idle.stateTitle == "Error")
         #expect(idle.showsLastError)
         #expect(!idle.showsStatusSpinner)
         #expect(!idle.showsBackfillPhase)
-        #expect(!idle.showsTrioHistoryPhase)
+        #expect(idle.progressCard == nil)
         #expect(HealthIngestStatus().stateTitle == "Up to date")
+    }
+
+    private func expectRewindCard(_ snapshot: HealthIngestStatus) {
+        #expect(snapshot.stateTitle == HealthIngestStatus.rewritingTitle)
+        #expect(snapshot.rewrite?.phase == HealthIngestStatus.rewritingPhase)
+        #expect(snapshot.rewrite?.days == 90)
+        #expect(snapshot.rewrite?.phase.contains("Health") != true)
+        #expect(snapshot.showsStatusSpinner)
+        #expect(snapshot.showsProgressPhase)
+        #expect(snapshot.progressCard?.phase == HealthIngestStatus.rewritingPhase)
+        #expect(snapshot.queueDepth == 0)
+        #expect(snapshot.rowsSentLine?.hasSuffix(HealthIngestStatus.liveUploadsCurrent) == true)
+    }
+
+    @Test func rewriteCardCoversRewindingQueueAndUpToDate() {
+        let window = HealthIngestBackfillProgress.measure(
+            start: Date(timeIntervalSince1970: 0),
+            frontier: Date(timeIntervalSince1970: 36 * 24 * 3600),
+            days: 90,
+            rowsSent: 1_234,
+            phase: HealthIngestStatus.rewritingPhase
+        )
+        #expect(window.day == 37)
+        #expect(abs(window.fraction - 0.4) < 0.000_1)
+
+        let queued = HealthIngestStatus(queueDepth: 640, priorityDepth: 640, rewrite: window)
+        #expect(queued.stateTitle == HealthIngestStatus.rewritingTitle)
+        #expect(queued.showsStatusSpinner)
+        #expect(queued.showsProgressPhase)
+        #expect(!queued.showsBackfillPhase)
+        #expect(queued.rowsSentLine == "\(1_234.formatted()) rows sent")
+
+        let liveCurrent = HealthIngestStatus(rewrite: window)
+        #expect(liveCurrent.stateTitle == HealthIngestStatus.rewritingTitle)
+        #expect(liveCurrent.queueDepth == 0)
+        #expect(liveCurrent.rowsSentLine == "\(1_234.formatted()) rows sent · \(HealthIngestStatus.liveUploadsCurrent)")
+
+        let draining = HealthIngestStatus(queueDepth: 4, priorityDepth: 4)
+        #expect(draining.stateTitle == "Uploading")
+        #expect(draining.rewrite == nil)
+        #expect(draining.rowsSentLine == nil)
+        #expect(!draining.showsStatusSpinner)
+
+        let caughtUp = HealthIngestStatus()
+        #expect(caughtUp.stateTitle == "Up to date")
+        #expect(caughtUp.rowsSentLine == nil)
+
+        let errored = HealthIngestStatus(lastError: "Could not reach the server.", rewrite: window)
+        #expect(errored.stateTitle == HealthIngestStatus.rewritingTitle)
+        #expect(errored.showsLastError)
     }
 
     @Test func lockedReadKeepsTheCursorAndRetriesTheSameWindow() async throws {

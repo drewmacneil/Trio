@@ -338,6 +338,15 @@ final class HealthIngestDisk {
         save(date.map { ["resume": $0] } ?? [:], name: "historical-resume.json")
     }
 
+    /// Accepted rows for the Core Data rewrite card. Cleared when the cursor is cleared.
+    func loadRewriteRowsSent() -> Int {
+        load(Int.self, name: "rewrite-rows.json") ?? 0
+    }
+
+    func saveRewriteRowsSent(_ count: Int) {
+        save(count, name: "rewrite-rows.json")
+    }
+
     func loadMappingVersion() -> Int {
         load(Int.self, name: "mapping-version.json") ?? 0
     }

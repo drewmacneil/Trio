@@ -233,6 +233,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private var diabetesResume: Date?
     /// Core Data rewind cursor. Independent of `diabetesResume` and of the HealthKit backfill.
     private var historicalResume: Date?
+    /// Accepted rows since this rewrite started. Shown on the same card as a HealthKit backfill.
+    private var rewriteRowsSent = 0
+    private var rewriteRowsSavedAt: Date?
     private var lastDiabetesRead: Date?
     /// Test seam. A Core Data rewind is already on disk; return before the mapping
     /// version is saved, as if the process was killed between the two writes.
@@ -307,6 +310,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         self.disk = disk
         health = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk)
         historicalResume = disk.loadHistoricalResume()
+        rewriteRowsSent = disk.loadRewriteRowsSent()
     }
 
     /// Restores backfill progress the way a launch does, then returns the status snapshot
@@ -499,12 +503,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             since = Date().addingTimeInterval(-Double(bounded) * 24 * 3600)
             disk.saveHistoricalResume(since)
             disk.saveDiabetesResume(nil)
+            disk.saveRewriteRowsSent(0)
         }
         stateLock.lock()
         historicalResume = since
         if existing == nil {
             diabetesResume = nil
             backfillSince = nil
+            rewriteRowsSent = 0
+            rewriteRowsSavedAt = nil
         }
         stateLock.unlock()
     }
@@ -661,6 +668,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         lastError = persisted.lastError
         diabetesResume = disk.loadDiabetesResume()
         historicalResume = disk.loadHistoricalResume()
+        rewriteRowsSent = disk.loadRewriteRowsSent()
         stateLock.unlock()
         restoreBackfillProgress()
         return queue
@@ -1052,7 +1060,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 return true
             }
             let acks = try HealthIngestWire.parseAcks(data)
-            noteBackfillRows(HealthIngestAck.acceptedRowCount(acks))
+            noteAcceptedRows(HealthIngestAck.acceptedRowCount(acks))
             if let reject = await queue.resolve(batch: batch, acks: acks, transportFailed: false) {
                 let message = "A record was rejected: \(String(reject.prefix(180)))"
                 setLastError(message)
@@ -1180,8 +1188,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
     private func setHistoricalResume(_ date: Date?) {
         stateLock.lock()
         historicalResume = date
+        if date == nil {
+            rewriteRowsSent = 0
+            rewriteRowsSavedAt = nil
+        }
         stateLock.unlock()
         disk?.saveHistoricalResume(date)
+        if date == nil {
+            disk?.saveRewriteRowsSent(0)
+        }
     }
 
     private func lockedHistoricalResume() -> Date? {
@@ -1267,20 +1282,41 @@ final class HealthIngestUploader: ObservableObject, Injectable {
 
     /// Server-accepted rows for the pass that is running now. Queued and duplicate rows are not included.
     /// The count is written at most every 30 seconds; the end of the pass flushes it as well.
-    private func noteBackfillRows(_ count: Int) {
+    /// A Core Data rewrite keeps its own count for the same card.
+    private func noteAcceptedRows(_ count: Int) {
         guard count > 0 else { return }
         stateLock.lock()
-        var save = false
+        var saveBackfill = false
+        var saveRewrite = false
+        let now = Date()
         if backfillRunning {
             backfillRowsSent += count
-            let now = Date()
             if backfillProgressSavedAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true {
                 backfillProgressSavedAt = now
-                save = true
+                saveBackfill = true
+            }
+        }
+        if historicalResume != nil {
+            rewriteRowsSent += count
+            if rewriteRowsSavedAt.map({ now.timeIntervalSince($0) >= 30 }) ?? true {
+                rewriteRowsSavedAt = now
+                saveRewrite = true
             }
         }
         stateLock.unlock()
-        if save { saveActiveBackfill() }
+        if saveBackfill { saveActiveBackfill() }
+        if saveRewrite { saveRewriteRows() }
+    }
+
+    private func saveRewriteRows() {
+        let count = lockedRewriteRowsSent()
+        disk?.saveRewriteRowsSent(count)
+    }
+
+    private func lockedRewriteRowsSent() -> Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return rewriteRowsSent
     }
 
     private func restoreBackfillProgress() {
@@ -1425,9 +1461,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
-        let rewindingTrio = lockedHistoricalResume() != nil
-        // `lastError` and `trioHistoryPhase` stay set during a Health backfill.
-        // The settings screen shows them with the day counter.
+        let frontier = lockedHistoricalResume()
         return HealthIngestStatus(
             lastSuccess: lockedSuccess(),
             lastError: lockedError(),
@@ -1439,7 +1473,20 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             latestRejectReason: log.latestReason,
             rejectGroups: log.groups(),
             backfill: running ? backfillProgress(preferences: prefs) : nil,
-            trioHistoryPhase: rewindingTrio ? HealthIngestStatus.resendingTrioHistory : nil
+            rewrite: frontier.map { rewriteProgress(frontier: $0) }
+        )
+    }
+
+    /// Day N of the 90-day Core Data window. The cursor is the frontier; the window is the last 90 days.
+    private func rewriteProgress(frontier: Date) -> HealthIngestBackfillProgress {
+        let days = HealthIngestMappingUpgrade.steps[HealthIngestWire.mappingVersion]?.rewindCoreDataDays ?? 90
+        let start = Date().addingTimeInterval(-Double(days) * 24 * 3600)
+        return HealthIngestBackfillProgress.measure(
+            start: start,
+            frontier: frontier,
+            days: days,
+            rowsSent: lockedRewriteRowsSent(),
+            phase: HealthIngestStatus.rewritingPhase
         )
     }
 

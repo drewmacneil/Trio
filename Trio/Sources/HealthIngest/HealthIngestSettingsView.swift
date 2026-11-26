@@ -214,24 +214,8 @@ struct HealthIngestSettingsForm: View {
     private var statusSection: some View {
         Section {
             stateRow
-            if status.backfillRunning, let progress = status.backfill {
-                VStack(alignment: .leading, spacing: 6) {
-                    if status.showsBackfillPhase {
-                        Text(progress.phase)
-                    }
-                    Text("Day \(progress.day) of \(progress.days)")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                    ProgressView(value: progress.fraction)
-                    Text("\(progress.rowsSent.formatted()) rows sent")
-                        .font(.footnote)
-                        .foregroundColor(.secondary)
-                }
-            }
-            if status.showsTrioHistoryPhase, let phase = status.trioHistoryPhase {
-                Text(phase)
-                    .font(.footnote)
-                    .foregroundColor(.secondary)
+            if let progress = status.progressCard {
+                progressBlock(progress)
             }
             labeledRow("Last success", status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
             labeledRow("Waiting to upload", status.queueDepth.formatted())
@@ -362,6 +346,24 @@ struct HealthIngestSettingsForm: View {
         return "On"
     }
 
+    /// One card for a HealthKit backfill and for the Core Data rewrite.
+    private func progressBlock(_ progress: HealthIngestBackfillProgress) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if status.showsProgressPhase {
+                Text(progress.phase)
+            }
+            Text("Day \(progress.day) of \(progress.days)")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+            ProgressView(value: progress.fraction)
+            if let line = status.rowsSentLine {
+                Text(line)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+            }
+        }
+    }
+
     @ViewBuilder private var stateRow: some View {
         HStack(spacing: 8) {
             Circle()
@@ -384,7 +386,7 @@ struct HealthIngestSettingsForm: View {
 
     private var stateColor: Color {
         switch stateTitle {
-        case "Backfilling": return .blue
+        case "Backfilling", HealthIngestStatus.rewritingTitle: return .blue
         case HealthIngestStatus.pausedUntilUnlock: return .orange
         case "Error", HealthIngestStatus.tokenRejectedTitle, HealthIngestStatus.deviceIdRejectedTitle:
             return .red

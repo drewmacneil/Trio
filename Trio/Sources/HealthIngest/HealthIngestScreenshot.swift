@@ -131,6 +131,25 @@ struct HealthIngestScreenshotHost: View {
             status.rejectGroups = groups
             return status
         }
+        let backfill = fixture.backfillRunning
+            ? HealthIngestBackfillProgress(
+                days: fixture.backfillDays,
+                day: fixture.day,
+                rowsSent: fixture.rowsSent,
+                phase: fixture.phase,
+                fraction: fixture.backfillDays > 0 ? Double(fixture.day) / Double(fixture.backfillDays) : 0
+            )
+            : nil
+        let rewriteDays = 90
+        let rewrite = fixture.rewriting
+            ? HealthIngestBackfillProgress(
+                days: rewriteDays,
+                day: fixture.day,
+                rowsSent: fixture.rowsSent,
+                phase: HealthIngestStatus.rewritingPhase,
+                fraction: rewriteDays > 0 ? Double(max(fixture.day - 1, 0)) / Double(rewriteDays) : 0
+            )
+            : nil
         return HealthIngestStatus(
             lastSuccess: fixture.lastSuccess.map { Date(timeIntervalSince1970: $0) },
             lastError: fixture.lastError,
@@ -141,15 +160,8 @@ struct HealthIngestScreenshotHost: View {
             backfillRunning: fixture.backfillRunning,
             latestRejectReason: fixture.latestRejectReason,
             rejectGroups: groups,
-            backfill: fixture.backfillRunning
-                ? HealthIngestBackfillProgress(
-                    days: fixture.backfillDays,
-                    day: fixture.day,
-                    rowsSent: fixture.rowsSent,
-                    phase: fixture.phase,
-                    fraction: fixture.backfillDays > 0 ? Double(fixture.day) / Double(fixture.backfillDays) : 0
-                )
-                : nil
+            backfill: backfill,
+            rewrite: rewrite
         )
     }
 
@@ -199,6 +211,8 @@ struct HealthIngestScreenshotFixture: Decodable {
     var lastSuccess: TimeInterval?
     var lastError: String?
     var backfillRunning = false
+    /// Core Data rewrite card. Fake day, rows, and queue come from the other fields.
+    var rewriting = false
     var latestRejectReason: String?
     var rowsSent = 0
     var day = 1
@@ -218,6 +232,7 @@ struct HealthIngestScreenshotFixture: Decodable {
         case lastSuccess
         case lastError
         case backfillRunning
+        case rewriting
         case latestRejectReason
         case rowsSent
         case day
@@ -241,6 +256,7 @@ struct HealthIngestScreenshotFixture: Decodable {
         lastSuccess = try container.decodeIfPresent(TimeInterval.self, forKey: .lastSuccess)
         lastError = try container.decodeIfPresent(String.self, forKey: .lastError)
         backfillRunning = try container.decodeIfPresent(Bool.self, forKey: .backfillRunning) ?? false
+        rewriting = try container.decodeIfPresent(Bool.self, forKey: .rewriting) ?? false
         latestRejectReason = try container.decodeIfPresent(String.self, forKey: .latestRejectReason)
         rowsSent = try container.decodeIfPresent(Int.self, forKey: .rowsSent) ?? 0
         day = try container.decodeIfPresent(Int.self, forKey: .day) ?? 1

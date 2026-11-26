@@ -251,7 +251,6 @@ import Testing
         #expect(!text.contains("unit-test-token"))
     }
 
-
     @Test func payloadHelpersKeepStoredValuesAndDropOnlyNonFiniteNumbers() {
         #expect(HealthIngestPayload.diaHours(0) == .number(0))
         #expect(HealthIngestPayload.diaHours(-1) == .number(-1))
@@ -267,8 +266,14 @@ import Testing
 
     @Test func healthKitPayloadsUseContractFieldNames() throws {
         let hrv = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.hrv, value: 45))
-        let energy = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.activeEnergy, value: 1.5))
-        let exercise = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.exerciseMinutes, value: 1))
+        let energy = try #require(
+            HealthIngestHealthMapping
+                .quantityPayload(recordType: HealthIngestType.activeEnergy, value: 1.5)
+        )
+        let exercise = try #require(
+            HealthIngestHealthMapping
+                .quantityPayload(recordType: HealthIngestType.exerciseMinutes, value: 1)
+        )
         let heart = try #require(HealthIngestHealthMapping.quantityPayload(recordType: HealthIngestType.heartRate, value: 72))
         #expect(keys(hrv).contains("sdnnMs"))
         #expect(!keys(hrv).contains("sdnnMilliseconds"))
@@ -310,7 +315,7 @@ import Testing
             hkValue: HKCategoryValueSleepAnalysis.asleepCore.rawValue
         )
         #expect(keys(sleep).contains("stage"))
-        if case .object(let fields) = sleep, case .string(let stage) = fields["stage"] {
+        if case let .object(fields) = sleep, case let .string(stage) = fields["stage"] {
             #expect(stage == "core")
         } else {
             Issue.record("sleep payload should include stage")
@@ -416,7 +421,8 @@ import Testing
                 type: type,
                 id: "\(type)-wire-1",
                 start: start,
-                end: type == HealthIngestType.sleepStage || type == HealthIngestType.activeEnergy || type == HealthIngestType.workout
+                end: type == HealthIngestType.sleepStage || type == HealthIngestType.activeEnergy || type == HealthIngestType
+                    .workout
                     ? start.addingTimeInterval(60)
                     : nil,
                 tz: "Etc/UTC",
@@ -620,8 +626,10 @@ import Testing
         #expect(snapshot.backfill == nil)
         expectRewindCard(snapshot)
         #expect(snapshot.rewrite?.day == 1)
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90)
+        )
     }
 
     @Test func coreDataRewindReadsLiveRowsBeforeTheHistoricalChunk() async throws {
@@ -817,24 +825,38 @@ import Testing
 
     @Test func mappingUpgradeSkippedVersionsUnionTheStepsOrFullReset() {
         // 5 → 7 applies version 6's HealthKit reset and version 7's Core Data rewind.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 5, currentVersion: 7) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: true, rewindCoreDataDays: 90))
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 5, currentVersion: 7) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: true, rewindCoreDataDays: 90)
+        )
         // 6 → 7 is only version 7, so HealthKit cursors stay.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 7) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90)
+        )
         // 7 → 8 resends glucose with trend and does not reset HealthKit.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 7, currentVersion: 8) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 7, currentVersion: 8) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90)
+        )
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 8) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90)
+        )
         // 8 → 9 resends glucose with source and does not reset HealthKit.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 8, currentVersion: 9) ==
-            HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90))
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 8, currentVersion: 9) ==
+                HealthIngestMappingUpgrade.Plan(resetHealthKit: false, rewindCoreDataDays: 90)
+        )
         // Version 10 has no step. Crossing it is a full reset.
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 10) ==
-            HealthIngestMappingUpgrade.fullReset)
-        #expect(HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: 10) ==
-            HealthIngestMappingUpgrade.fullReset)
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 6, currentVersion: 10) ==
+                HealthIngestMappingUpgrade.fullReset
+        )
+        #expect(
+            HealthIngestMappingUpgrade.plan(storedVersion: 9, currentVersion: 10) ==
+                HealthIngestMappingUpgrade.fullReset
+        )
     }
 
     @Test func mappingDowngradeLeavesCursorsAndStoredVersionAlone() async throws {
@@ -1107,7 +1129,7 @@ import Testing
         #expect(HealthIngestPayload.predictedBG(Double.nan) == nil)
         #expect(HealthIngestPayload.predictedBG(Double.infinity) == nil)
         #expect(HealthIngestPayload.predictedBG(NSDecimalNumber(value: -3)) == .number(-3))
-        #expect(HealthIngestPayload.predictedBG(Optional<Decimal>.none) == nil)
+        #expect(HealthIngestPayload.predictedBG(Decimal?.none) == nil)
     }
 
     @Test func rejectedReceiptsCanBeForgottenForALaterBackfill() async throws {
@@ -1173,7 +1195,6 @@ import Testing
         #expect(await queue.enqueue([makeRecord(id: "hrv-cap-2", type: HealthIngestType.hrv)]).queued == 0)
     }
 
-
     @Test func canonicalJSONMatchesJavaScriptStringEscaping() {
         // JSON.stringify leaves "/" and non-ASCII raw and escapes only ", \\ and C0 controls.
         // JSONSerialization wrote "\\/", which changed the id of any snapshot containing "mg/dL".
@@ -1195,7 +1216,7 @@ import Testing
     @Test func queueKeepsOnlyAWindowInMemoryAndSpillsTheRest() async throws {
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
-        let total = 2_600
+        let total = 2600
         var sent = 0
         while sent < total {
             let upper = min(sent + 500, total)
@@ -1214,7 +1235,10 @@ import Testing
 
         var delivered = Set<String>()
         while true {
-            let batch = await reopened.nextBatch(limit: HealthIngestWire.maxBatchRecords, maxBytes: HealthIngestWire.maxBatchBytes)
+            let batch = await reopened.nextBatch(
+                limit: HealthIngestWire.maxBatchRecords,
+                maxBytes: HealthIngestWire.maxBatchBytes
+            )
             if batch.isEmpty { break }
             #expect(batch.count <= HealthIngestWire.maxBatchRecords)
             #expect(await reopened.windowCount() <= HealthIngestQueue.windowCap)
@@ -1228,13 +1252,19 @@ import Testing
 
     @Test func anOversizedLegacyQueueFileIsSplitIntoSegmentsOnOpen() async throws {
         let disk = try makeDisk()
-        let legacy = (0 ..< 2_500).map { index -> HealthIngestQueuedRecord in
+        let legacy = (0 ..< 2500).map { index -> HealthIngestQueuedRecord in
             let record = makeRecord(id: "legacy-\(index)", type: HealthIngestType.hrv)
-            return HealthIngestQueuedRecord(record: record, bytes: 200, hash: "h\(index)", failures: 0, notBefore: Date(timeIntervalSince1970: 0))
+            return HealthIngestQueuedRecord(
+                record: record,
+                bytes: 200,
+                hash: "h\(index)",
+                failures: 0,
+                notBefore: Date(timeIntervalSince1970: 0)
+            )
         }
         disk.saveQueue(legacy)
         let queue = HealthIngestQueue(disk: disk)
-        #expect(await queue.depth() == 2_500)
+        #expect(await queue.depth() == 2500)
         #expect(await queue.windowCount() <= HealthIngestQueue.windowCap)
         #expect(disk.loadQueue().count <= HealthIngestQueue.windowCap)
         await queue.dropTypes([HealthIngestType.hrv])
@@ -1254,15 +1284,25 @@ import Testing
         ]) == 1)
         #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.workout) == 90)
         #expect(HealthIngestHealthKitReader.timeout(for: HealthIngestType.heartRate) == 30)
-        let error = NSError(domain: "HealthIngest", code: 1, userInfo: [NSLocalizedDescriptionKey: "Protected health data is unavailable"])
-        #expect(HealthIngestHealthKitReader.failureText(recordType: "workout", error: error) == "workout: Protected health data is unavailable")
+        let error = NSError(
+            domain: "HealthIngest",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: "Protected health data is unavailable"]
+        )
+        #expect(
+            HealthIngestHealthKitReader
+                .failureText(recordType: "workout", error: error) == "workout: Protected health data is unavailable"
+        )
     }
 
     @Test func rejectLogKeepsTheLastTwoHundredAndClears() async throws {
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
         for index in 0 ..< 205 {
-            let record = makeRecord(id: "reject-\(index)", type: index.isMultiple(of: 2) ? HealthIngestType.loopCycle : HealthIngestType.profileSnapshot)
+            let record = makeRecord(
+                id: "reject-\(index)",
+                type: index.isMultiple(of: 2) ? HealthIngestType.loopCycle : HealthIngestType.profileSnapshot
+            )
             #expect(await queue.enqueue([record]).queued == 1)
             let ack = HealthIngestAck(
                 type: record.type,
@@ -1333,7 +1373,7 @@ import Testing
 
     @Test func launchReconcileDropsTheStaleCounterWithoutAMappingBump() async throws {
         let disk = try makeDisk()
-        disk.saveRejectedCount(15_893)
+        disk.saveRejectedCount(15893)
         let orphaned = #"{"events":[],"counts":{"hrv\npayload.sdnnMs is required":15893}}"#
         try orphaned.write(to: disk.directory.appendingPathComponent("reject-log.json"), atomically: true, encoding: .utf8)
         let queue = HealthIngestQueue(disk: disk)
@@ -1350,7 +1390,7 @@ import Testing
         {"events":[{"type":"hrv","reason":"payload.sdnnMs is required","message":"sdnn missing","at":"2026-01-01T00:00:00Z"}],"counts":{"hrv\\npayload.sdnnMs is required":4}}
         """
         try visible.write(to: disk.directory.appendingPathComponent("reject-log.json"), atomically: true, encoding: .utf8)
-        disk.saveRejectedCount(15_893)
+        disk.saveRejectedCount(15893)
         await queue.reconcileRejectedCount()
         let summary = await queue.rejectionSummary()
         let group = try #require(summary.groups.first)
@@ -1453,7 +1493,7 @@ import Testing
             stored: HealthIngestPersistedBackfill(
                 days: 90,
                 windowStart: start,
-                rowsSent: 1_240,
+                rowsSent: 1240,
                 chosenDays: 7,
                 active: true
             ),
@@ -1463,7 +1503,7 @@ import Testing
         #expect(status.backfillRunning)
         #expect(progress.days == 90)
         #expect(progress.day == 23)
-        #expect(progress.rowsSent == 1_240)
+        #expect(progress.rowsSent == 1240)
         #expect(progress.fraction > 0.2)
         #expect(progress.fraction < 0.3)
     }
@@ -1532,18 +1572,18 @@ import Testing
             start: start,
             frontier: HealthIngestBackfillProgress.frontier(start: start, cursor: day23, resume: nil),
             days: 90,
-            rowsSent: 1_240,
+            rowsSent: 1240,
             phase: "Reading Health samples"
         )
         #expect(reading.day == 23)
-        #expect(reading.rowsSent == 1_240)
+        #expect(reading.rowsSent == 1240)
 
         let finishedAt = start.addingTimeInterval(90 * 24 * 3600)
         let finished = HealthIngestBackfillProgress.measure(
             start: start,
             frontier: HealthIngestBackfillProgress.frontier(start: start, cursor: finishedAt, resume: nil),
             days: 90,
-            rowsSent: 4_000,
+            rowsSent: 4000,
             phase: "Reading Health samples"
         )
         #expect(finished.day == 90)
@@ -1553,7 +1593,7 @@ import Testing
     @Test func diabetesItemsLeaveAheadOfAHealthKitBackfill() async throws {
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
-        let total = 1_200
+        let total = 1200
         var sent = 0
         while sent < total {
             let upper = min(sent + 400, total)
@@ -1702,7 +1742,10 @@ import Testing
         #expect(await reloaded.priorityDepth() == expectedPriority.count)
         var delivered: [String] = []
         while delivered.count < total {
-            let batch = await reloaded.nextBatch(limit: HealthIngestWire.maxBatchRecords, maxBytes: HealthIngestWire.maxBatchBytes)
+            let batch = await reloaded.nextBatch(
+                limit: HealthIngestWire.maxBatchRecords,
+                maxBytes: HealthIngestWire.maxBatchBytes
+            )
             if batch.isEmpty { break }
             delivered.append(contentsOf: batch.map(\.id))
             let acks = batch.map { HealthIngestAck(type: $0.type, id: $0.id, status: .accepted) }
@@ -1819,9 +1862,18 @@ import Testing
         #expect(cgmPayload["kind"] as? String == "warmup_end")
         #expect(cgm.id.hasPrefix("cgm-event:"))
         #expect(!cgm.id.contains("serial"))
-        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "warmup", fatal: false, failureMessage: nil) == "warmup_start")
-        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "expired", fatal: false, failureMessage: nil) == "sensor_expired")
-        #expect(HealthIngestCGM.kind(type: "sensorIssue", errorCode: "sensorFailed", fatal: true, failureMessage: nil) == "sensor_failed")
+        #expect(
+            HealthIngestCGM
+                .kind(type: "sensorIssue", errorCode: "warmup", fatal: false, failureMessage: nil) == "warmup_start"
+        )
+        #expect(
+            HealthIngestCGM
+                .kind(type: "sensorIssue", errorCode: "expired", fatal: false, failureMessage: nil) == "sensor_expired"
+        )
+        #expect(
+            HealthIngestCGM
+                .kind(type: "sensorIssue", errorCode: "sensorFailed", fatal: true, failureMessage: nil) == "sensor_failed"
+        )
         #expect(HealthIngestCGM.kind(type: "sensorStart", errorCode: nil, fatal: false, failureMessage: nil) == "sensor_start")
         #expect(HealthIngestCGM.kind(type: "calibration", errorCode: nil, fatal: false, failureMessage: nil) == "calibration")
         #expect(HealthIngestCGM.kind(type: "transmitterStart", errorCode: nil, fatal: false, failureMessage: nil) == nil)
@@ -2098,7 +2150,7 @@ import Testing
         }
 
         let activated = Date(timeIntervalSince1970: 1_700_000_000)
-        let reading = activated.addingTimeInterval(3_600)
+        let reading = activated.addingTimeInterval(3600)
         var snapshot = HealthIngestCGMSnapshot(
             sensor: "DXCM1A",
             activatedAt: activated,
@@ -2110,7 +2162,7 @@ import Testing
             calibration: nil,
             previous: HealthIngestCGMSnapshot.EndedSensor(
                 sensor: "DXCM0Z",
-                activatedAt: activated.addingTimeInterval(-86_400),
+                activatedAt: activated.addingTimeInterval(-86400),
                 endedAt: activated,
                 endReason: "replaced",
                 failureMessage: nil
@@ -2154,7 +2206,7 @@ import Testing
         let note = HealthIngestLiveCGM.annotation(at: reading)
         #expect(note?.trendRate == -0.4)
         #expect(note?.sensor == "DXCM1A")
-        let before = HealthIngestLiveCGM.annotation(at: activated.addingTimeInterval(-3_600))
+        let before = HealthIngestLiveCGM.annotation(at: activated.addingTimeInterval(-3600))
         #expect(before?.sensor == "DXCM0Z")
         #expect(before?.trendRate == nil)
 
@@ -2187,14 +2239,14 @@ import Testing
         let rewrite = HealthIngestBackfillProgress(
             days: 90,
             day: 37,
-            rowsSent: 1_234,
+            rowsSent: 1234,
             phase: HealthIngestStatus.rewritingPhase,
             fraction: 0.4
         )
         let running = HealthIngestStatus(
             lastError: "Could not reach the server (code -1009).",
-            queueDepth: 3_538,
-            priorityDepth: 3_538,
+            queueDepth: 3538,
+            priorityDepth: 3538,
             backfillRunning: true,
             backfill: progress,
             rewrite: rewrite
@@ -2232,7 +2284,7 @@ import Testing
             start: Date(timeIntervalSince1970: 0),
             frontier: Date(timeIntervalSince1970: 36 * 24 * 3600),
             days: 90,
-            rowsSent: 1_234,
+            rowsSent: 1234,
             phase: HealthIngestStatus.rewritingPhase
         )
         #expect(window.day == 37)
@@ -2243,12 +2295,12 @@ import Testing
         #expect(queued.showsStatusSpinner)
         #expect(queued.showsProgressPhase)
         #expect(!queued.showsBackfillPhase)
-        #expect(queued.rowsSentLine == "\(1_234.formatted()) rows sent")
+        #expect(queued.rowsSentLine == "\(1234.formatted()) rows sent")
 
         let liveCurrent = HealthIngestStatus(rewrite: window)
         #expect(liveCurrent.stateTitle == HealthIngestStatus.rewritingTitle)
         #expect(liveCurrent.queueDepth == 0)
-        #expect(liveCurrent.rowsSentLine == "\(1_234.formatted()) rows sent · \(HealthIngestStatus.liveUploadsCurrent)")
+        #expect(liveCurrent.rowsSentLine == "\(1234.formatted()) rows sent · \(HealthIngestStatus.liveUploadsCurrent)")
 
         let draining = HealthIngestStatus(queueDepth: 4, priorityDepth: 4)
         #expect(draining.stateTitle == "Uploading")
@@ -2517,7 +2569,7 @@ import Testing
         let disk = try makeDisk()
         let queue = HealthIngestQueue(disk: disk)
         let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
-        let total = 1_500
+        let total = 1500
         var sent = 0
         while sent < total {
             let upper = min(sent + 400, total)
@@ -2678,7 +2730,7 @@ import Testing
             HealthIngestLiveCGM.discardCachedStore()
         }
         let activated = Date(timeIntervalSince1970: 1_700_000_000)
-        let reading = activated.addingTimeInterval(3_600)
+        let reading = activated.addingTimeInterval(3600)
         _ = HealthIngestLiveCGM.observe(HealthIngestCGMSnapshot(
             sensor: "DXCM1A",
             activatedAt: activated,
@@ -2786,7 +2838,7 @@ import Testing
     }
 
     private func keys(_ value: HealthIngestJSON) -> Set<String> {
-        if case .object(let fields) = value {
+        if case let .object(fields) = value {
             return Set(fields.keys)
         }
         return []
@@ -2827,6 +2879,71 @@ import Testing
         let json = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
         let records = try #require(json["records"] as? [[String: Any]])
         return try #require(records.first?["payload"] as? [String: Any])
+    }
+
+    @Test func turningEveryCategoryOnDoesNotStartABackfill() throws {
+        var preferences = HealthIngestPreferences.initial
+        preferences.enabled = true
+        preferences.categories[HealthIngestCategory.heart.rawValue] = false
+        preferences.categories[HealthIngestCategory.glucose.rawValue] = false
+        let turnedOn = preferences.withAllCategoriesOn()
+        #expect(turnedOn.enabled)
+        #expect(HealthIngestCategory.allCases.allSatisfy { turnedOn.isOn($0) })
+        #expect(turnedOn.categories.values.allSatisfy { $0 })
+
+        let disk = try makeDisk()
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: preferences)
+        #expect(HealthIngestCategory.allCases.allSatisfy { uploader.preferences.isOn($0) })
+        let status = uploader.publishRelaunchStatus()
+        #expect(!status.backfillRunning)
+        #expect(status.backfill == nil)
+        #expect(status.rewrite == nil)
+        #expect(disk.loadHistoricalResume() == nil)
+    }
+
+    @Test func queueCountersAddUpAcrossTrioHealthAndBackfill() async throws {
+        let disk = try makeDisk()
+        let queue = HealthIngestQueue(disk: disk)
+        let trio = makeRecord(id: "glucose-1", type: HealthIngestType.glucose)
+        let liveHealth = makeRecord(id: "hr-live", type: HealthIngestType.heartRate)
+        let older = makeRecord(id: "hr-old", type: HealthIngestType.heartRate)
+        #expect(await queue.enqueue([trio]).queued == 1)
+        #expect(await queue.enqueue([liveHealth]).queued == 1)
+        #expect(await queue.enqueue([older], fromBackfill: true).queued == 1)
+
+        let depth = await queue.depth()
+        let trioDepth = await queue.priorityDepth()
+        let regular = await queue.regularDepth()
+        let backfill = await queue.backfillDepth()
+        let health = regular - backfill
+        #expect(trioDepth == 1)
+        #expect(health == 1)
+        #expect(backfill == 1)
+        #expect(trioDepth + health + backfill == depth)
+
+        let reloaded = HealthIngestQueue(disk: disk)
+        let reloadedPriority = await reloaded.priorityDepth()
+        let reloadedRegular = await reloaded.regularDepth()
+        let reloadedBackfill = await reloaded.backfillDepth()
+        let reloadedDepth = await reloaded.depth()
+        #expect(reloadedPriority + (reloadedRegular - reloadedBackfill) + reloadedBackfill == reloadedDepth)
+        #expect(reloadedBackfill == 1)
+    }
+
+    @Test func legendWidensATinySliceWithoutChangingTheTotal() {
+        let parts = [
+            HealthIngestQueuePart(name: "Trio", count: 3, color: .blue),
+            HealthIngestQueuePart(name: "Apple Health", count: 120, color: .pink),
+            HealthIngestQueuePart(name: "Backfill", count: 5, color: .indigo)
+        ]
+        let slices = HealthIngestQueueLegendLayout.layout(parts, width: 320)
+        #expect(slices.count == 3)
+        #expect(slices.map(\.part.count).reduce(0, +) == 128)
+        #expect(slices[0].display + 3 + slices[1].display + 3 + slices[2].display <= 320.5)
+        #expect(slices[0].display >= HealthIngestQueueLegendLayout.labelWidth(parts[0]) - 0.5)
+        #expect(slices[2].display >= HealthIngestQueueLegendLayout.labelWidth(parts[2]) - 0.5)
+        #expect(slices[0].display - slices[0].solid > 8)
+        #expect(slices[2].display - slices[2].solid > 8)
     }
 }
 
@@ -2897,7 +3014,7 @@ private final class HealthIngestURLStub: URLProtocol {
     static var body = Data()
     static var status = 200
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canInit(with _: URLRequest) -> Bool { true }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 

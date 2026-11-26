@@ -15,6 +15,43 @@ struct HealthIngestQueuedRecord: Codable, Equatable {
     var hash: String
     var failures: Int
     var notBefore: Date
+    /// HealthKit history read. Incremental Health samples stay false.
+    var fromBackfill: Bool
+
+    init(
+        record: HealthIngestRecord,
+        bytes: Int,
+        hash: String,
+        failures: Int,
+        notBefore: Date,
+        fromBackfill: Bool = false
+    ) {
+        self.record = record
+        self.bytes = bytes
+        self.hash = hash
+        self.failures = failures
+        self.notBefore = notBefore
+        self.fromBackfill = fromBackfill
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case record
+        case bytes
+        case hash
+        case failures
+        case notBefore
+        case fromBackfill
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        record = try container.decode(HealthIngestRecord.self, forKey: .record)
+        bytes = try container.decode(Int.self, forKey: .bytes)
+        hash = try container.decode(String.self, forKey: .hash)
+        failures = try container.decode(Int.self, forKey: .failures)
+        notBefore = try container.decode(Date.self, forKey: .notBefore)
+        fromBackfill = try container.decodeIfPresent(Bool.self, forKey: .fromBackfill) ?? false
+    }
 }
 
 struct HealthIngestReceipt: Codable, Equatable {
@@ -121,7 +158,8 @@ struct HealthIngestRejectLog: Codable, Equatable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         events = try container.decodeIfPresent([HealthIngestRejectEvent].self, forKey: .events) ?? []
         reasons = try container.decodeIfPresent([HealthIngestRejectReason].self, forKey: .reasons) ?? []
-        guard reasons.isEmpty, let counts = try container.decodeIfPresent([String: Int].self, forKey: .counts), !counts.isEmpty else { return }
+        guard reasons.isEmpty, let counts = try container.decodeIfPresent([String: Int].self, forKey: .counts),
+              !counts.isEmpty else { return }
         didMigrateLegacyCounts = true
         // A counts map with no samples never appeared in the detail list. Importing it
         // would bring back a stale total such as 15,893. Leave the store empty.
@@ -303,6 +341,17 @@ final class HealthIngestDisk {
         save(count, name: "rejected-count.json")
     }
 
+    /// Nil until a build that counts backfill rows has saved the file.
+    func loadBackfillWaiting() -> Int? {
+        let url = directory.appendingPathComponent("backfill-waiting.json")
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        return load(Int.self, name: "backfill-waiting.json")
+    }
+
+    func saveBackfillWaiting(_ count: Int) {
+        save(count, name: "backfill-waiting.json")
+    }
+
     func loadRejectLog() -> HealthIngestRejectLog {
         load(HealthIngestRejectLog.self, name: "reject-log.json") ?? HealthIngestRejectLog()
     }
@@ -391,7 +440,7 @@ enum HealthIngestReadGate {
     /// Trio reads wait only when their own lane holds this many rows. A foreground
     /// catch-up is a two-day chunk, so this fits several chunks, then pauses until
     /// uploads drain the lane.
-    static let priorityCap = 2_000
+    static let priorityCap = 2000
 
     static func decide(
         healthKitDepth: Int,
@@ -412,7 +461,7 @@ enum HealthIngestReadGate {
 /// lane is split on open so those rows still upload.
 actor HealthIngestQueue {
     /// Rows kept in memory per lane. Anything beyond this goes to spill segments.
-    static let windowCap = 1_000
+    static let windowCap = 1000
     static let segmentSize = 500
 
     private struct LaneFiles {
@@ -462,9 +511,11 @@ actor HealthIngestQueue {
     /// Accepted receipts stay so deletions can be detected. Rejected receipts
     /// only need to prevent an immediate resend; a large rejected set made
     /// `receipts.json` expensive to decode at launch.
-    static let receiptCap = 4_000
-    static let rejectedReceiptCap = 2_000
+    static let receiptCap = 4000
+    static let rejectedReceiptCap = 2000
     private let snapshotInterval: TimeInterval = 24 * 3600
+    /// HealthKit history rows inside the regular lane, including spill.
+    private var backfillWaiting: Int
 
     init(disk: HealthIngestDisk) {
         self.disk = disk
@@ -478,6 +529,27 @@ actor HealthIngestQueue {
         receipts = stored
         receiptByKey = Dictionary(stored.map { ($0.key, $0) }, uniquingKeysWith: { _, new in new })
         firstSeen = disk.loadFirstSeen()
+        if let stored = disk.loadBackfillWaiting() {
+            backfillWaiting = stored
+        } else {
+            backfillWaiting = Self.countBackfill(in: regular, disk: disk)
+            disk.saveBackfillWaiting(backfillWaiting)
+        }
+    }
+
+    private static func countBackfill(in lane: Lane, disk: HealthIngestDisk) -> Int {
+        var count = lane.items.reduce(0) { $0 + ($1.fromBackfill ? 1 : 0) }
+        for segment in lane.spill.segments {
+            let rows = disk.loadSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id)
+            count += rows.reduce(0) { $0 + ($1.fromBackfill ? 1 : 0) }
+        }
+        return count
+    }
+
+    private func noteBackfillChange(_ delta: Int) {
+        guard delta != 0 else { return }
+        backfillWaiting = max(0, backfillWaiting + delta)
+        disk.saveBackfillWaiting(backfillWaiting)
     }
 
     /// A queue file written before spill segments existed can hold tens of thousands
@@ -521,7 +593,8 @@ actor HealthIngestQueue {
     private static func migrateLegacyPriorityRows(disk: HealthIngestDisk, regular: Lane, priority: Lane) {
         var moved: [HealthIngestQueuedRecord] = []
         moved.append(contentsOf: regular.items.filter { HealthIngestType.isPriorityLane($0.record.type) })
-        var segmentRows: [(segment: HealthIngestSpillSegment, stay: [HealthIngestQueuedRecord], go: [HealthIngestQueuedRecord])] = []
+        var segmentRows: [(segment: HealthIngestSpillSegment, stay: [HealthIngestQueuedRecord], go: [HealthIngestQueuedRecord])] =
+            []
         for segment in regular.spill.segments {
             let rows = disk.loadSpillSegment(prefix: regular.files.segmentPrefix, id: segment.id)
             let go = rows.filter { HealthIngestType.isPriorityLane($0.record.type) }
@@ -567,7 +640,7 @@ actor HealthIngestQueue {
     /// Callers pass at most a few hundred records at a time. Rows beyond the memory window are
     /// written to spill segments, so a large backfill never grows the in-memory queue.
     /// Trio records go to the priority lane. HealthKit records stay on the original lane.
-    func enqueue(_ records: [HealthIngestRecord], now: Date = Date()) -> HealthIngestEnqueueResult {
+    func enqueue(_ records: [HealthIngestRecord], fromBackfill: Bool = false, now: Date = Date()) -> HealthIngestEnqueueResult {
         var queued = 0
         var oversized = 0
         var priorityDirty = false
@@ -601,10 +674,14 @@ actor HealthIngestQueue {
             let lane = priorityLane ? priority : regular
             if lane.windowKeys.contains(key), let index = lane.items.firstIndex(where: { Self.key($0.record) == key }) {
                 guard lane.items[index].hash != hash else { continue }
+                if !priorityLane, lane.items[index].fromBackfill != fromBackfill {
+                    noteBackfillChange(fromBackfill ? 1 : -1)
+                }
                 lane.items[index].record = record
                 lane.items[index].bytes = bytes
                 lane.items[index].hash = hash
                 lane.items[index].notBefore = now
+                lane.items[index].fromBackfill = fromBackfill
                 queued += 1
                 if priorityLane { priorityDirty = true } else { regularDirty = true }
                 continue
@@ -620,8 +697,12 @@ actor HealthIngestQueue {
                 bytes: bytes,
                 hash: hash,
                 failures: 0,
-                notBefore: now
+                notBefore: now,
+                fromBackfill: fromBackfill && !priorityLane
             )
+            if row.fromBackfill {
+                noteBackfillChange(1)
+            }
             if lane.items.count < Self.windowCap {
                 lane.items.append(row)
                 lane.windowKeys.insert(key)
@@ -769,6 +850,9 @@ actor HealthIngestQueue {
     /// HealthKit rows waiting, including their spill segments.
     func regularDepth() -> Int { regular.count }
 
+    /// HealthKit history rows inside `regularDepth`. Incremental Health rows are the rest.
+    func backfillDepth() -> Int { max(0, backfillWaiting) }
+
     /// HealthKit rows held in memory. Never above `windowCap` after init or an enqueue.
     func windowCount() -> Int { regular.items.count }
 
@@ -818,12 +902,19 @@ actor HealthIngestQueue {
 
     func dropTypes(_ types: Set<String>) {
         for lane in [priority, regular] {
+            if lane === regular {
+                noteBackfillChange(-lane.items.reduce(0) { $0 + ($1.fromBackfill && types.contains($1.record.type) ? 1 : 0) })
+            }
             lane.items.removeAll { types.contains($0.record.type) }
             lane.windowKeys = Set(lane.items.map { Self.key($0.record) })
             disk.saveQueue(lane.items, named: lane.files.queueName)
             var kept: [HealthIngestSpillSegment] = []
             for segment in lane.spill.segments {
                 let rows = disk.loadSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id)
+                if lane === regular {
+                    let dropped = rows.reduce(0) { $0 + ($1.fromBackfill && types.contains($1.record.type) ? 1 : 0) }
+                    noteBackfillChange(-dropped)
+                }
                 let remaining = rows.filter { !types.contains($0.record.type) }
                 if remaining.isEmpty {
                     disk.deleteSpillSegment(prefix: lane.files.segmentPrefix, id: segment.id)
@@ -926,6 +1017,9 @@ actor HealthIngestQueue {
             postpone(postponeKeys, until: now.addingTimeInterval(HealthIngestBackoff.delay(afterFailures: 1)))
         }
         if !remove.isEmpty {
+            let droppedBackfill = regular.items
+                .reduce(0) { $0 + ($1.fromBackfill && remove.contains(Self.key($1.record)) ? 1 : 0) }
+            noteBackfillChange(-droppedBackfill)
             for lane in [priority, regular] {
                 lane.items.removeAll { remove.contains(Self.key($0.record)) }
                 lane.windowKeys.subtract(remove)
@@ -948,11 +1042,13 @@ actor HealthIngestQueue {
 
     private func locate(_ key: String) -> (lane: Lane, index: Int)? {
         if priority.windowKeys.contains(key),
-           let index = priority.items.firstIndex(where: { Self.key($0.record) == key }) {
+           let index = priority.items.firstIndex(where: { Self.key($0.record) == key })
+        {
             return (priority, index)
         }
         if regular.windowKeys.contains(key),
-           let index = regular.items.firstIndex(where: { Self.key($0.record) == key }) {
+           let index = regular.items.firstIndex(where: { Self.key($0.record) == key })
+        {
             return (regular, index)
         }
         return nil

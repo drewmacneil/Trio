@@ -107,6 +107,15 @@ struct HealthIngestPreferences: Codable, Equatable {
         categories[category.rawValue] ?? true
     }
 
+    /// Every category on, saved as explicit true. Does not start a read or a backfill.
+    func withAllCategoriesOn() -> HealthIngestPreferences {
+        var copy = self
+        for category in HealthIngestCategory.allCases {
+            copy.categories[category.rawValue] = true
+        }
+        return copy
+    }
+
     var requestsHealthData: Bool {
         HealthIngestCategory.allCases.contains { $0.readsHealthKit && isOn($0) }
     }
@@ -278,8 +287,13 @@ struct HealthIngestStatus: Equatable {
     var queueDepth: Int = 0
     /// Trio rows included in `queueDepth`. These leave the queue before HealthKit backfill.
     var priorityDepth: Int = 0
+    /// HealthKit history rows inside the waiting total. Incremental Health rows are the remainder.
+    var backfillDepth: Int = 0
 
     var healthDepth: Int { max(0, queueDepth - priorityDepth) }
+
+    /// Incremental Apple Health rows. Together with Trio and backfill this is `queueDepth`.
+    var healthLiveDepth: Int { max(0, healthDepth - backfillDepth) }
     var rejectedCount: Int = 0
     var hasToken = false
     var backfillRunning = false
@@ -422,4 +436,59 @@ final class HealthIngestSettingsStore {
             keychain.setValue(trimmed, forKey: Self.tokenKey)
         }
     }
+
+    private let tokenRevisionKey = "HealthIngest.tokenRevision"
+    private let connectionKey = "HealthIngest.connectionCheck"
+
+    func tokenRevision() -> Int {
+        defaults.integer(forKey: tokenRevisionKey)
+    }
+
+    @discardableResult  func bumpTokenRevision() -> Int {
+        let next = tokenRevision() + 1
+        defaults.set(next, forKey: tokenRevisionKey)
+        return next
+    }
+
+    func loadConnection() -> HealthIngestConnectionCheck? {
+        guard let data = defaults.data(forKey: connectionKey) else { return nil }
+        return try? JSONDecoder().decode(HealthIngestConnectionCheck.self, from: data)
+    }
+
+    func saveConnection(_ check: HealthIngestConnectionCheck?) {
+        if let check, let data = try? JSONEncoder().encode(check) {
+            defaults.set(data, forKey: connectionKey)
+        } else {
+            defaults.removeObject(forKey: connectionKey)
+        }
+    }
+}
+
+struct HealthIngestConnectionCheck: Codable, Equatable {
+    enum Kind: String, Codable {
+        case connected
+        case timedOut
+        case tokenRejected
+        case badURL
+        case http
+        case unreachable
+    }
+
+    var url: String
+    var deviceID: String
+    var tokenRevision: Int
+    var testedAt: Date
+    var kind: Kind
+    var latencyMS: Int?
+    var httpCode: Int?
+}
+
+enum HealthIngestProbe: Equatable {
+    case badURL
+    case missingToken
+    case connected(milliseconds: Int)
+    case tokenRejected
+    case timedOut
+    case http(Int)
+    case unreachable
 }

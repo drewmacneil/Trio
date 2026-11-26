@@ -768,12 +768,19 @@ enum HealthIngestOrigin {
 }
 
 enum HealthIngestAppVersion {
+    /// Marketing version and build, such as `1.0.2 (18)`. The git hash stays a separate field.
+    static func releaseAndBuild() -> String {
+        let release = Bundle.main.releaseVersionNumber ?? "0"
+        let build = Bundle.main.buildVersionNumber ?? "0"
+        return "\(release) (\(build))"
+    }
+
     static func current() -> String {
         let release = Bundle.main.releaseVersionNumber ?? "0"
         let build = Bundle.main.buildVersionNumber ?? "0"
         if let dev = Bundle.main.appDevVersion, !dev.isEmpty, !dev.contains("$"), dev != release {
             return "\(release) (\(build)) \(dev)"
         }
-        return "\(release) (\(build))"
+        return releaseAndBuild()
     }
 }

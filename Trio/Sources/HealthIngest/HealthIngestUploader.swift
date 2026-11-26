@@ -50,7 +50,7 @@ enum HealthIngestMappingUpgrade {
         guard storedVersion < currentVersion else { return nil }
         var resetHealthKit = false
         var rewindDays = 0
-        for version in (storedVersion + 1)...currentVersion {
+        for version in (storedVersion + 1) ... currentVersion {
             guard let step = steps[version] else { return fullReset }
             resetHealthKit = resetHealthKit || step.resetHealthKit
             rewindDays = max(rewindDays, step.rewindCoreDataDays)
@@ -263,7 +263,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             backfillPages: 4,
             incrementalPages: 2,
             flushBatches: 8,
-            backlogHighWater: 6_000,
+            backlogHighWater: 6000,
             diabetesChunk: 2 * 24 * 3600,
             minDiabetesInterval: 0
         )
@@ -272,7 +272,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             backfillPages: 1,
             incrementalPages: 1,
             flushBatches: 2,
-            backlogHighWater: 1_500,
+            backlogHighWater: 1500,
             diabetesChunk: 24 * 3600,
             minDiabetesInterval: 600
         )
@@ -282,7 +282,11 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         container = resolver
         injectServices(resolver)
         settingsStore = HealthIngestSettingsStore(keychain: keychain)
-        let loaded = settingsStore.load()
+        let stored = settingsStore.load()
+        let loaded = stored.withAllCategoriesOn()
+        if loaded != stored {
+            settingsStore.save(loaded)
+        }
         storedPreferences = loaded
         preferences = loaded
         status.hasToken = settingsStore.hasToken()
@@ -305,8 +309,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             defaults: defaults,
             keychain: BaseKeychain(serviceName: "trio.health-ingest.relaunch.\(UUID().uuidString)", synchronizable: false)
         )
-        storedPreferences = preferences
-        self.preferences = preferences
+        let normalized = preferences.withAllCategoriesOn()
+        storedPreferences = normalized
+        self.preferences = normalized
         self.disk = disk
         health = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk)
         historicalResume = disk.loadHistoricalResume()
@@ -355,37 +360,54 @@ final class HealthIngestUploader: ObservableObject, Injectable {
 
     @MainActor func setToken(_ raw: String) {
         settingsStore.setToken(raw)
+        settingsStore.bumpTokenRevision()
         status.hasToken = settingsStore.hasToken()
         poke()
     }
 
     @MainActor func clearToken() {
         settingsStore.setToken("")
+        settingsStore.bumpTokenRevision()
         status.hasToken = false
     }
 
-    @MainActor func testConnection(baseURL: String, deviceID: String) async -> String {
+    func tokenRevision() -> Int { settingsStore.tokenRevision() }
+
+    func connectionCheck() -> HealthIngestConnectionCheck? { settingsStore.loadConnection() }
+
+    @MainActor func rememberConnection(_ check: HealthIngestConnectionCheck) {
+        settingsStore.saveConnection(check)
+    }
+
+    @MainActor func clearConnectionCheck() {
+        settingsStore.saveConnection(nil)
+    }
+
+    @MainActor func testConnection(baseURL: String, deviceID: String) async -> HealthIngestProbe {
         let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         var prefs = currentPreferences()
         prefs.baseURL = trimmed
         prefs.deviceID = deviceID
         commit(prefs)
         guard let origin = HealthIngestOrigin.parse(trimmed) else {
-            return "Enter an https URL."
+            return .badURL
         }
         guard let token = settingsStore.token() else {
-            return "Save a token first. It stays in the Keychain."
+            return .missingToken
         }
         let started = Date()
         do {
             let code = try await client.status(origin: origin, token: token)
             if (200 ... 299).contains(code) {
                 let milliseconds = max(0, Int(Date().timeIntervalSince(started) * 1000))
-                return "Connected, server responded in \(milliseconds) ms"
+                return .connected(milliseconds: milliseconds)
             }
-            return "The server returned HTTP \(code)."
+            if code == 401 { return .tokenRejected }
+            return .http(code)
+        } catch let error as URLError where error.code == .timedOut {
+            return .timedOut
         } catch {
-            return Self.networkMessage(error)
+            return .unreachable
         }
     }
 
@@ -401,7 +423,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         backfillRowsSent = 0
         stateLock.unlock()
         poke()
-        publishSnapshot(depth: status.queueDepth, priorityDepth: status.priorityDepth)
+        publishSnapshot(depth: status.queueDepth, priorityDepth: status.priorityDepth, backfillDepth: status.backfillDepth)
         Task.detached(priority: .utility) { [weak self] in
             guard let self, (try? self.prepare()) != nil else { return }
             self.saveActiveBackfill()
@@ -427,7 +449,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 await queue.clearRejections()
                 let depth = await queue.depth()
                 let priorityDepth = await queue.priorityDepth()
-                self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+                let backfillDepth = await queue.backfillDepth()
+                self.publishSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
             }
         }
     }
@@ -450,9 +473,10 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
         let depth = await queue.depth()
         let priorityDepth = await queue.priorityDepth()
+        let backfillDepth = await queue.backfillDepth()
         await MainActor.run { [weak self] in
             guard let self else { return }
-            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
             self.backfill(days: days)
         }
     }
@@ -484,9 +508,10 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             if stopAfterPersistingCoreDataRewind { return }
         }
         disk.saveMappingVersion(HealthIngestWire.mappingVersion)
-        let depth = await self.queue?.depth() ?? 0
-        let priorityDepth = await self.queue?.priorityDepth() ?? 0
-        publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+        let depth = await queue?.depth() ?? 0
+        let priorityDepth = await queue?.priorityDepth() ?? 0
+        let backfillDepth = await queue?.backfillDepth() ?? 0
+        publishSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
     }
 
     /// Writes the Core Data rewind cursor. A cursor already on disk is kept, so a
@@ -625,7 +650,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             guard let self else { return }
             let depth = await queue.depth()
             let priorityDepth = await queue.priorityDepth()
-            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+            let backfillDepth = await queue.backfillDepth()
+            self.publishSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
         }
     }
 
@@ -836,8 +862,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         var oversized = 0
         var errors: [String] = []
 
-        func enqueuePage(_ records: [HealthIngestRecord]) async {
-            let added = await queue.enqueue(records)
+        func enqueuePage(_ records: [HealthIngestRecord], fromBackfill: Bool = false) async {
+            let added = await queue.enqueue(records, fromBackfill: fromBackfill)
             oversized += added.oversized
             if added.queued > 0 {
                 debug(.healthKit, "Health Ingest queued \(added.queued) records")
@@ -905,7 +931,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                             origin: origin,
                             token: token,
                             deviceID: prefs.normalizedDeviceID,
-                            enqueue: enqueuePage
+                            enqueue: { records in
+                                await enqueuePage(records)
+                            }
                         )
                         mark.sentAny = mark.sentAny || outcome.sentAny
                         if outcome.failed { mark.failed = true }
@@ -925,7 +953,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                     origin: origin,
                     token: token,
                     deviceID: prefs.normalizedDeviceID,
-                    enqueue: enqueuePage
+                    enqueue: { records in
+                        await enqueuePage(records)
+                    }
                 )
                 sentAny = sentAny || flush.sentAny
                 failed = failed || flush.failed
@@ -951,7 +981,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                             preferences: prefs,
                             pageLimit: budget.hkPageLimit,
                             maxPages: budget.backfillPages,
-                            sink: enqueuePage
+                            sink: { records in
+                                await enqueuePage(records, fromBackfill: true)
+                            }
                         )
                     )
                 }
@@ -962,7 +994,9 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                             preferences: prefs,
                             pageLimit: budget.hkPageLimit,
                             maxPagesPerKind: budget.incrementalPages,
-                            sink: enqueuePage
+                            sink: { records in
+                                await enqueuePage(records)
+                            }
                         )
                     )
                 }
@@ -997,7 +1031,8 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         storeBackfillRunning(health.hasPendingBackfill(preferences: prefs))
         let depth = await queue.depth()
         let priorityDepth = await queue.priorityDepth()
-        publishSnapshot(depth: depth, priorityDepth: priorityDepth)
+        let backfillDepth = await queue.backfillDepth()
+        publishSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
         disk.saveStatus(HealthIngestPersistedStatus(lastSuccess: lockedSuccess(), lastError: lockedError()))
     }
 
@@ -1347,7 +1382,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             chosenDays: resolved.chosenDays,
             active: resolved.active
         )
-        if (resolved.active || stored != nil), stored != record {
+        if resolved.active || stored != nil, stored != record {
             disk.saveBackfillProgress(record)
         }
     }
@@ -1450,14 +1485,14 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         )
     }
 
-    private func publishSnapshot(depth: Int, priorityDepth: Int) {
-        let snapshot = makeSnapshot(depth: depth, priorityDepth: priorityDepth)
+    private func publishSnapshot(depth: Int, priorityDepth: Int, backfillDepth: Int = 0) {
+        let snapshot = makeSnapshot(depth: depth, priorityDepth: priorityDepth, backfillDepth: backfillDepth)
         Task { @MainActor [weak self] in
             self?.status = snapshot
         }
     }
 
-    private func makeSnapshot(depth: Int, priorityDepth: Int) -> HealthIngestStatus {
+    private func makeSnapshot(depth: Int, priorityDepth: Int, backfillDepth: Int = 0) -> HealthIngestStatus {
         let prefs = currentPreferences()
         let log = disk?.loadRejectLog() ?? HealthIngestRejectLog()
         let running = lockedBackfillRunning()
@@ -1467,6 +1502,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             lastError: lockedError(),
             queueDepth: depth,
             priorityDepth: priorityDepth,
+            backfillDepth: backfillDepth,
             rejectedCount: log.total,
             hasToken: settingsStore.hasToken(),
             backfillRunning: running,

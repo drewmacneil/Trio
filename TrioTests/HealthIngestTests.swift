@@ -2945,6 +2945,136 @@ import Testing
         #expect(slices[0].display - slices[0].solid > 8)
         #expect(slices[2].display - slices[2].solid > 8)
     }
+
+    @Test func uploadSuccessRefreshesConnectedAndKeepsAKnownLatency() {
+        let earlier = Date(timeIntervalSince1970: 1_700_000_000)
+        let later = Date(timeIntervalSince1970: 1_700_000_100)
+        let tested = HealthIngestConnectionCheck(
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 2,
+            testedAt: earlier,
+            kind: .connected,
+            latencyMS: 84,
+            httpCode: nil
+        )
+        let refreshed = HealthIngestConnectionCheck.afterUpload(
+            previous: tested,
+            outcome: .succeeded(at: later),
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 2
+        )
+        #expect(refreshed.kind == .connected)
+        #expect(refreshed.testedAt == later)
+        #expect(refreshed.latencyMS == 84)
+
+        let firstUpload = HealthIngestConnectionCheck.afterUpload(
+            previous: nil,
+            outcome: .succeeded(at: later),
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 1
+        )
+        #expect(firstUpload.kind == .connected)
+        #expect(firstUpload.latencyMS == nil)
+        #expect(firstUpload.testedAt == later)
+    }
+
+    @Test func uploadFailureReplacesConnectedAndANewTokenIsNotTested() {
+        let when = Date(timeIntervalSince1970: 1_700_000_200)
+        let connected = HealthIngestConnectionCheck(
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 1,
+            testedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            kind: .connected,
+            latencyMS: 84,
+            httpCode: nil
+        )
+        let rejected = HealthIngestConnectionCheck.afterUpload(
+            previous: connected,
+            outcome: .tokenRejected(at: when),
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 1
+        )
+        #expect(rejected.kind == .tokenRejected)
+        #expect(rejected.latencyMS == nil)
+        #expect(rejected.testedAt == when)
+
+        let timedOut = HealthIngestConnectionCheck.afterUpload(
+            previous: connected,
+            outcome: .timedOut(at: when),
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 1
+        )
+        #expect(timedOut.kind == .timedOut)
+
+        let offline = HealthIngestConnectionCheck.afterUpload(
+            previous: connected,
+            outcome: .unreachable(at: when),
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            tokenRevision: 1
+        )
+        #expect(offline.kind == .unreachable)
+
+        let changedToken = HealthIngestConnectionResolver.phase(
+            check: connected,
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            hasToken: true,
+            tokenRevision: 2,
+            testing: false
+        )
+        #expect(changedToken == .notTested)
+
+        let changedURL = HealthIngestConnectionResolver.phase(
+            check: connected,
+            url: "https://other.example.ts.net",
+            deviceID: "trio-iphone",
+            hasToken: true,
+            tokenRevision: 1,
+            testing: false
+        )
+        #expect(changedURL == .notTested)
+
+        let stillConnected = HealthIngestConnectionResolver.phase(
+            check: connected,
+            url: "https://example.ts.net",
+            deviceID: "trio-iphone",
+            hasToken: true,
+            tokenRevision: 1,
+            testing: false
+        )
+        #expect(stillConnected == .connected(milliseconds: 84, testedAt: connected.testedAt))
+    }
+
+    @Test func serverCopyMatchesTheApprovedStates() {
+        #expect(HealthIngestServerCopy.connectionFooter(phase: .notConfigured) == "Add an https address and a token before testing.")
+        #expect(HealthIngestServerCopy.connectionFooter(phase: .timedOut(testedAt: Date(timeIntervalSince1970: 0))) == "Nothing was changed. Try again when the server can be reached.")
+        #expect(HealthIngestServerCopy.connectionFooter(phase: .tokenRejected(testedAt: Date(timeIntervalSince1970: 0))) == "The device id has to be the one in the token.")
+        #expect(HealthIngestServerCopy.connectionFooter(phase: .badURL(testedAt: Date(timeIntervalSince1970: 0))) == "The address has to be https. A port is allowed.")
+        #expect(HealthIngestServerCopy.badURLDetail(address: " http://example.ts.net ") == "http://example.ts.net is not an https address.")
+        #expect(HealthIngestServerCopy.inputsFooter(hasToken: true, phase: .notTested).contains("replacement"))
+        #expect(!HealthIngestServerCopy.stripeFooter.hasSuffix("..."))
+        #expect(HealthIngestServerCopy.stripeFooter.contains("real proportion."))
+        #expect(HealthIngestServerCopy.waitingFooter(empty: true, widened: false) == HealthIngestServerCopy.emptyQueueFooter)
+        #expect(HealthIngestServerCopy.waitingFooter(empty: false, widened: true) == HealthIngestServerCopy.stripeFooter)
+        #expect(HealthIngestServerCopy.homeRowsFooter.contains("Upload on sends every category."))
+    }
+
+    @Test func rejectedRowsKeepEachReasonCount() {
+        let groups = [
+            HealthIngestRejectGroup(type: "heart_rate", reason: "Unrecognized record", message: "Unrecognized record", count: 3, lastSeen: Date(timeIntervalSince1970: 20)),
+            HealthIngestRejectGroup(type: "heart_rate", reason: "Missing field", message: "Missing field", count: 1, lastSeen: Date(timeIntervalSince1970: 10))
+        ]
+        #expect(groups.map(\.reason) == ["Unrecognized record", "Missing field"])
+        #expect(groups.map(\.count) == [3, 1])
+        #expect(groups.reduce(0) { $0 + $1.count } == 4)
+    }
 }
 
 private final class ScriptedHealthKitQueries: HealthIngestHealthKitQuerying, @unchecked Sendable {

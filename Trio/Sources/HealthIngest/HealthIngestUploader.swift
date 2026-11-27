@@ -1077,24 +1077,28 @@ final class HealthIngestUploader: ObservableObject, Injectable {
                 gzip: compressed != nil
             )
             if code == 403 {
+                noteUpload(.http(code: code, at: Date()))
                 setLastError(HealthIngestStatus.deviceIdRejectedError)
                 _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
             if code == 401 {
+                noteUpload(.tokenRejected(at: Date()))
                 setLastError(HealthIngestStatus.tokenRejectedError)
                 _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
             guard code == 200 else {
+                noteUpload(.http(code: code, at: Date()))
                 setLastError("The server returned HTTP \(code).")
                 _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
                 consecutiveFailures += 1
                 return true
             }
             let acks = try HealthIngestWire.parseAcks(data)
+            noteUpload(.succeeded(at: Date()))
             noteAcceptedRows(HealthIngestAck.acceptedRowCount(acks))
             if let reject = await queue.resolve(batch: batch, acks: acks, transportFailed: false) {
                 let message = "A record was rejected: \(String(reject.prefix(180)))"
@@ -1109,7 +1113,15 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
             consecutiveFailures += 1
             return true
+        } catch let error as URLError where error.code == .timedOut {
+            noteUpload(.timedOut(at: Date()))
+            setLastError(Self.networkMessage(error))
+            _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
+            consecutiveFailures += 1
+            warning(.healthKit, "Health Ingest upload failed: \(Self.networkMessage(error))")
+            return true
         } catch {
+            noteUpload(.unreachable(at: Date()))
             setLastError(Self.networkMessage(error))
             _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
             consecutiveFailures += 1
@@ -1287,6 +1299,28 @@ final class HealthIngestUploader: ObservableObject, Injectable {
         stateLock.lock()
         lastSuccess = date
         stateLock.unlock()
+        guard var check = settingsStore.loadConnection(), check.kind == .connected else { return }
+        let prefs = currentPreferences()
+        let url = prefs.baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard check.url == url, check.deviceID == prefs.normalizedDeviceID, check.tokenRevision == settingsStore.tokenRevision() else {
+            return
+        }
+        check.testedAt = date
+        settingsStore.saveConnection(check)
+    }
+
+    /// Records the transport result for the current address and token. A later failure
+    /// replaces Connected. Latency is left to `afterUpload`, which keeps it only when known.
+    private func noteUpload(_ outcome: HealthIngestUploadOutcome) {
+        let prefs = currentPreferences()
+        let check = HealthIngestConnectionCheck.afterUpload(
+            previous: settingsStore.loadConnection(),
+            outcome: outcome,
+            url: prefs.baseURL.trimmingCharacters(in: .whitespacesAndNewlines),
+            deviceID: prefs.normalizedDeviceID,
+            tokenRevision: settingsStore.tokenRevision()
+        )
+        settingsStore.saveConnection(check)
     }
 
     private func storeBackfillRunning(_ running: Bool) {

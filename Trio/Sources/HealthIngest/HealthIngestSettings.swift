@@ -481,6 +481,110 @@ struct HealthIngestConnectionCheck: Codable, Equatable {
     var kind: Kind
     var latencyMS: Int?
     var httpCode: Int?
+
+    /// A successful upload refreshes Connected and keeps a latency only when this
+    /// check is already for the same address, device, and token. A transport failure
+    /// replaces that with the matching failure. A different address or token does not
+    /// keep the old latency.
+    static func afterUpload(
+        previous: HealthIngestConnectionCheck?,
+        outcome: HealthIngestUploadOutcome,
+        url: String,
+        deviceID: String,
+        tokenRevision: Int
+    ) -> HealthIngestConnectionCheck {
+        let same = previous?.url == url && previous?.deviceID == deviceID && previous?.tokenRevision == tokenRevision
+        switch outcome {
+        case let .succeeded(at):
+            return HealthIngestConnectionCheck(
+                url: url,
+                deviceID: deviceID,
+                tokenRevision: tokenRevision,
+                testedAt: at,
+                kind: .connected,
+                latencyMS: same ? previous?.latencyMS : nil,
+                httpCode: nil
+            )
+        case let .tokenRejected(at):
+            return failure(.tokenRejected, at: at, url: url, deviceID: deviceID, tokenRevision: tokenRevision)
+        case let .timedOut(at):
+            return failure(.timedOut, at: at, url: url, deviceID: deviceID, tokenRevision: tokenRevision)
+        case let .unreachable(at):
+            return failure(.unreachable, at: at, url: url, deviceID: deviceID, tokenRevision: tokenRevision)
+        case let .http(code, at):
+            return HealthIngestConnectionCheck(
+                url: url,
+                deviceID: deviceID,
+                tokenRevision: tokenRevision,
+                testedAt: at,
+                kind: .http,
+                latencyMS: nil,
+                httpCode: code
+            )
+        }
+    }
+
+    private static func failure(
+        _ kind: Kind,
+        at: Date,
+        url: String,
+        deviceID: String,
+        tokenRevision: Int
+    ) -> HealthIngestConnectionCheck {
+        HealthIngestConnectionCheck(
+            url: url,
+            deviceID: deviceID,
+            tokenRevision: tokenRevision,
+            testedAt: at,
+            kind: kind,
+            latencyMS: nil,
+            httpCode: nil
+        )
+    }
+}
+
+enum HealthIngestUploadOutcome: Equatable {
+    case succeeded(at: Date)
+    case tokenRejected(at: Date)
+    case timedOut(at: Date)
+    case unreachable(at: Date)
+    case http(code: Int, at: Date)
+}
+
+enum HealthIngestConnectionResolver {
+    /// Not tested when the saved check is for a different address, device, or token.
+    static func phase(
+        check: HealthIngestConnectionCheck?,
+        url: String,
+        deviceID: String,
+        hasToken: Bool,
+        tokenRevision: Int,
+        testing: Bool
+    ) -> HealthIngestConnectionPhase {
+        if testing { return .testing }
+        let trimmed = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parsed = HealthIngestOrigin.parse(trimmed) != nil
+        let matches = check?.url == trimmed && check?.deviceID == deviceID && check?.tokenRevision == tokenRevision
+        if let check, matches, check.kind == .badURL {
+            return .badURL(testedAt: check.testedAt)
+        }
+        guard parsed, hasToken else { return .notConfigured }
+        guard let check, matches else { return .notTested }
+        switch check.kind {
+        case .connected:
+            return .connected(milliseconds: check.latencyMS, testedAt: check.testedAt)
+        case .timedOut:
+            return .timedOut(testedAt: check.testedAt)
+        case .tokenRejected:
+            return .tokenRejected(testedAt: check.testedAt)
+        case .badURL:
+            return .badURL(testedAt: check.testedAt)
+        case .http:
+            return .http(code: check.httpCode ?? 0, testedAt: check.testedAt)
+        case .unreachable:
+            return .unreachable(testedAt: check.testedAt)
+        }
+    }
 }
 
 enum HealthIngestProbe: Equatable {

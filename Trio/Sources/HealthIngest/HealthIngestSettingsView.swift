@@ -15,9 +15,6 @@ struct HealthIngestSettingsView: View {
     @State private var confirmRemoveServer = false
     @State private var storedCheck: HealthIngestConnectionCheck?
 
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(AppState.self) private var appState
-
     init(resolver: Resolver) {
         let uploader = resolver.resolve(HealthIngestUploader.self)!
         _uploader = ObservedObject(wrappedValue: uploader)
@@ -55,43 +52,30 @@ struct HealthIngestSettingsView: View {
                 let days = uploader.status.backfillRunning ? (uploader.status.backfill?.days ?? backfillDays) : backfillDays
                 uploader.resetBackfill(days: days)
             },
-            clearRejections: { uploader.clearRejections() },
-            background: appState.trioBackgroundColor(for: colorScheme)
+            clearRejections: { uploader.clearRejections() }
         )
         .onChange(of: uploader.backfillDayChoice) { _, newValue in
             if !uploader.status.backfillRunning {
                 backfillDays = newValue
             }
         }
+        .onChange(of: uploader.status.lastSuccess) { _, _ in
+            storedCheck = uploader.connectionCheck()
+        }
+        .onChange(of: uploader.status.lastError) { _, _ in
+            storedCheck = uploader.connectionCheck()
+        }
     }
 
     private var phase: HealthIngestConnectionPhase {
-        if testing { return .testing }
-        let trimmed = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parsed = HealthIngestOrigin.parse(trimmed) != nil
-        let revision = uploader.tokenRevision()
-        let matches = storedCheck?.url == trimmed
-            && storedCheck?.deviceID == deviceID
-            && storedCheck?.tokenRevision == revision
-        if let check = storedCheck, matches, check.kind == .badURL {
-            return .badURL(testedAt: check.testedAt)
-        }
-        guard parsed, uploader.status.hasToken else { return .notConfigured }
-        guard let check = storedCheck, matches else { return .notTested }
-        switch check.kind {
-        case .connected:
-            return .connected(milliseconds: check.latencyMS ?? 0, testedAt: check.testedAt)
-        case .timedOut:
-            return .timedOut(testedAt: check.testedAt)
-        case .tokenRejected:
-            return .tokenRejected(testedAt: check.testedAt)
-        case .badURL:
-            return .badURL(testedAt: check.testedAt)
-        case .http:
-            return .http(code: check.httpCode ?? 0, testedAt: check.testedAt)
-        case .unreachable:
-            return .unreachable(testedAt: check.testedAt)
-        }
+        HealthIngestConnectionResolver.phase(
+            check: storedCheck,
+            url: baseURL,
+            deviceID: deviceID,
+            hasToken: uploader.status.hasToken,
+            tokenRevision: uploader.tokenRevision(),
+            testing: testing
+        )
     }
 
     private func saveToken() {
@@ -142,7 +126,7 @@ enum HealthIngestConnectionPhase: Equatable {
     case notConfigured
     case notTested
     case testing
-    case connected(milliseconds: Int, testedAt: Date)
+    case connected(milliseconds: Int?, testedAt: Date)
     case timedOut(testedAt: Date)
     case tokenRejected(testedAt: Date)
     case badURL(testedAt: Date)
@@ -238,7 +222,6 @@ struct HealthIngestSettingsForm: View {
     var rememberBackfillDays: (Int) -> Void
     var resetBackfill: () -> Void
     var clearRejections: () -> Void
-    var background: LinearGradient
 
     private let backfillChoices = HealthIngestBackfillProgress.dayChoices
 
@@ -246,31 +229,29 @@ struct HealthIngestSettingsForm: View {
         Form {
             hero
             serverRow
-            NavigationLink {
-                HealthIngestSentScreen()
-            } label: {
-                LabeledContent("What is sent", value: "All data")
-            }
-            .listRowBackground(Color.chart)
-            if enabled {
+            Section {
                 NavigationLink {
-                    historyScreen
+                    HealthIngestSentScreen()
                 } label: {
-                    LabeledContent("History", value: "\(windowDays) days")
+                    LabeledContent("What is sent", value: "All data")
                 }
-                .listRowBackground(Color.chart)
-                NavigationLink {
-                    diagnosticsScreen
-                } label: {
-                    LabeledContent("Diagnostics", value: diagnosticsValue)
+                if enabled {
+                    NavigationLink {
+                        historyScreen
+                    } label: {
+                        LabeledContent("History", value: "\(windowDays) days")
+                    }
+                    NavigationLink {
+                        diagnosticsScreen
+                    } label: {
+                        LabeledContent("Diagnostics", value: diagnosticsValue)
+                    }
                 }
-                .listRowBackground(Color.chart)
+            } footer: {
+                HealthIngestWrappingFooter(HealthIngestServerCopy.homeRowsFooter)
             }
         }
-        .scrollContentBackground(.hidden)
-        .background(background)
-        .navigationTitle("Health Ingest")
-        .navigationBarTitleDisplayMode(.automatic)
+        .healthIngestPage(title: "Health Ingest", largeTitle: true)
         .alert("Reset backfill?", isPresented: $confirmReset) {
             Button("Reset and resend", role: .destructive) { resetBackfill() }
             Button("Cancel", role: .cancel) {}
@@ -322,13 +303,11 @@ struct HealthIngestSettingsForm: View {
                 }
             }
             .padding(.vertical, 2)
-            .listRowBackground(Color.chart)
             if enabled {
                 LabeledContent("Last success") {
                     Text(status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
                         .foregroundStyle(.secondary)
                 }
-                .listRowBackground(Color.chart)
             }
         } footer: {
             Text(
@@ -356,7 +335,6 @@ struct HealthIngestSettingsForm: View {
                     connectionBadge
                 }
             }
-            .listRowBackground(Color.chart)
         }
     }
 
@@ -523,31 +501,18 @@ struct HealthIngestServerScreen: View {
             } header: {
                 Text("Server")
             } footer: {
-                Text(
-                    "https address. The device id has to match the token, or the server returns 403. Tap Token to paste one in. It stays in the Keychain and is not shown."
-                )
+                HealthIngestWrappingFooter(HealthIngestServerCopy.inputsFooter(hasToken: hasToken, phase: phase))
             }
 
             Section {
                 connectionStatus
-                if let tested = phase.testedAt {
-                    LabeledContent("Last tested") {
-                        Text(HealthIngestConnectionPhase.stamp(tested))
-                            .foregroundStyle(.secondary)
-                    }
-                    .fullWidthSeparator()
-                }
                 Button(phase.repeatsTest ? "Test again" : "Test connection", action: testConnection)
                     .disabled(!phase.canTest)
                     .fullWidthSeparator()
             } header: {
                 Text("Connection check")
             } footer: {
-                Text(
-                    phase.canTest
-                        ? "Uses the address, device id, and saved token."
-                        : "Add an https address and a token before testing."
-                )
+                HealthIngestWrappingFooter(HealthIngestServerCopy.connectionFooter(phase: phase))
             }
 
             if showsRemoveServer || hasToken {
@@ -567,9 +532,7 @@ struct HealthIngestServerScreen: View {
                 }
             }
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("Server")
-        .navigationBarTitleDisplayMode(.inline)
+        .healthIngestPage(title: "Server")
     }
 
     @ViewBuilder private var connectionStatus: some View {
@@ -584,15 +547,22 @@ struct HealthIngestServerScreen: View {
                 Text("Testing…")
             }
             .fullWidthSeparator()
-        case let .connected(milliseconds, _):
-            HStack(spacing: 10) {
+        case let .connected(milliseconds, testedAt):
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)
-                Text("Connected")
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Connected")
+                    Text(testedAt.formatted(date: .abbreviated, time: .shortened))
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
-                Text("\(milliseconds) ms")
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+                if let milliseconds {
+                    Text("\(milliseconds) ms")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
             }
             .fullWidthSeparator()
         case .timedOut:
@@ -613,7 +583,7 @@ struct HealthIngestServerScreen: View {
             failureLine(
                 symbol: "exclamationmark.circle.fill",
                 title: "Enter an https URL.",
-                detail: "The address has to be https. A port is allowed.",
+                detail: HealthIngestServerCopy.badURLDetail(address: baseURL),
                 tint: .red
             )
         case let .http(code, _):
@@ -708,9 +678,7 @@ struct HealthIngestTokenScreen: View {
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
             }
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("Token")
-        .navigationBarTitleDisplayMode(.inline)
+        .healthIngestPage(title: "Token")
     }
 }
 
@@ -728,9 +696,7 @@ struct HealthIngestSentScreen: View {
                 footer: "Upload on sends every category. There is no per-type switch."
             )
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("What is sent")
-        .navigationBarTitleDisplayMode(.inline)
+        .healthIngestPage(title: "What is sent")
     }
 
     private func sentSection(_ title: String, kinds: [HealthIngestSentKind], footer: String) -> some View {
@@ -754,7 +720,6 @@ struct HealthIngestSentScreen: View {
                         .foregroundStyle(.green)
                         .accessibilityLabel("Included")
                 }
-                .listRowBackground(Color.chart)
             }
         } header: {
             Text(title)
@@ -795,7 +760,6 @@ struct HealthIngestHistoryScreen: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                     }
-                    .listRowBackground(Color.chart)
                 } header: {
                     Text("This pass")
                 }
@@ -808,18 +772,15 @@ struct HealthIngestHistoryScreen: View {
                 }
                 .pickerStyle(.menu)
                 .disabled(running)
-                .listRowBackground(Color.chart)
                 if running {
                     HStack(spacing: 8) {
                         ProgressView()
                         Text("Backfilling…")
                             .foregroundStyle(.secondary)
                     }
-                    .listRowBackground(Color.chart)
                 } else {
                     Button("Backfill", action: start)
                         .disabled(!enabled)
-                        .listRowBackground(Color.chart)
                 }
             } header: {
                 Text("Window")
@@ -833,9 +794,7 @@ struct HealthIngestHistoryScreen: View {
                 )
             }
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("History")
-        .navigationBarTitleDisplayMode(.inline)
+        .healthIngestPage(title: "History")
     }
 
     private var daysSelection: Binding<Int> {
@@ -881,7 +840,6 @@ struct HealthIngestDiagnosticsScreen: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 18)
-                    .listRowBackground(Color.chart)
                 } else {
                     VStack(alignment: .leading, spacing: 12) {
                         VStack(alignment: .leading, spacing: 0) {
@@ -895,17 +853,12 @@ struct HealthIngestDiagnosticsScreen: View {
                         HealthIngestQueueLegend(parts: parts)
                     }
                     .padding(.vertical, 4)
-                    .listRowBackground(Color.chart)
                 }
             } header: {
                 Text("Waiting")
             } footer: {
-                Text(
-                    widened
-                        ?
-                        "A striped tail means that slice was drawn wider than its share so the name fits. The solid part is the real proportion."
-                        :
-                        "Trio leaves the queue before Apple Health. Backfill is the part of Apple Health still being read from history."
+                HealthIngestWrappingFooter(
+                    HealthIngestServerCopy.waitingFooter(empty: status.queueDepth == 0, widened: widened)
                 )
             }
 
@@ -926,24 +879,29 @@ struct HealthIngestDiagnosticsScreen: View {
                         }
                         Spacer(minLength: 0)
                     }
-                    .listRowBackground(Color.chart)
+                    ForEach(status.rejectGroups) { group in
+                        HStack {
+                            Text(group.reason)
+                            Spacer()
+                            Text(group.count.formatted())
+                                .foregroundStyle(.secondary)
+                        }
+                    }
                     Button("Clear", role: .destructive, action: clear)
-                        .listRowBackground(Color.chart)
                 } footer: {
-                    Text("The phone keeps the last 200 rejects. Clear removes them here. The server keeps its own history.")
+                    HealthIngestWrappingFooter(
+                        "The phone keeps the last 200 rejects. Clear removes them here. The server keeps its own history."
+                    )
                 }
             }
 
             Section {
                 Button("Reset backfill", role: .destructive, action: reset)
-                    .listRowBackground(Color.chart)
             } footer: {
                 Text("Forgets upload progress and resends the selected window. Nothing is deleted. The server skips duplicates.")
             }
         }
-        .scrollContentBackground(.hidden)
-        .navigationTitle("Diagnostics")
-        .navigationBarTitleDisplayMode(.inline)
+        .healthIngestPage(title: "Diagnostics")
         .onPreferenceChange(HealthIngestStripeKey.self) { widened = $0 }
     }
 
@@ -1164,11 +1122,81 @@ private struct HealthIngestSentKind: Identifiable {
     ]
 }
 
+enum HealthIngestServerCopy {
+    static let homeRowsFooter = "Upload on sends every category. History and diagnostics are separate from the connection."
+    static let stripeFooter =
+        "A striped tail means that slice was drawn wider than its share so the name fits. The solid part is the real proportion."
+    static let emptyQueueFooter = "Trio data uploads first when something is queued."
+    static let queueOrderFooter =
+        "Trio leaves the queue before Apple Health. Backfill is the part of Apple Health still being read from history."
+
+    static func inputsFooter(hasToken: Bool, phase: HealthIngestConnectionPhase) -> String {
+        switch phase {
+        case .notConfigured, .notTested, .testing:
+            if hasToken {
+                return "Tap Token to paste a replacement. The saved token stays in the Keychain and is not shown."
+            }
+            return "Tap Token to paste one in. It stays in the Keychain and is not shown."
+        default:
+            return "https address. The device id has to match the token, or the server returns 403. The token stays in the Keychain."
+        }
+    }
+
+    static func connectionFooter(phase: HealthIngestConnectionPhase) -> String {
+        switch phase {
+        case .notConfigured:
+            return "Add an https address and a token before testing."
+        case .timedOut:
+            return "Nothing was changed. Try again when the server can be reached."
+        case .tokenRejected:
+            return "The device id has to be the one in the token."
+        case .badURL:
+            return "The address has to be https. A port is allowed."
+        default:
+            return "Uses the address, device id, and saved token."
+        }
+    }
+
+    static func badURLDetail(address: String) -> String {
+        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
+        let shown = trimmed.isEmpty ? "That address" : trimmed
+        return "\(shown) is not an https address."
+    }
+
+    static func waitingFooter(empty: Bool, widened: Bool) -> String {
+        if empty { return emptyQueueFooter }
+        if widened { return stripeFooter }
+        return queueOrderFooter
+    }
+}
+
+struct HealthIngestWrappingFooter: View {
+    var text: String
+
+    init(_ text: String) {
+        self.text = text
+    }
+
+    var body: some View {
+        Text(text)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 extension View {
+    /// System grouped page and inset cells, the same chrome as the approved mocks.
+    func healthIngestPage(title: String, largeTitle: Bool = false) -> some View {
+        scrollContentBackground(.hidden)
+            .background(Color(uiColor: .systemGroupedBackground))
+            .listStyle(.insetGrouped)
+            .navigationTitle(title)
+            .navigationBarTitleDisplayMode(largeTitle ? .large : .inline)
+    }
+
     func fullWidthSeparator() -> some View {
         frame(maxWidth: .infinity, alignment: .leading)
             .listRowInsets(EdgeInsets(top: 12, leading: 16, bottom: 12, trailing: 16))
-            .listRowBackground(Color.chart)
             .alignmentGuide(.listRowSeparatorLeading) { _ in -16 }
             .alignmentGuide(.listRowSeparatorTrailing) { dimensions in
                 dimensions[.trailing] + 16
@@ -1176,21 +1204,9 @@ extension View {
     }
 }
 
-extension HealthIngestConnectionPhase {
-    static func stamp(_ date: Date) -> String {
-        if Calendar.current.isDateInToday(date) {
-            return "Today at \(date.formatted(date: .omitted, time: .shortened))"
-        }
-        return date.formatted(date: .abbreviated, time: .shortened)
-    }
-}
-
 struct HealthIngestRejectedView: View {
     var groups: [HealthIngestRejectGroup]
     var onClear: () -> Void
-
-    @Environment(\.colorScheme) private var colorScheme
-    @Environment(AppState.self) private var appState
 
     var body: some View {
         let types = grouped
@@ -1200,7 +1216,6 @@ struct HealthIngestRejectedView: View {
                     Text("No rejected records.")
                         .foregroundStyle(.secondary)
                 }
-                .listRowBackground(Color.chart)
             } else {
                 ForEach(types, id: \.type) { bucket in
                     Section {
@@ -1225,7 +1240,6 @@ struct HealthIngestRejectedView: View {
                     } header: {
                         Text(HealthIngestType.displayName(bucket.type))
                     }
-                    .listRowBackground(Color.chart)
                 }
             }
             Section {
@@ -1233,12 +1247,8 @@ struct HealthIngestRejectedView: View {
             } footer: {
                 Text("The phone keeps the last 200 rejects. The server keeps the full history.")
             }
-            .listRowBackground(Color.chart)
         }
-        .scrollContentBackground(.hidden)
-        .background(appState.trioBackgroundColor(for: colorScheme))
-        .navigationTitle("Rejected")
-        .navigationBarTitleDisplayMode(.automatic)
+        .healthIngestPage(title: "Rejected", largeTitle: true)
     }
 
     private var grouped: [(type: String, rows: [HealthIngestRejectGroup])] {

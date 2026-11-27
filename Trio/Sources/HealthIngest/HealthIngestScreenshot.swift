@@ -38,7 +38,6 @@
         @State private var confirmRemoveServer = false
         private let loaded: HealthIngestScreenshotFixture
         private let relaunched: HealthIngestStatus?
-        @Environment(AppState.self) private var appState
 
         init() {
             let loaded = Self.loadFixture()
@@ -154,8 +153,7 @@
                         startBackfill: {},
                         rememberBackfillDays: { _ in },
                         resetBackfill: {},
-                        clearRejections: {},
-                        background: appState.trioBackgroundColor(for: .light)
+                        clearRejections: {}
                     )
                 }
             }
@@ -264,7 +262,7 @@
         var priorityDepth = 0
         var backfillDepth = 0
         var connection = "connected"
-        var latencyMS = 84
+        var latencyMS: Int? = 84
         var lastTested: TimeInterval?
         var rejectedCount = 0
         var lastSuccess: TimeInterval?
@@ -319,7 +317,7 @@
             priorityDepth = try container.decodeIfPresent(Int.self, forKey: .priorityDepth) ?? 0
             backfillDepth = try container.decodeIfPresent(Int.self, forKey: .backfillDepth) ?? 0
             connection = try container.decodeIfPresent(String.self, forKey: .connection) ?? "connected"
-            latencyMS = try container.decodeIfPresent(Int.self, forKey: .latencyMS) ?? 84
+            latencyMS = try container.decodeIfPresent(Int.self, forKey: .latencyMS)
             lastTested = try container.decodeIfPresent(TimeInterval.self, forKey: .lastTested)
             rejectedCount = try container.decodeIfPresent(Int.self, forKey: .rejectedCount) ?? 0
             lastSuccess = try container.decodeIfPresent(TimeInterval.self, forKey: .lastSuccess)

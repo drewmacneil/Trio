@@ -233,7 +233,7 @@ struct HealthIngestSettingsForm: View {
                 NavigationLink {
                     HealthIngestSentScreen()
                 } label: {
-                    LabeledContent("What is sent", value: "All data")
+                    Text("What's uploaded")
                 }
                 if enabled {
                     NavigationLink {
@@ -251,7 +251,7 @@ struct HealthIngestSettingsForm: View {
                 HealthIngestWrappingFooter(HealthIngestServerCopy.homeRowsFooter)
             }
         }
-        .healthIngestPage(title: "Health Ingest", largeTitle: true)
+        .healthIngestPage(title: "Data Upload", largeTitle: true)
         .alert("Reset backfill?", isPresented: $confirmReset) {
             Button("Reset and resend", role: .destructive) { resetBackfill() }
             Button("Cancel", role: .cancel) {}
@@ -285,7 +285,7 @@ struct HealthIngestSettingsForm: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Toggle("Health Ingest", isOn: enabledBinding)
+                    Toggle("Data Upload", isOn: enabledBinding)
                         .labelsHidden()
                 }
                 if enabled, let host = HealthIngestOrigin.host(baseURL) {
@@ -696,7 +696,7 @@ struct HealthIngestSentScreen: View {
                 footer: "Upload on sends every category. There is no per-type switch."
             )
         }
-        .healthIngestPage(title: "What is sent")
+        .healthIngestPage(title: "What's uploaded")
     }
 
     private func sentSection(_ title: String, kinds: [HealthIngestSentKind], footer: String) -> some View {
@@ -714,11 +714,6 @@ struct HealthIngestSentScreen: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Spacer(minLength: 8)
-                    Image(systemName: "checkmark")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.green)
-                        .accessibilityLabel("Included")
                 }
             }
         } header: {

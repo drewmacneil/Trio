@@ -172,7 +172,8 @@
         private var status: HealthIngestStatus {
             if let relaunched {
                 var status = relaunched
-                status.queueDepth = fixture.queueDepth
+                status.failureCount = fixture.failureCount
+            status.queueDepth = fixture.queueDepth
                 status.priorityDepth = fixture.priorityDepth
                 status.backfillDepth = fixture.backfillDepth
                 status.hasToken = fixture.hasToken
@@ -207,6 +208,7 @@
                 queueDepth: fixture.queueDepth,
                 priorityDepth: fixture.priorityDepth,
                 backfillDepth: fixture.backfillDepth,
+                failureCount: fixture.failureCount,
                 rejectedCount: fixture.rejectedCount,
                 hasToken: fixture.hasToken,
                 backfillRunning: fixture.backfillRunning,
@@ -257,6 +259,7 @@
     var hasToken = false
         var testResult: String?
         var backfillDays = 7
+        var failureCount = 0
         var queueDepth = 0
         /// Trio rows included in `queueDepth`. Health rows are the remainder.
         var priorityDepth = 0
@@ -284,6 +287,7 @@
         case hasToken
             case testResult
             case backfillDays
+            case failureCount
             case queueDepth
             case priorityDepth
             case backfillDepth
@@ -313,6 +317,7 @@
         hasToken = try container.decodeIfPresent(Bool.self, forKey: .hasToken) ?? false
             testResult = try container.decodeIfPresent(String.self, forKey: .testResult)
             backfillDays = try container.decodeIfPresent(Int.self, forKey: .backfillDays) ?? 7
+            failureCount = try container.decodeIfPresent(Int.self, forKey: .failureCount) ?? 0
             queueDepth = try container.decodeIfPresent(Int.self, forKey: .queueDepth) ?? 0
             priorityDepth = try container.decodeIfPresent(Int.self, forKey: .priorityDepth) ?? 0
             backfillDepth = try container.decodeIfPresent(Int.self, forKey: .backfillDepth) ?? 0

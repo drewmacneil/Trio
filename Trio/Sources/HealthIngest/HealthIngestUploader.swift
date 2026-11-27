@@ -630,7 +630,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             queue = try prepare()
         } catch {
             stateLock.lock()
-            lastError = "Could not open the on-device queue."
+            lastError = HealthIngestStatus.queueOpenError
             stateLock.unlock()
             publishSnapshot(depth: 0, priorityDepth: 0)
             warning(.healthKit, "Health Ingest queue failed to open", error: error)
@@ -1014,17 +1014,19 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             }
         }
         applyHealthReadResult(attempted: attemptedHealthRead, messages: healthReadMessages)
-        if let message = errors.first {
-            setLastError(message)
+        let readProblem = errors.first { !HealthIngestStatus.isPausedUntilUnlock($0) }
+        if let readProblem {
+            setLastError(readProblem)
+            if !failed { consecutiveFailures += 1 }
         }
         if sentAny {
             setLastSuccess(Date())
         }
-        if !failed {
+        if !failed, readProblem == nil {
             consecutiveFailures = 0
         }
         if oversized > 0 {
-            let message = "A record payload was over 128 KiB and was dropped."
+            let message = HealthIngestStatus.oversizedError
             setLastError(message)
             warning(.healthKit, "Health Ingest \(message)")
         }
@@ -1062,7 +1064,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             if let encoded { compressed = HealthIngestWire.gzipIfWorthwhile(encoded) }
         }
         guard let raw = encoded else {
-            setLastError("Could not encode a batch.")
+            setLastError(HealthIngestStatus.encodeError)
             return true
         }
         let background = HealthIngestBackgroundTask()
@@ -1109,7 +1111,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             }
             return false
         } catch let error as HealthIngestWireError where error == .unrecognizedResponse {
-            setLastError("The server response was not a per-record result.")
+            setLastError(HealthIngestStatus.unreadableResponseError)
             _ = await queue.resolve(batch: batch, acks: [], transportFailed: true)
             consecutiveFailures += 1
             return true
@@ -1537,6 +1539,7 @@ final class HealthIngestUploader: ObservableObject, Injectable {
             queueDepth: depth,
             priorityDepth: priorityDepth,
             backfillDepth: backfillDepth,
+            failureCount: consecutiveFailures,
             rejectedCount: log.total,
             hasToken: settingsStore.hasToken(),
             backfillRunning: running,

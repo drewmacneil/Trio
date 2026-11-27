@@ -2247,20 +2247,22 @@ import Testing
             lastError: "Could not reach the server (code -1009).",
             queueDepth: 3538,
             priorityDepth: 3538,
+            failureCount: 1,
             backfillRunning: true,
             backfill: progress,
             rewrite: rewrite
         )
         #expect(running.stateTitle == "Backfilling")
-        #expect(running.showsLastError)
+        #expect(!running.showsLastError)
         #expect(running.showsStatusSpinner)
         #expect(running.showsBackfillPhase)
         #expect(running.progressCard?.phase == "Reading Health samples")
         #expect(running.rowsSentLine == "\(12.formatted()) rows sent")
 
-        let idle = HealthIngestStatus(lastError: "Could not reach the server.")
-        #expect(idle.stateTitle == "Error")
+        let idle = HealthIngestStatus(lastError: "Could not reach the server.", failureCount: 2)
+        #expect(idle.stateTitle == HealthIngestStatus.cantReachTitle)
         #expect(idle.showsLastError)
+        #expect(idle.cardAction == "Still failing after a retry.")
         #expect(!idle.showsStatusSpinner)
         #expect(!idle.showsBackfillPhase)
         #expect(idle.progressCard == nil)
@@ -2312,9 +2314,9 @@ import Testing
         #expect(caughtUp.stateTitle == "Up to date")
         #expect(caughtUp.rowsSentLine == nil)
 
-        let errored = HealthIngestStatus(lastError: "Could not reach the server.", rewrite: window)
+        let errored = HealthIngestStatus(lastError: "Could not reach the server.", failureCount: 1, rewrite: window)
         #expect(errored.stateTitle == HealthIngestStatus.rewritingTitle)
-        #expect(errored.showsLastError)
+        #expect(!errored.showsLastError)
     }
 
     @Test func lockedReadKeepsTheCursorAndRetriesTheSameWindow() async throws {
@@ -2423,7 +2425,7 @@ import Testing
             backfillRunning: true,
             backfill: progress
         )
-        #expect(running.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(running.stateTitle == HealthIngestStatus.pausedTitle)
         #expect(running.isPausedUntilUnlock)
         #expect(!running.showsLastError)
         #expect(!running.showsStatusSpinner)
@@ -2431,18 +2433,21 @@ import Testing
         #expect(running.backfill != nil)
 
         let idle = HealthIngestStatus(lastError: HealthIngestStatus.pausedUntilUnlock)
-        #expect(idle.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(idle.stateTitle == HealthIngestStatus.pausedTitle)
         #expect(!idle.showsLastError)
 
         let legacy = HealthIngestStatus(lastError: "heart_rate: Protected health data is inaccessible")
         #expect(legacy.isPausedUntilUnlock)
-        #expect(legacy.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(legacy.stateTitle == HealthIngestStatus.pausedTitle)
         #expect(!legacy.showsLastError)
 
-        let server = HealthIngestStatus(lastError: "Could not reach the server.")
+        let server = HealthIngestStatus(lastError: "Could not reach the server.", failureCount: 1)
         #expect(!server.isPausedUntilUnlock)
-        #expect(server.showsLastError)
-        #expect(server.stateTitle == "Error")
+        #expect(!server.showsLastError)
+        #expect(server.stateTitle == "Up to date")
+        let persistent = HealthIngestStatus(lastError: "Could not reach the server.", failureCount: 2)
+        #expect(persistent.showsLastError)
+        #expect(persistent.stateTitle == HealthIngestStatus.cantReachTitle)
     }
 
     @Test func lockedPauseClearsAfterTheNextReadSucceeds() throws {
@@ -2456,7 +2461,7 @@ import Testing
         #expect(paused.lastError == HealthIngestStatus.pausedUntilUnlock)
         #expect(paused.isPausedUntilUnlock)
         #expect(!paused.showsLastError)
-        #expect(paused.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(paused.stateTitle == HealthIngestStatus.pausedTitle)
 
         uploader.applyHealthReadResult(attempted: true, messages: [])
         let cleared = uploader.currentSnapshot()
@@ -2467,11 +2472,11 @@ import Testing
         uploader.applyHealthReadResult(attempted: true, messages: ["workout timed out"])
         uploader.applyHealthReadResult(attempted: true, messages: [])
         #expect(uploader.currentSnapshot().lastError == "workout timed out")
-        #expect(uploader.currentSnapshot().showsLastError)
+        #expect(!uploader.currentSnapshot().showsLastError)
 
         uploader.applyHealthReadResult(attempted: true, messages: [HealthIngestStatus.pausedUntilUnlock])
         #expect(uploader.currentSnapshot().lastError == "workout timed out")
-        #expect(uploader.currentSnapshot().stateTitle == "Error")
+        #expect(uploader.currentSnapshot().stateTitle == "Up to date")
     }
 
     /// One case per row of the status-dot priority. Earlier rows beat later ones.
@@ -2517,7 +2522,7 @@ import Testing
             backfillRunning: true,
             backfill: progress
         )
-        #expect(paused.stateTitle == HealthIngestStatus.pausedUntilUnlock)
+        #expect(paused.stateTitle == HealthIngestStatus.pausedTitle)
         #expect(!paused.showsLastError)
         #expect(!paused.showsStatusSpinner)
         #expect(!paused.showsBackfillPhase)
@@ -2536,16 +2541,17 @@ import Testing
         let stalled = HealthIngestStatus(
             lastError: "Could not reach the server (code -1009).",
             queueDepth: 3,
+            failureCount: 1,
             backfillRunning: true,
             backfill: progress
         )
         #expect(stalled.stateTitle == "Backfilling")
-        #expect(stalled.showsLastError)
+        #expect(!stalled.showsLastError)
         #expect(stalled.showsStatusSpinner)
         #expect(stalled.showsBackfillPhase)
 
-        let failed = HealthIngestStatus(lastError: "workout timed out", queueDepth: 8)
-        #expect(failed.stateTitle == "Error")
+        let failed = HealthIngestStatus(lastError: "workout timed out", queueDepth: 8, failureCount: 2)
+        #expect(failed.stateTitle == HealthIngestStatus.readFailedTitle)
         #expect(failed.showsLastError)
         #expect(!failed.showsStatusSpinner)
         #expect(!failed.showsBackfillPhase)
@@ -3050,6 +3056,56 @@ import Testing
             testing: false
         )
         #expect(stillConnected == .connected(milliseconds: 84, testedAt: connected.testedAt))
+    }
+
+    @Test func cardStaysQuietUntilTheSecondNetworkFailure() {
+        let first = HealthIngestStatus(lastError: "Could not reach the server (code -1001).", failureCount: 1)
+        #expect(first.stateTitle == "Up to date")
+        #expect(!first.showsLastError)
+        #expect(first.cardAction == nil)
+
+        let second = HealthIngestStatus(lastError: "Could not reach the server (code -1001).", failureCount: 2)
+        #expect(second.stateTitle == HealthIngestStatus.cantReachTitle)
+        #expect(second.cardAction == "Still failing after a retry.")
+
+        let cleared = HealthIngestStatus(lastError: nil, failureCount: 0)
+        #expect(cleared.stateTitle == "Up to date")
+        #expect(cleared.cardAction == nil)
+
+        let rejected = HealthIngestStatus(
+            lastError: HealthIngestStatus.tokenRejectedError,
+            failureCount: 1
+        )
+        #expect(rejected.stateTitle == HealthIngestStatus.tokenRejectedTitle)
+        #expect(rejected.cardAction == "Replace the token on the Server screen.")
+
+        let oneRecord = HealthIngestStatus(lastError: "A record was rejected: heart_rate sample: missing unit", failureCount: 0)
+        #expect(oneRecord.cardAction == nil)
+        #expect(oneRecord.stateTitle == "Up to date")
+
+        let http = HealthIngestStatus(lastError: "The server returned HTTP 500.", failureCount: 1)
+        #expect(http.cardAction == nil)
+        let httpAgain = HealthIngestStatus(lastError: "The server returned HTTP 500.", failureCount: 2)
+        #expect(httpAgain.stateTitle == HealthIngestStatus.serverErrorTitle)
+
+        let unreadable = HealthIngestStatus(lastError: HealthIngestStatus.unreadableResponseError, failureCount: 1)
+        #expect(unreadable.cardAction == nil)
+        let queue = HealthIngestStatus(lastError: HealthIngestStatus.queueOpenError, failureCount: 0)
+        #expect(queue.stateTitle == HealthIngestStatus.queueOpenTitle)
+        let encode = HealthIngestStatus(lastError: HealthIngestStatus.encodeError, failureCount: 0)
+        #expect(encode.stateTitle == HealthIngestStatus.encodeTitle)
+        let dropped = HealthIngestStatus(lastError: HealthIngestStatus.oversizedError, failureCount: 0)
+        #expect(dropped.stateTitle == HealthIngestStatus.oversizedTitle)
+    }
+
+    @Test func lastSuccessLineUsesAShortRelativeTime() {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        let twoMinutes = now.addingTimeInterval(-120)
+        #expect(HealthIngestStatus.lastSuccessPhrase(at: twoMinutes, now: now) == "Last success · 2 min ago")
+        #expect(HealthIngestStatus.lastSuccessPhrase(at: nil, now: now) == "No successful upload yet")
+        let paused = HealthIngestStatus(lastSuccess: twoMinutes, lastError: HealthIngestStatus.pausedUntilUnlock)
+        #expect(paused.stateTitle == HealthIngestStatus.pausedTitle)
+        #expect(paused.lastSuccessPhrase(now: now) == "Last success · 2 min ago")
     }
 
     @Test func serverCopyMatchesTheApprovedStates() {

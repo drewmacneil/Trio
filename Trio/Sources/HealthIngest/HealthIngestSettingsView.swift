@@ -288,11 +288,6 @@ struct HealthIngestSettingsForm: View {
                     Toggle("Data Upload", isOn: enabledBinding)
                         .labelsHidden()
                 }
-                if enabled, let host = HealthIngestOrigin.host(baseURL) {
-                    Text(host)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
                 if enabled, let progress = status.progressCard {
                     progressBlock(progress)
                 }

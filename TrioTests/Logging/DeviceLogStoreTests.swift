@@ -31,8 +31,10 @@ import UIKit
         return (directory, directory.appendingPathComponent("Logs/DeviceLog.sqlite"))
     }
 
+    /// Fresh store, so this only needs to cover the rows this test just wrote.
+    /// A 60-second lookback drops the earliest row when Core Data is slow.
     private static var window: DateInterval {
-        DateInterval(start: Date().addingTimeInterval(-60), end: Date().addingTimeInterval(60))
+        DateInterval(start: Date().addingTimeInterval(-6 * 60 * 60), end: Date().addingTimeInterval(6 * 60 * 60))
     }
 
     private static func log(_ store: DeviceLogStore, manager: String, message: String) async -> Error? {

@@ -387,6 +387,32 @@ final class HealthIngestDisk {
         save(date.map { ["resume": $0] } ?? [:], name: "historical-resume.json")
     }
 
+    /// Exclusive end of a Core Data gap. Nil means the rewind walks to now.
+    func loadHistoricalUntil() -> Date? {
+        load([String: Date].self, name: "historical-until.json")?["until"]
+    }
+
+    func saveHistoricalUntil(_ date: Date?) {
+        save(date.map { ["until": $0] } ?? [:], name: "historical-until.json")
+    }
+
+    func loadHorizon() -> HealthIngestHorizon.Record? {
+        load(HealthIngestHorizon.Record.self, name: "horizon.json")
+    }
+
+    func saveHorizon(_ record: HealthIngestHorizon.Record) {
+        save(record, name: "horizon.json")
+    }
+
+    /// Exclusive end of a HealthKit gap, keyed by record type. Missing keys read through now.
+    func loadBackfillUntils() -> [String: Date] {
+        load([String: Date].self, name: "backfill-until.json") ?? [:]
+    }
+
+    func saveBackfillUntils(_ untils: [String: Date]) {
+        save(untils, name: "backfill-until.json")
+    }
+
     /// Accepted rows for the Core Data rewrite card. Cleared when the cursor is cleared.
     func loadRewriteRowsSent() -> Int {
         load(Int.self, name: "rewrite-rows.json") ?? 0

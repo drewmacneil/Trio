@@ -104,6 +104,8 @@ HealthKit samples may send optional fields beside `payload`: `sourceName`, `sour
 
 `HealthIngestWire.mappingVersion` is the switch that re-reads stored HealthKit history through the existing paged backfill (same page size, batch limits, and backlog pause). The local receipt hash includes the source fields, so an unchanged payload is still sent again with the same `(type, id)`.
 
+The history horizon is 365 days (`HealthIngestHorizon.days`). It is not a mapping version and does not change the payload. A phone that already finished the previous 90-day horizon reads the older gap once: HealthKit cursors and the Core Data rewind start 365 days ago and stop at the covered edge, so the last 90 days are not queried again. Live reads still run first. A phone with no HealthKit anchors yet reads the full year. Page size, batch limits, and the backlog pause are unchanged. The server still upserts on `(type, id)`, and the queue skips a matching receipt. Trio's own store still drops most glucose, insulin, and carb rows after about 90 days; the uploader does not read HealthKit glucose.
+
 ## Sessions
 
 Start a new agent session for each piece of work. Do not carry assumptions from an earlier chat. If something required to work in this repo is missing here, verify it and update this skill in that same change.

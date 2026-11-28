@@ -655,9 +655,9 @@ import Testing
         #expect(wider > now.addingTimeInterval(-90 * 24 * 3600))
         let bounded = HealthIngestDiabetesSchedule.liveSince(
             now: now,
-            lastLiveSuccess: now.addingTimeInterval(-200 * 24 * 3600)
+            lastLiveSuccess: now.addingTimeInterval(-400 * 24 * 3600)
         )
-        #expect(abs(bounded.timeIntervalSince(now.addingTimeInterval(-90 * 24 * 3600))) < 1)
+        #expect(abs(bounded.timeIntervalSince(now.addingTimeInterval(-Double(HealthIngestHorizon.days) * 24 * 3600))) < 1)
 
         final class Seen: @unchecked Sendable {
             var reads: [HealthIngestDiabetesSchedule.Read] = []
@@ -2074,6 +2074,18 @@ import Testing
         )
     }
 
+    private func archivedAnchor(_ value: Int) throws -> Data {
+        try NSKeyedArchiver.archivedData(
+            withRootObject: HKQueryAnchor(fromValue: value),
+            requiringSecureCoding: true
+        )
+    }
+
+    private func unarchivedAnchor(_ data: Data?) throws -> HKQueryAnchor? {
+        guard let data else { return nil }
+        return try NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data)
+    }
+
     private func heartOnlyPreferences() -> HealthIngestPreferences {
         var categories: [String: Bool] = [:]
         for category in HealthIngestCategory.allCases {
@@ -3130,6 +3142,302 @@ import Testing
         #expect(groups.map(\.reason) == ["Unrecognized record", "Missing field"])
         #expect(groups.map(\.count) == [3, 1])
         #expect(groups.reduce(0) { $0 + $1.count } == 4)
+    }
+
+    @Test func horizonKeepsThePayloadAndCapsThePickerAtOneYear() {
+        #expect(HealthIngestWire.schemaVersion == 1)
+        #expect(HealthIngestWire.mappingVersion == 9)
+        #expect(HealthIngestHorizon.days == 365)
+        #expect(HealthIngestHorizon.legacyDays == 90)
+        #expect(HealthIngestHorizon.clamp(0) == 1)
+        #expect(HealthIngestHorizon.clamp(90) == 90)
+        #expect(HealthIngestHorizon.clamp(400) == 365)
+        #expect(HealthIngestBackfillProgress.dayChoices == [1, 3, 7, 14, 30, 90, 365])
+
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let year = HealthIngestBackfillProgress.recover(
+            earliestCursor: now.addingTimeInterval(-120 * 24 * 3600),
+            now: now
+        )
+        #expect(year.days == 365)
+        let ninety = HealthIngestBackfillProgress.recover(
+            earliestCursor: now.addingTimeInterval(-68 * 24 * 3600),
+            now: now
+        )
+        #expect(ninety.days == 90)
+
+        let inside = HealthIngestDiabetesSchedule.liveSince(
+            now: now,
+            lastLiveSuccess: now.addingTimeInterval(-200 * 24 * 3600)
+        )
+        #expect(inside < now.addingTimeInterval(-90 * 24 * 3600))
+        #expect(inside > now.addingTimeInterval(-Double(HealthIngestHorizon.days) * 24 * 3600))
+    }
+
+    @Test func horizonPlanExtendsAFinishedInstallOnceAndSkipsTheCoveredDays() {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let finished = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now, stored: nil, backfillBusy: false, hasAnchors: true)
+        )
+        guard case .start(let since, let until, let days, let record) = finished else {
+            Issue.record("A finished 90-day install should read the older gap")
+            return
+        }
+        #expect(days == 365)
+        #expect(record.days == 365)
+        #expect(record.pendingSince == nil)
+        #expect(abs(since.timeIntervalSince(HealthIngestHorizon.date(daysAgo: 365, now: now))) < 0.001)
+        #expect(until == HealthIngestHorizon.date(daysAgo: 90, now: now))
+
+        let again = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now, stored: record, backfillBusy: false, hasAnchors: true)
+        )
+        #expect(again == .none)
+
+        let busy = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now, stored: nil, backfillBusy: true, hasAnchors: true)
+        )
+        guard case .remember(let pending) = busy else {
+            Issue.record("A pass that is already running should keep its cursors")
+            return
+        }
+        #expect(pending.days == 90)
+        #expect(pending.pendingSince == since)
+        #expect(pending.pendingUntil == until)
+
+        let stillBusy = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now.addingTimeInterval(3600), stored: pending, backfillBusy: true, hasAnchors: true)
+        )
+        #expect(stillBusy == .none)
+
+        let later = now.addingTimeInterval(40 * 24 * 3600)
+        let resumed = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: later, stored: pending, backfillBusy: false, hasAnchors: true)
+        )
+        guard case .start(let resumedSince, let resumedUntil, _, _) = resumed else {
+            Issue.record("An idle phone should start the gap it already stored")
+            return
+        }
+        #expect(resumedSince == since)
+        #expect(resumedUntil == until)
+
+        let fresh = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now, stored: nil, backfillBusy: false, hasAnchors: false)
+        )
+        guard case .start(let fullSince, let fullUntil, let fullDays, _) = fresh else {
+            Issue.record("A phone that has never read HealthKit should read the whole year")
+            return
+        }
+        #expect(fullDays == 365)
+        #expect(fullSince == since)
+        #expect(fullUntil == nil)
+
+        let lostRecent = HealthIngestHorizon.plan(
+            HealthIngestHorizon.Input(now: now, stored: pending, backfillBusy: false, hasAnchors: false)
+        )
+        guard case .start(_, let lostUntil, _, let lostRecord) = lostRecent else {
+            Issue.record("A deferred gap with no anchors should not skip the recent window")
+            return
+        }
+        #expect(lostUntil == nil)
+        #expect(lostRecord.pendingSince == nil)
+    }
+
+    @Test func finishedBackfillExtendsOnceWithoutRereadingTheLastNinetyDays() throws {
+        let disk = try makeDisk()
+        let anchor = try archivedAnchor(9)
+        let anchorKey = HealthIngestType.heartRate
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        disk.saveAnchors([anchorKey: anchor])
+        var preferences = HealthIngestPreferences.initial
+        preferences.enabled = true
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: preferences)
+        uploader.applyHorizonExtensionIfNeeded()
+
+        let now = Date()
+        let cursor = try #require(disk.loadCursors()[anchorKey])
+        let until = try #require(disk.loadBackfillUntils()[anchorKey])
+        #expect(abs(now.timeIntervalSince(cursor) - Double(HealthIngestHorizon.days) * 24 * 3600) < 30)
+        #expect(abs(now.timeIntervalSince(until) - Double(HealthIngestHorizon.legacyDays) * 24 * 3600) < 30)
+        #expect(try unarchivedAnchor(disk.loadAnchors()[anchorKey]) != nil)
+        #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+        let resume = try #require(disk.loadHistoricalResume())
+        let limit = try #require(disk.loadHistoricalUntil())
+        #expect(abs(resume.timeIntervalSince(cursor)) < 5)
+        #expect(abs(limit.timeIntervalSince(until)) < 5)
+        let stored = try #require(disk.loadHorizon())
+        #expect(stored.days == HealthIngestHorizon.days)
+        #expect(stored.pendingSince == nil)
+        let snapshot = uploader.currentSnapshot()
+        #expect(snapshot.backfillRunning)
+        #expect(snapshot.backfill?.days == HealthIngestHorizon.days)
+        #expect(snapshot.stateTitle == "Backfilling")
+        #expect(snapshot.backfill?.phase == "Reading Health samples")
+
+        let cursors = disk.loadCursors()
+        uploader.applyHorizonExtensionIfNeeded()
+        #expect(disk.loadCursors() == cursors)
+        #expect(disk.loadHorizon()?.pendingSince == nil)
+        #expect(try unarchivedAnchor(disk.loadAnchors()[anchorKey]) != nil)
+    }
+
+    @Test func horizonWaitsForAnInProgressBackfillThenStartsTheStoredGap() throws {
+        let disk = try makeDisk()
+        let existing = Date(timeIntervalSince1970: 1_700_000_000)
+        let anchor = try archivedAnchor(3)
+        disk.saveAnchors([HealthIngestType.heartRate: anchor])
+        disk.saveCursors([HealthIngestType.heartRate: existing])
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        uploader.applyHorizonExtensionIfNeeded()
+
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == existing)
+        #expect(disk.loadHistoricalResume() == nil)
+        #expect(disk.loadBackfillUntils().isEmpty)
+        let pending = try #require(disk.loadHorizon())
+        #expect(pending.days == HealthIngestHorizon.legacyDays)
+        let gapStart = try #require(pending.pendingSince)
+        let gapEnd = try #require(pending.pendingUntil)
+
+        uploader.applyHorizonExtensionIfNeeded()
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == existing)
+        #expect(disk.loadHorizon()?.pendingSince == gapStart)
+
+        disk.saveCursors([:])
+        let idle = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        idle.applyHorizonExtensionIfNeeded()
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == gapStart)
+        #expect(disk.loadBackfillUntils()[HealthIngestType.heartRate] == gapEnd)
+        #expect(disk.loadHistoricalResume() == gapStart)
+        #expect(disk.loadHistoricalUntil() == gapEnd)
+        #expect(disk.loadHorizon()?.days == HealthIngestHorizon.days)
+        #expect(disk.loadHorizon()?.pendingSince == nil)
+        #expect(try unarchivedAnchor(disk.loadAnchors()[HealthIngestType.heartRate]) != nil)
+    }
+
+    @Test func phoneWithoutAnchorsReadsTheFullYear() throws {
+        let disk = try makeDisk()
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        uploader.applyHorizonExtensionIfNeeded()
+
+        let cursor = try #require(disk.loadCursors()[HealthIngestType.workout])
+        #expect(abs(Date().timeIntervalSince(cursor) - Double(HealthIngestHorizon.days) * 24 * 3600) < 30)
+        #expect(disk.loadBackfillUntils()[HealthIngestType.workout] == nil)
+        #expect(disk.loadHistoricalUntil() == nil)
+        let resume = try #require(disk.loadHistoricalResume())
+        #expect(abs(resume.timeIntervalSince(cursor)) < 5)
+        #expect(disk.loadHorizon()?.days == HealthIngestHorizon.days)
+        #expect(disk.loadMappingVersion() == HealthIngestWire.mappingVersion)
+    }
+
+    @Test func historicalGapStopsAtTheCoveredEdgeAndReadsLiveFirst() async throws {
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        let start = HealthIngestHorizon.date(daysAgo: HealthIngestHorizon.days, now: now)
+        let limit = HealthIngestHorizon.date(daysAgo: HealthIngestHorizon.legacyDays, now: now)
+        let chunk: TimeInterval = 2 * 24 * 3600
+        let first = HealthIngestDiabetesSchedule.plan(
+            now: now,
+            chunk: chunk,
+            lastLiveSuccess: nil,
+            backfillRequest: nil,
+            diabetesResume: nil,
+            historicalResume: start,
+            historicalUntil: limit
+        )
+        #expect(first.reads.map(\.role) == [.live, .historical])
+        #expect(first.reads[1].since == start)
+        #expect(first.reads[1].until == start.addingTimeInterval(chunk))
+        #expect(first.historicalResume == start.addingTimeInterval(chunk))
+
+        let near = limit.addingTimeInterval(-24 * 3600)
+        let finishing = HealthIngestDiabetesSchedule.plan(
+            now: now,
+            chunk: chunk,
+            lastLiveSuccess: nil,
+            backfillRequest: nil,
+            diabetesResume: nil,
+            historicalResume: near,
+            historicalUntil: limit
+        )
+        #expect(finishing.reads[0].role == .live)
+        #expect(finishing.reads[1].since == near)
+        #expect(finishing.reads[1].until == limit)
+        #expect(finishing.historicalResume == nil)
+
+        let disk = try makeDisk()
+        disk.saveMappingVersion(HealthIngestWire.mappingVersion)
+        disk.saveHistoricalResume(near)
+        disk.saveHistoricalUntil(limit)
+        let uploader = HealthIngestUploader(relaunchFrom: disk, preferences: .initial)
+        final class Seen: @unchecked Sendable {
+            var roles: [HealthIngestDiabetesSchedule.Read.Role] = []
+            var until: Date?
+        }
+        let seen = Seen()
+        _ = await uploader.runScheduledDiabetesPass(
+            now: now,
+            chunk: chunk,
+            read: { spec in
+                seen.roles.append(spec.role)
+                if spec.role == .historical { seen.until = spec.until }
+                return ([], [])
+            },
+            onHealthKitBackfill: { _ in
+                Issue.record("A horizon gap must not start another HealthKit window")
+            },
+            enqueue: { _ in }
+        )
+        #expect(seen.roles == [.live, .historical])
+        #expect(seen.until == limit)
+        #expect(disk.loadHistoricalResume() == nil)
+        #expect(disk.loadHistoricalUntil() == nil)
+    }
+
+    @Test func boundedHealthKitPageDoesNotEmitSamplesPastTheCoveredEdge() async throws {
+        let disk = try makeDisk()
+        let queries = ScriptedHealthKitQueries()
+        let reader = HealthIngestHealthKitReader(store: HKHealthStore(), disk: disk, queries: queries)
+        reader.protectedDataOverride = true
+        let preferences = heartOnlyPreferences()
+        let since = Date(timeIntervalSince1970: 1_700_000_000)
+        let sampleStart = since.addingTimeInterval(500)
+        let heart = try #require(HKQuantityType.quantityType(forIdentifier: .heartRate))
+        queries.heartSample = HKQuantitySample(
+            type: heart,
+            quantity: HKQuantity(unit: HKUnit.count().unitDivided(by: .minute()), doubleValue: 70),
+            start: sampleStart,
+            end: sampleStart
+        )
+        reader.beginBackfill(since: since, until: sampleStart, preferences: preferences)
+        var sunk = 0
+        let dropped = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 2, sink: { records in
+            sunk += records.count
+        })
+        #expect(dropped.isEmpty)
+        #expect(sunk == 0)
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == nil)
+
+        reader.beginBackfill(since: since, until: sampleStart.addingTimeInterval(10), preferences: preferences)
+        #expect(disk.loadBackfillUntils()[HealthIngestType.heartRate] == sampleStart.addingTimeInterval(10))
+        let kept = await reader.backfill(preferences: preferences, pageLimit: 50, maxPages: 2, sink: { records in
+            sunk += records.count
+        })
+        #expect(kept.isEmpty)
+        #expect(sunk == 1)
+        #expect(disk.loadCursors()[HealthIngestType.heartRate] == nil)
+        #expect(disk.loadBackfillUntils()[HealthIngestType.heartRate] == nil)
+
+        queries.sampleFormats.removeAll()
+        queries.heartSample = nil
+        reader.beginBackfill(since: since, preferences: preferences)
+        _ = await reader.backfill(preferences: preferences, pageLimit: 10, maxPages: 1, sink: { _ in })
+        let open = try #require(queries.sampleFormats.first)
+        queries.sampleFormats.removeAll()
+        reader.beginBackfill(since: since, until: since.addingTimeInterval(1_000), preferences: preferences)
+        _ = await reader.backfill(preferences: preferences, pageLimit: 10, maxPages: 1, sink: { _ in })
+        let bounded = try #require(queries.sampleFormats.first)
+        #expect(open != bounded)
     }
 }
 

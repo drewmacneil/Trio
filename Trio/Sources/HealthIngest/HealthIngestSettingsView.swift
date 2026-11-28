@@ -229,13 +229,8 @@ struct HealthIngestSettingsForm: View {
         Form {
             hero
             serverRow
-            Section {
-                NavigationLink {
-                    HealthIngestSentScreen()
-                } label: {
-                    LabeledContent("What is sent", value: "All data")
-                }
-                if enabled {
+            if enabled {
+                Section {
                     NavigationLink {
                         historyScreen
                     } label: {
@@ -246,12 +241,21 @@ struct HealthIngestSettingsForm: View {
                     } label: {
                         LabeledContent("Diagnostics", value: diagnosticsValue)
                     }
+                } footer: {
+                    Text("History reads older samples. Diagnostics shows what is waiting and what was rejected.")
+                }
+            }
+            Section {
+                NavigationLink {
+                    HealthIngestSentScreen()
+                } label: {
+                    Text("What's uploaded")
                 }
             } footer: {
                 HealthIngestWrappingFooter(HealthIngestServerCopy.homeRowsFooter)
             }
         }
-        .healthIngestPage(title: "Health Ingest", largeTitle: true)
+        .healthIngestPage(title: "Data Upload", largeTitle: true)
         .alert("Reset backfill?", isPresented: $confirmReset) {
             Button("Reset and resend", role: .destructive) { resetBackfill() }
             Button("Cancel", role: .cancel) {}
@@ -269,7 +273,10 @@ struct HealthIngestSettingsForm: View {
     }
 
     private var diagnosticsValue: String {
-        status.queueDepth == 0 ? "Nothing waiting" : "\(status.queueDepth.formatted()) waiting"
+        if status.rejectedCount > 0 {
+            return "\(status.rejectedCount.formatted()) rejected"
+        }
+        return status.queueDepth == 0 ? "Nothing waiting" : "\(status.queueDepth.formatted()) waiting"
     }
 
     private var hero: some View {
@@ -285,30 +292,23 @@ struct HealthIngestSettingsForm: View {
                         ProgressView()
                             .controlSize(.small)
                     }
-                    Toggle("Health Ingest", isOn: enabledBinding)
+                    Toggle("Data Upload", isOn: enabledBinding)
                         .labelsHidden()
                 }
-                if enabled, let host = HealthIngestOrigin.host(baseURL) {
-                    Text(host)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-                if enabled, let progress = status.progressCard {
+                if enabled, status.showsProgressPhase, let progress = status.progressCard {
                     progressBlock(progress)
                 }
-                if enabled, status.showsLastError, let error = status.lastError {
-                    Text(error)
+                if enabled {
+                    statusDetail
+                }
+                if enabled, let action = status.cardAction {
+                    Text(action)
                         .font(.footnote)
                         .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             .padding(.vertical, 2)
-            if enabled {
-                LabeledContent("Last success") {
-                    Text(status.lastSuccess?.formatted(date: .abbreviated, time: .shortened) ?? "None")
-                        .foregroundStyle(.secondary)
-                }
-            }
         } footer: {
             Text(
                 enabled
@@ -331,31 +331,22 @@ struct HealthIngestSettingsForm: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Spacer()
-                    connectionBadge
+                    Spacer(minLength: 0)
                 }
             }
         }
     }
 
-    @ViewBuilder private var connectionBadge: some View {
-        switch phase {
-        case .connected:
-            Text("Connected")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color.green.opacity(0.14), in: Capsule())
-        case .notConfigured:
-            Text("Not configured")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-        default:
-            Text("Not tested")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+    private var statusDetail: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if status.isPausedUntilUnlock {
+                Text("Resumes when iPhone is unlocked")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HealthIngestLastSuccessLine(date: status.lastSuccess)
         }
+        .font(.footnote)
+        .foregroundStyle(.secondary)
     }
 
     private var serverScreen: some View {
@@ -433,8 +424,13 @@ struct HealthIngestSettingsForm: View {
         switch status.stateTitle {
         case "Backfilling",
              HealthIngestStatus.rewritingTitle: return .blue
-        case HealthIngestStatus.pausedUntilUnlock: return .orange
-        case "Error",
+        case HealthIngestStatus.pausedTitle: return .orange
+        case HealthIngestStatus.cantReachTitle,
+             HealthIngestStatus.serverErrorTitle,
+             HealthIngestStatus.readFailedTitle,
+             HealthIngestStatus.queueOpenTitle,
+             HealthIngestStatus.encodeTitle,
+             HealthIngestStatus.oversizedTitle,
              HealthIngestStatus.deviceIdRejectedTitle,
              HealthIngestStatus.tokenRejectedTitle:
             return .red
@@ -568,8 +564,8 @@ struct HealthIngestServerScreen: View {
         case .timedOut:
             failureLine(
                 symbol: "clock.badge.exclamationmark",
-                title: "Timed out",
-                detail: "The server did not answer. Check the address and try again.",
+                title: HealthIngestStatus.cantReachTitle,
+                detail: "Still failing after a retry.",
                 tint: .orange
             )
         case .tokenRejected:
@@ -589,15 +585,17 @@ struct HealthIngestServerScreen: View {
         case let .http(code, _):
             failureLine(
                 symbol: "exclamationmark.circle.fill",
-                title: "The server returned HTTP \(code).",
-                detail: "The check did not succeed.",
+                title: code == 403 ? HealthIngestStatus.deviceIdRejectedTitle : HealthIngestStatus.serverErrorTitle,
+                detail: code == 403
+                    ? HealthIngestStatus.deviceIdRejectedError
+                    : "The server returned HTTP \(code).",
                 tint: .red
             )
         case .unreachable:
             failureLine(
                 symbol: "wifi.slash",
-                title: "Could not reach the server",
-                detail: "Check the address and try again.",
+                title: HealthIngestStatus.cantReachTitle,
+                detail: "Still failing after a retry.",
                 tint: .red
             )
         }
@@ -696,7 +694,7 @@ struct HealthIngestSentScreen: View {
                 footer: "Upload on sends every category. There is no per-type switch."
             )
         }
-        .healthIngestPage(title: "What is sent")
+        .healthIngestPage(title: "What's uploaded")
     }
 
     private func sentSection(_ title: String, kinds: [HealthIngestSentKind], footer: String) -> some View {
@@ -714,11 +712,6 @@ struct HealthIngestSentScreen: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Spacer(minLength: 8)
-                    Image(systemName: "checkmark")
-                        .font(.body.weight(.semibold))
-                        .foregroundStyle(.green)
-                        .accessibilityLabel("Included")
                 }
             }
         } header: {
@@ -1123,7 +1116,7 @@ private struct HealthIngestSentKind: Identifiable {
 }
 
 enum HealthIngestServerCopy {
-    static let homeRowsFooter = "Upload on sends every category. History and diagnostics are separate from the connection."
+    static let homeRowsFooter = "Upload on sends every category. There is no per-type switch."
     static let stripeFooter =
         "A striped tail means that slice was drawn wider than its share so the name fits. The solid part is the real proportion."
     static let emptyQueueFooter = "Trio data uploads first when something is queued."
@@ -1167,6 +1160,31 @@ enum HealthIngestServerCopy {
         if empty { return emptyQueueFooter }
         if widened { return stripeFooter }
         return queueOrderFooter
+    }
+}
+
+/// One line when it fits. Otherwise "Last success" and the time are each their own line,
+/// and the time uses non-breaking spaces so "min ago" cannot sit alone.
+struct HealthIngestLastSuccessLine: View {
+    var date: Date?
+    var now: Date = Date()
+
+    var body: some View {
+        if let date {
+            let time = HealthIngestStatus.relativeSuccess(from: date, now: now)
+                .replacingOccurrences(of: " ", with: "\u{00a0}")
+            ViewThatFits(in: .horizontal) {
+                Text("Last success · \(time)")
+                    .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Last success")
+                    Text(time)
+                }
+            }
+        } else {
+            Text("No successful upload yet")
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

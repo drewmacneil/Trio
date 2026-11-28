@@ -289,6 +289,8 @@ struct HealthIngestStatus: Equatable {
     var priorityDepth: Int = 0
     /// HealthKit history rows inside the waiting total. Incremental Health rows are the remainder.
     var backfillDepth: Int = 0
+    /// Failed upload passes in a row. A network or read error stays off the card until this is 2.
+    var failureCount: Int = 0
 
     var healthDepth: Int { max(0, queueDepth - priorityDepth) }
 
@@ -310,7 +312,19 @@ struct HealthIngestStatus: Equatable {
     static let liveUploadsCurrent = "Live uploads are current"
 
     /// Shown on the dot while HealthKit cannot read because the iPhone is locked.
+    static let pausedTitle = "Paused"
+    /// Stored error text for a locked phone. The card title is `pausedTitle`.
     static let pausedUntilUnlock = "Paused until iPhone is unlocked"
+    static let cantReachTitle = "Can't reach the server"
+    static let serverErrorTitle = "Server error"
+    static let readFailedTitle = "Read failed"
+    static let queueOpenTitle = "Can't open the queue"
+    static let encodeTitle = "Can't encode a batch"
+    static let oversizedTitle = "A record was dropped"
+    static let queueOpenError = "Could not open the on-device queue."
+    static let encodeError = "Could not encode a batch."
+    static let oversizedError = "A record payload was over 128 KiB and was dropped."
+    static let unreadableResponseError = "The server response was not a per-record result."
 
     /// The 401 line `send` stores in `lastError`. The dot title is `tokenRejectedTitle`.
     static let tokenRejectedError = "The server rejected the token (HTTP 401)."
@@ -333,12 +347,9 @@ struct HealthIngestStatus: Equatable {
 
     var isDeviceIdRejected: Bool { lastError == Self.deviceIdRejectedError }
 
-    /// A server or network error stays on screen while a backfill is running.
-    /// A locked iPhone is the dot title, not this row.
-    var showsLastError: Bool {
-        guard let lastError, !lastError.isEmpty else { return false }
-        return !isPausedUntilUnlock
-    }
+    /// A persistent, actionable problem. A first network or read failure stays off the card.
+    /// A rejected record never appears here.
+    var showsLastError: Bool { cardAction != nil }
 
     /// Pause, a rejected token, or a rejected device id mean the pass is not reading.
     private var holdsBackfill: Bool {
@@ -353,9 +364,9 @@ struct HealthIngestStatus: Equatable {
         return rewrite
     }
 
-    /// The status-row spinner. Off while the dot is a pause or a token failure.
+    /// The status-row spinner. Off while the card is a pause or an actionable problem.
     var showsStatusSpinner: Bool {
-        (backfillRunning || isRewriting) && !holdsBackfill
+        (backfillRunning || isRewriting) && !holdsBackfill && !showsLastError
     }
 
     /// "Reading Health samples" or the rewrite phase. The day counter stays up either way.
@@ -378,18 +389,123 @@ struct HealthIngestStatus: Equatable {
         return sent
     }
 
-    /// The dot's title. First match wins. A real problem other than 401 or 403
-    /// stays in `showsLastError` and does not take the dot away from a running pass.
+    /// The dot's title. A persistent problem takes the card. A locked phone is "Paused".
     /// "Up to date" requires an empty queue and a cleared rewrite cursor.
     var stateTitle: String {
-        if isTokenRejected { return Self.tokenRejectedTitle }
-        if isDeviceIdRejected { return Self.deviceIdRejectedTitle }
-        if isPausedUntilUnlock { return Self.pausedUntilUnlock }
+        if let title = HealthIngestCardPolicy.title(for: lastError, failureCount: failureCount) {
+            return title
+        }
+        if isPausedUntilUnlock { return Self.pausedTitle }
         if backfillRunning { return "Backfilling" }
         if isRewriting { return Self.rewritingTitle }
-        if showsLastError { return "Error" }
         if queueDepth > 0 { return "Uploading" }
         return "Up to date"
+    }
+
+    /// Red sentence under the title. Nil for a silent first failure and for record rejections.
+    var cardAction: String? {
+        HealthIngestCardPolicy.action(for: lastError, failureCount: failureCount)
+    }
+
+    func lastSuccessPhrase(now: Date = Date()) -> String {
+        Self.lastSuccessPhrase(at: lastSuccess, now: now)
+    }
+
+    static func lastSuccessPhrase(at date: Date?, now: Date) -> String {
+        guard let date else { return "No successful upload yet" }
+        return "Last success · \(relativeSuccess(from: date, now: now))"
+    }
+
+    static func relativeSuccess(from date: Date, now: Date) -> String {
+        let seconds = Int(now.timeIntervalSince(date))
+        if seconds < 45 { return "just now" }
+        if seconds < 3_600 {
+            return "\(max(1, seconds / 60)) min ago"
+        }
+        if seconds < 86_400 {
+            let hours = seconds / 3_600
+            return hours == 1 ? "1 hr ago" : "\(hours) hr ago"
+        }
+        let days = seconds / 86_400
+        return days == 1 ? "1 day ago" : "\(days) days ago"
+    }
+}
+
+enum HealthIngestCardPolicy {
+    /// Network, other HTTP, an unreadable response, and read errors wait for a second failed pass.
+    static let persistedFailureCount = 2
+
+    static func title(for message: String?, failureCount: Int) -> String? {
+        guard let issue = visible(message, failureCount: failureCount) else { return nil }
+        switch issue {
+        case .tokenRejected: return HealthIngestStatus.tokenRejectedTitle
+        case .deviceRejected: return HealthIngestStatus.deviceIdRejectedTitle
+        case .unreachable: return HealthIngestStatus.cantReachTitle
+        case .http, .unreadableResponse: return HealthIngestStatus.serverErrorTitle
+        case .read: return HealthIngestStatus.readFailedTitle
+        case .queueOpen: return HealthIngestStatus.queueOpenTitle
+        case .encode: return HealthIngestStatus.encodeTitle
+        case .oversized: return HealthIngestStatus.oversizedTitle
+        case .recordRejected, .paused: return nil
+        }
+    }
+
+    static func action(for message: String?, failureCount: Int) -> String? {
+        guard let issue = visible(message, failureCount: failureCount) else { return nil }
+        switch issue {
+        case .tokenRejected: return "Replace the token on the Server screen."
+        case .deviceRejected: return "The device id has to match the token."
+        case .unreachable: return "Still failing after a retry."
+        case .http, .unreadableResponse, .read, .queueOpen, .encode, .oversized:
+            return message
+        case .recordRejected, .paused: return nil
+        }
+    }
+
+    private enum Issue: Equatable {
+        case tokenRejected
+        case deviceRejected
+        case unreachable
+        case http
+        case unreadableResponse
+        case read
+        case queueOpen
+        case encode
+        case oversized
+        case recordRejected
+        case paused
+
+        var showsImmediately: Bool {
+            switch self {
+            case .tokenRejected, .deviceRejected, .queueOpen, .encode, .oversized: return true
+            default: return false
+            }
+        }
+    }
+
+    private static func visible(_ message: String?, failureCount: Int) -> Issue? {
+        guard let issue = classify(message) else { return nil }
+        switch issue {
+        case .recordRejected, .paused: return nil
+        case _ where issue.showsImmediately: return issue
+        case _ where failureCount >= persistedFailureCount: return issue
+        default: return nil
+        }
+    }
+
+    private static func classify(_ message: String?) -> Issue? {
+        guard let message, !message.isEmpty else { return nil }
+        if HealthIngestStatus.isPausedUntilUnlock(message) { return .paused }
+        if message == HealthIngestStatus.tokenRejectedError { return .tokenRejected }
+        if message == HealthIngestStatus.deviceIdRejectedError { return .deviceRejected }
+        if message == HealthIngestStatus.queueOpenError { return .queueOpen }
+        if message == HealthIngestStatus.encodeError { return .encode }
+        if message == HealthIngestStatus.oversizedError { return .oversized }
+        if message == HealthIngestStatus.unreadableResponseError { return .unreadableResponse }
+        if message.hasPrefix("Could not reach the server") { return .unreachable }
+        if message.hasPrefix("The server returned HTTP ") { return .http }
+        if message.hasPrefix("A record was rejected:") { return .recordRejected }
+        return .read
     }
 }
 

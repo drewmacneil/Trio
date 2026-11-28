@@ -444,7 +444,7 @@ enum SettingItems {
         ),
         SettingItem(title: "Tidepool", view: .serviceSettings, path: ["Services"]),
         SettingItem(
-            title: "Health Ingest",
+            title: "Data Upload",
             view: .healthIngest,
             searchContents: [
                 "Upload to private server",
@@ -452,7 +452,7 @@ enum SettingItems {
                 "Test connection",
                 "Backfill"
             ],
-            path: ["Services", "Health Ingest"]
+            path: ["Services", "Data Upload"]
         ),
         SettingItem(title: "Apple Health", view: .healthkit, path: ["Services"])
     ]

@@ -299,10 +299,7 @@ struct HealthIngestSettingsForm: View {
                     progressBlock(progress)
                 }
                 if enabled {
-                    Text(secondaryLine)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    statusDetail
                 }
                 if enabled, let action = status.cardAction {
                     Text(action)
@@ -340,12 +337,16 @@ struct HealthIngestSettingsForm: View {
         }
     }
 
-    private var secondaryLine: String {
-        let success = status.lastSuccessPhrase()
-        if status.isPausedUntilUnlock {
-            return "Resumes when iPhone is unlocked · \(success)"
+    private var statusDetail: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if status.isPausedUntilUnlock {
+                Text("Resumes when iPhone is unlocked")
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HealthIngestLastSuccessLine(date: status.lastSuccess)
         }
-        return success
+        .font(.footnote)
+        .foregroundStyle(.secondary)
     }
 
     private var serverScreen: some View {
@@ -1159,6 +1160,31 @@ enum HealthIngestServerCopy {
         if empty { return emptyQueueFooter }
         if widened { return stripeFooter }
         return queueOrderFooter
+    }
+}
+
+/// One line when it fits. Otherwise "Last success" and the time are each their own line,
+/// and the time uses non-breaking spaces so "min ago" cannot sit alone.
+struct HealthIngestLastSuccessLine: View {
+    var date: Date?
+    var now: Date = Date()
+
+    var body: some View {
+        if let date {
+            let time = HealthIngestStatus.relativeSuccess(from: date, now: now)
+                .replacingOccurrences(of: " ", with: "\u{00a0}")
+            ViewThatFits(in: .horizontal) {
+                Text("Last success · \(time)")
+                    .fixedSize(horizontal: true, vertical: false)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("Last success")
+                    Text(time)
+                }
+            }
+        } else {
+            Text("No successful upload yet")
+                .fixedSize(horizontal: false, vertical: true)
+        }
     }
 }
 

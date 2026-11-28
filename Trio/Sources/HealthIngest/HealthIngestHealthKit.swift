@@ -77,6 +77,8 @@ final class HealthIngestHealthKitReader {
     private var observers: [HKObserverQuery] = []
     private var anchors: [String: HKQueryAnchor] = [:]
     private var cursors: [String: Date] = [:]
+    /// Exclusive end for a gap backfill. Nil reads through now.
+    private var untils: [String: Date] = [:]
     private var loaded = false
     /// Nil follows the device lock. Tests set this so a locked read can be simulated.
     var protectedDataOverride: Bool?
@@ -132,7 +134,9 @@ final class HealthIngestHealthKitReader {
         }
     }
 
-    func beginBackfill(since: Date, preferences: HealthIngestPreferences) {
+    /// `until` stops the read before samples that were already uploaded. Nil reads through now
+    /// and clears any previous end, so a manual full-window backfill is not capped.
+    func beginBackfill(since: Date, until: Date? = nil, preferences: HealthIngestPreferences) {
         loadIfNeeded()
         lock.lock()
         for kind in Self.readTypes() where preferences.isOn(kind.category) {
@@ -141,6 +145,7 @@ final class HealthIngestHealthKitReader {
             } else {
                 cursors[kind.recordType] = since
             }
+            untils[kind.recordType] = until
         }
         lock.unlock()
         persist()
@@ -150,6 +155,7 @@ final class HealthIngestHealthKitReader {
         loadIfNeeded()
         lock.lock()
         cursors.removeAll()
+        untils.removeAll()
         lock.unlock()
         persist()
     }
@@ -273,7 +279,13 @@ final class HealthIngestHealthKitReader {
     /// Returns an error message, or nil when the page was read (or the type had nothing left).
     private func backfillOnePage(kind: SampleKind, limit: Int, sink: PageSink) async -> String? {
         guard let cursor = cursor(for: kind.recordType) else { return nil }
-        let predicate = HKQuery.predicateForSamples(withStart: cursor, end: nil, options: .strictStartDate)
+        let until = untilDate(for: kind.recordType)
+        if let until, cursor >= until {
+            setCursor(nil, for: kind.recordType)
+            persist()
+            return nil
+        }
+        let predicate = HKQuery.predicateForSamples(withStart: cursor, end: until, options: .strictStartDate)
         do {
             let samples = try await queries.samples(
                 type: kind.sampleType,
@@ -286,14 +298,19 @@ final class HealthIngestHealthKitReader {
             if await deviceCanReadProtectedData() == false {
                 return HealthIngestStatus.pausedUntilUnlock
             }
-            guard let last = samples.last else {
+            let kept = samples.filter { sample in
+                guard let until else { return true }
+                return sample.startDate < until
+            }
+            guard let last = kept.last else {
                 setCursor(nil, for: kind.recordType)
                 persist()
                 return nil
             }
-            let records = autoreleasepool { samples.compactMap { Self.map($0, kind: kind) } }
+            let records = autoreleasepool { kept.compactMap { Self.map($0, kind: kind) } }
             if !records.isEmpty { await sink(records) }
-            if samples.count < limit {
+            let hitEnd = until.map { last.startDate >= $0 || kept.count < samples.count } ?? false
+            if kept.count < limit || hitEnd {
                 setCursor(nil, for: kind.recordType)
             } else if last.startDate > cursor {
                 setCursor(last.startDate, for: kind.recordType)
@@ -321,7 +338,14 @@ final class HealthIngestHealthKitReader {
     private func setCursor(_ date: Date?, for recordType: String) {
         lock.lock()
         cursors[recordType] = date
+        if date == nil { untils[recordType] = nil }
         lock.unlock()
+    }
+
+    private func untilDate(for recordType: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        return untils[recordType]
     }
 
     func oldestPendingCursor(preferences: HealthIngestPreferences) -> Date? {
@@ -341,6 +365,7 @@ final class HealthIngestHealthKitReader {
         guard !loaded else { return }
         loaded = true
         cursors = disk.loadCursors()
+        untils = disk.loadBackfillUntils()
         for (key, data) in disk.loadAnchors() {
             if let anchor = try? NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data) {
                 anchors[key] = anchor
@@ -351,6 +376,7 @@ final class HealthIngestHealthKitReader {
     private func persist() {
         lock.lock()
         let cursors = self.cursors
+        let untils = self.untils
         var stored: [String: Data] = [:]
         for (key, anchor) in anchors {
             if let data = try? NSKeyedArchiver.archivedData(withRootObject: anchor, requiringSecureCoding: true) {
@@ -359,6 +385,7 @@ final class HealthIngestHealthKitReader {
         }
         lock.unlock()
         disk.saveCursors(cursors)
+        disk.saveBackfillUntils(untils)
         disk.saveAnchors(stored)
     }
 

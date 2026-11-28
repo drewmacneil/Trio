@@ -208,15 +208,16 @@ struct HealthIngestBackfillProgress: Equatable {
 
     /// Picker values. A cursor only moves forward from the window start, so its age is a
     /// lower bound on which of these windows could still be in progress.
-    static let dayChoices = [1, 3, 7, 14, 30, 90]
+    static let dayChoices = [1, 3, 7, 14, 30, 90, 365]
 
     /// Progress for a backfill that resumed with cursors but no saved window. The smallest
     /// choice that still reaches the earliest cursor becomes the window, and that cursor
     /// is the frontier inside it. A 68-day-old cursor can only be a 90-day pass.
+    /// A cursor older than 90 days is the year-long pass.
     static func recover(earliestCursor: Date, now: Date, choices: [Int] = dayChoices) -> (days: Int, windowStart: Date) {
         let age = max(0, now.timeIntervalSince(earliestCursor))
         let sorted = choices.sorted()
-        let days = sorted.first { Double($0) * 24 * 3600 >= age } ?? sorted.last ?? 90
+        let days = sorted.first { Double($0) * 24 * 3600 >= age } ?? sorted.last ?? HealthIngestHorizon.days
         let start = now.addingTimeInterval(-Double(days) * 24 * 3600)
         return (days, start)
     }

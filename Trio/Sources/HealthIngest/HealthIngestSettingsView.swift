@@ -781,9 +781,9 @@ struct HealthIngestHistoryScreen: View {
                 Text(
                     running
                         ?
-                        "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. The first Health sync is the last day. History reads older Health samples. The day count stays locked until this pass finishes."
+                        "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. Health samples can be read for up to a year. The first Health sync is the last day. History reads older Health samples. The day count stays locked until this pass finishes."
                         :
-                        "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. Overrides and prediction curves are kept for less time, so leave upload on to catch them. The first Health sync is the last day. History reads older Health samples."
+                        "Glucose, insulin, carbs, and loop results stay on the phone for about 90 days. Health samples can be read for up to a year. Overrides and prediction curves are kept for less time, so leave upload on to catch them. The first Health sync is the last day. History reads older Health samples."
                 )
             }
         }

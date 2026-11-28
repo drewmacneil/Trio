@@ -79,6 +79,9 @@ enum HealthIngestWire {
     /// not clear HealthKit cursors or anchors and does not start a HealthKit backfill.
     /// Each later version needs a step in `HealthIngestMappingUpgrade.steps`.
     /// A missing step resets the HealthKit backfill instead of skipping the resend.
+    /// A longer history window is `HealthIngestHorizon`, not a new mapping version.
+    /// The payload and this version stay put so an accepted row is not sent again
+    /// just because the phone can now read further back.
     static let mappingVersion = 9
 
     static func encodeEnvelope(_ envelope: HealthIngestEnvelope) throws -> Data {
